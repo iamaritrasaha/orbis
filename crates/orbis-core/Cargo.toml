@@ -1,0 +1,18 @@
+[package]
+name = "orbis-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Provider-neutral read-only package discovery and explanation core for Orbis"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+wait-timeout.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
