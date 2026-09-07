@@ -21,7 +21,7 @@ impl PlainProgressRenderer {
         is_tty: bool,
         max_output_lines: usize,
     ) -> Self {
-        let current_stage = stages.first().copied().unwrap_or(ExecutionStage::Planning);
+        let current_stage = stages.first().copied().unwrap_or(ExecutionStage::Preparing);
         Self {
             theme,
             header,

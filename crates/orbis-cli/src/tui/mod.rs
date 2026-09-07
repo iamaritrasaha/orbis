@@ -108,6 +108,108 @@ fn terminal_capable() -> bool {
         && std::env::var("TERM").is_ok_and(|term| term != "dumb")
 }
 
+/// Startup reveal animation for the Orbis terminal identity.
+#[derive(Debug)]
+pub(crate) struct StartupAnimation {
+    enabled: bool,
+    start: Option<std::time::Instant>,
+    completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AnimationStep {
+    Dot,
+    SmallDiamond,
+    LargeDiamond,
+    Wordmark,
+    Finished,
+}
+
+impl StartupAnimation {
+    pub(crate) fn new(theme: &Theme) -> Self {
+        let enabled = Self::should_enable(theme);
+        Self {
+            enabled,
+            start: if enabled { Some(std::time::Instant::now()) } else { None },
+            completed: !enabled,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_testing(enabled: bool) -> Self {
+        Self {
+            enabled,
+            start: if enabled { Some(std::time::Instant::now()) } else { None },
+            completed: !enabled,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_elapsed_ms(&mut self, ms: u64) {
+        self.start = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(ms))
+                .unwrap_or_else(std::time::Instant::now),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self { enabled: false, start: None, completed: true }
+    }
+
+    pub(crate) fn should_enable(theme: &Theme) -> bool {
+        if !theme.unicode || !theme.color {
+            return false;
+        }
+        if std::env::var("NO_COLOR").is_ok() {
+            return false;
+        }
+        if std::env::var("REDUCE_MOTION").is_ok() {
+            return false;
+        }
+        if std::env::var("TERM").map(|term| term == "dumb").unwrap_or(false) {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.enabled && !self.completed
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.completed = true;
+    }
+
+    pub(crate) fn step_at(&mut self, elapsed_ms: u128) -> AnimationStep {
+        if !self.enabled || self.completed {
+            return AnimationStep::Finished;
+        }
+        match elapsed_ms {
+            0..=120 => AnimationStep::Dot,
+            121..=240 => AnimationStep::SmallDiamond,
+            241..=360 => AnimationStep::LargeDiamond,
+            361..=500 => AnimationStep::Wordmark,
+            _ => {
+                self.completed = true;
+                AnimationStep::Finished
+            }
+        }
+    }
+
+    pub(crate) fn step(&mut self) -> AnimationStep {
+        if !self.is_active() {
+            return AnimationStep::Finished;
+        }
+        let Some(start) = self.start else {
+            self.completed = true;
+            return AnimationStep::Finished;
+        };
+        self.step_at(start.elapsed().as_millis())
+    }
+}
+
 struct App<'a> {
     _registry: &'a ProviderRegistry,
     theme: Theme,
@@ -133,6 +235,7 @@ struct App<'a> {
     loading_plan: bool,
     error: Option<String>,
     quit: bool,
+    animation: StartupAnimation,
     // Progress screen state
     progress_stage: orbis_core::progress::ExecutionStage,
     progress_title: String,
@@ -174,7 +277,8 @@ impl<'a> App<'a> {
             loading_plan: false,
             error: None,
             quit: false,
-            progress_stage: orbis_core::progress::ExecutionStage::Planning,
+            animation: StartupAnimation::new(&theme),
+            progress_stage: orbis_core::progress::ExecutionStage::Preparing,
             progress_title: String::new(),
             progress_output: VecDeque::new(),
             progress_scroll: 0,
@@ -194,6 +298,9 @@ impl<'a> App<'a> {
                 self.accept(message);
                 received = true;
             }
+            if self.animation.is_active() {
+                dirty = true;
+            }
             if dirty || received {
                 terminal.draw(|frame| self.draw(frame))?;
                 dirty = false;
@@ -203,6 +310,7 @@ impl<'a> App<'a> {
             {
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.animation.finish();
                         self.handle_key(key);
                         dirty = true;
                     }
@@ -325,6 +433,7 @@ impl<'a> App<'a> {
     }
 
     fn open(&mut self, screen: Screen) {
+        self.animation.finish();
         self.previous = self.screen;
         self.screen = screen;
         self.error = None;
@@ -571,7 +680,7 @@ impl<'a> App<'a> {
                     Some("This plan is blocked or incomplete and cannot be confirmed.".into());
                 return;
             }
-            self.progress_stage = orbis_core::progress::ExecutionStage::Planning;
+            self.progress_stage = orbis_core::progress::ExecutionStage::Preparing;
             self.progress_title = format!("{} {}", plan.action.label(), plan.target.name);
             self.progress_output.clear();
             self.progress_scroll = 0;
@@ -611,6 +720,9 @@ impl<'a> App<'a> {
             frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
             return;
         }
+        if self.screen != Screen::Dashboard {
+            self.animation.finish();
+        }
         match self.screen {
             Screen::Dashboard => self.draw_dashboard(frame, area),
             Screen::Search => self.draw_search(frame, area),
@@ -621,6 +733,7 @@ impl<'a> App<'a> {
             Screen::HistoryDetail => self.draw_history_detail(frame, area),
             Screen::Why => self.draw_why(frame, area),
             Screen::Help => {
+                self.animation.finish();
                 self.draw_dashboard(frame, area);
                 self.draw_help(frame, area);
             }
@@ -688,7 +801,11 @@ impl<'a> App<'a> {
         );
     }
 
-    fn draw_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_dashboard(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height < 20 || area.width < 70 {
+            self.animation.finish();
+        }
+        let step = self.animation.step();
         let brand_lines = self.theme.brand_full();
         let header_height = (brand_lines.len() as u16) + 2;
         let chunks = Layout::vertical([
@@ -697,14 +814,46 @@ impl<'a> App<'a> {
             Constraint::Length(3),
         ])
         .split(area);
-        let mut header_lines: Vec<Line<'static>> = brand_lines
-            .iter()
-            .map(|line| Line::from(Span::styled(*line, self.theme.style(Token::Primary))))
-            .collect();
-        header_lines.push(Line::from(Span::styled(
-            format!("  {}", Theme::brand_tagline()),
-            self.theme.style(Token::Muted),
-        )));
+        let header_lines: Vec<Line<'static>> = match step {
+            AnimationStep::Dot => vec![
+                Line::from(Span::styled(" ·", self.theme.style(Token::Primary))),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+            ],
+            AnimationStep::SmallDiamond => vec![
+                Line::from(Span::styled(" ◇", self.theme.style(Token::Primary))),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+            ],
+            AnimationStep::LargeDiamond => vec![
+                Line::from(Span::styled(" ◈", self.theme.style(Token::Primary))),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+            ],
+            AnimationStep::Wordmark => vec![
+                Line::from(Span::styled(
+                    format!(" {}", self.theme.brand_compact()),
+                    self.theme.style(Token::Primary),
+                )),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+            ],
+            AnimationStep::Finished => {
+                let mut lines: Vec<Line<'static>> = brand_lines
+                    .iter()
+                    .map(|line| Line::from(Span::styled(*line, self.theme.style(Token::Primary))))
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", Theme::brand_tagline()),
+                    self.theme.style(Token::Muted),
+                )));
+                lines
+            }
+        };
         let header = Paragraph::new(Text::from(header_lines));
         frame.render_widget(header, chunks[0]);
         match layout_class(area.width) {
@@ -1555,5 +1704,69 @@ mod tests {
         assert!(content.contains("Completed"));
         assert!(content.contains("verified"));
         assert!(content.contains("tx-test-123"));
+    }
+
+    #[test]
+    fn startup_animation_steps_progress_correctly() {
+        let mut anim = StartupAnimation::for_testing(true);
+        assert!(anim.is_active());
+        assert_eq!(anim.step_at(50), AnimationStep::Dot);
+        assert_eq!(anim.step_at(120), AnimationStep::Dot);
+        assert_eq!(anim.step_at(180), AnimationStep::SmallDiamond);
+        assert_eq!(anim.step_at(240), AnimationStep::SmallDiamond);
+        assert_eq!(anim.step_at(300), AnimationStep::LargeDiamond);
+        assert_eq!(anim.step_at(360), AnimationStep::LargeDiamond);
+        assert_eq!(anim.step_at(420), AnimationStep::Wordmark);
+        assert_eq!(anim.step_at(500), AnimationStep::Wordmark);
+        assert_eq!(anim.step_at(550), AnimationStep::Finished);
+        assert!(!anim.is_active());
+        assert_eq!(anim.step_at(600), AnimationStep::Finished);
+    }
+
+    #[test]
+    fn startup_animation_finish_makes_it_inactive() {
+        let mut anim = StartupAnimation::for_testing(true);
+        assert!(anim.is_active());
+        anim.finish();
+        assert!(!anim.is_active());
+        assert_eq!(anim.step_at(50), AnimationStep::Finished);
+    }
+
+    #[test]
+    fn startup_animation_disabled_conditions() {
+        let ascii_theme = Theme::test(80);
+        assert!(!StartupAnimation::should_enable(&ascii_theme));
+
+        let anim = StartupAnimation::disabled();
+        assert!(!anim.is_active());
+    }
+
+    #[test]
+    fn startup_animation_frame_rendering() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(80);
+        theme.unicode = true;
+        theme.color = true;
+        let mut app = App::new(registry, theme, tx, rx);
+        app.animation = StartupAnimation::for_testing(true);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw frame 0");
+        let content0: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content0.contains('·'));
+
+        app.animation.set_elapsed_ms(400);
+        terminal.draw(|frame| app.draw(frame)).expect("draw wordmark");
+        let content_wm: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content_wm.contains("ORBIS"));
+
+        app.animation.set_elapsed_ms(600);
+        terminal.draw(|frame| app.draw(frame)).expect("draw finished");
+        let content_fin: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content_fin.contains("Your Linux software, in one place."));
     }
 }

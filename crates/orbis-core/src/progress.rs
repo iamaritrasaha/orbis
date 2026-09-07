@@ -15,8 +15,8 @@ use crate::models::PackageSource;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStage {
-    /// Building the provider plan (read-only).
-    Planning,
+    /// Pre-execution initialization and durable execution-start recording.
+    Preparing,
     /// The plan has been presented and Orbis is waiting for user confirmation.
     AwaitingConfirmation,
     /// Requesting administrator authorization via sudo.
@@ -25,8 +25,8 @@ pub enum ExecutionStage {
     Executing,
     /// Post-execution verification of package state.
     Verifying,
-    /// Writing the durable transaction/maintenance record.
-    RecordingHistory,
+    /// Writing the final durable outcome record.
+    SavingResult,
     /// The operation finished successfully.
     Completed,
     /// The operation finished with a failure.
@@ -37,12 +37,12 @@ impl ExecutionStage {
     /// Human-readable label for this stage.
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Planning => "Planning",
+            Self::Preparing => "Preparing",
             Self::AwaitingConfirmation => "Awaiting confirmation",
             Self::Authenticating => "Authenticating",
             Self::Executing => "Executing",
             Self::Verifying => "Verifying",
-            Self::RecordingHistory => "Recording history",
+            Self::SavingResult => "Saving result",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
         }
@@ -56,24 +56,22 @@ impl ExecutionStage {
     /// The ordered list of stages for a standard single-package transaction.
     pub fn transaction_stages() -> &'static [ExecutionStage] {
         &[
-            Self::Planning,
-            Self::AwaitingConfirmation,
+            Self::Preparing,
             Self::Authenticating,
             Self::Executing,
             Self::Verifying,
-            Self::RecordingHistory,
+            Self::SavingResult,
         ]
     }
 
     /// The ordered list of stages for a maintenance operation.
     pub fn maintenance_stages() -> &'static [ExecutionStage] {
         &[
-            Self::Planning,
-            Self::AwaitingConfirmation,
+            Self::Preparing,
             Self::Authenticating,
             Self::Executing,
             Self::Verifying,
-            Self::RecordingHistory,
+            Self::SavingResult,
         ]
     }
 }
@@ -204,16 +202,18 @@ mod tests {
 
     #[test]
     fn stage_labels_are_human_readable() {
-        assert_eq!(ExecutionStage::Planning.label(), "Planning");
+        assert_eq!(ExecutionStage::Preparing.label(), "Preparing");
         assert_eq!(ExecutionStage::Executing.label(), "Executing");
+        assert_eq!(ExecutionStage::SavingResult.label(), "Saving result");
         assert_eq!(ExecutionStage::Completed.label(), "Completed");
         assert_eq!(ExecutionStage::Failed.label(), "Failed");
     }
 
     #[test]
     fn terminal_stages_are_identified() {
-        assert!(!ExecutionStage::Planning.is_terminal());
+        assert!(!ExecutionStage::Preparing.is_terminal());
         assert!(!ExecutionStage::Executing.is_terminal());
+        assert!(!ExecutionStage::SavingResult.is_terminal());
         assert!(ExecutionStage::Completed.is_terminal());
         assert!(ExecutionStage::Failed.is_terminal());
     }
@@ -221,16 +221,18 @@ mod tests {
     #[test]
     fn transaction_stages_are_ordered() {
         let stages = ExecutionStage::transaction_stages();
-        assert!(stages.len() >= 4);
-        assert_eq!(stages[0], ExecutionStage::Planning);
-        assert!(stages.contains(&ExecutionStage::Executing));
-        assert!(stages.contains(&ExecutionStage::Verifying));
+        assert_eq!(stages.len(), 5);
+        assert_eq!(stages[0], ExecutionStage::Preparing);
+        assert_eq!(stages[1], ExecutionStage::Authenticating);
+        assert_eq!(stages[2], ExecutionStage::Executing);
+        assert_eq!(stages[3], ExecutionStage::Verifying);
+        assert_eq!(stages[4], ExecutionStage::SavingResult);
     }
 
     #[test]
     fn silent_observer_accepts_events_without_effect() {
         let observer = SilentObserver;
-        observer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Planning });
+        observer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Preparing });
         observer.on_event(&OperationEvent::Finished {
             stage: ExecutionStage::Completed,
             message: None,
@@ -241,7 +243,7 @@ mod tests {
     #[test]
     fn collecting_observer_captures_all_events() {
         let observer = Arc::new(CollectingObserver::new());
-        observer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Planning });
+        observer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Preparing });
         observer.on_event(&OperationEvent::ProviderOutput(OutputLine {
             stream: OutputStream::Stdout,
             content: "test output".into(),

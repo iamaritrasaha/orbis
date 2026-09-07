@@ -294,7 +294,7 @@ impl ProviderRegistry {
         let operation_id = plan.operation_id.clone();
 
         observer.on_event(&progress::OperationEvent::StageChanged {
-            stage: progress::ExecutionStage::RecordingHistory,
+            stage: progress::ExecutionStage::Preparing,
         });
 
         history
@@ -310,7 +310,7 @@ impl ProviderRegistry {
         match self.execute_transaction_with_observer(plan.clone(), executor, observer) {
             Ok(result) => {
                 observer.on_event(&progress::OperationEvent::StageChanged {
-                    stage: progress::ExecutionStage::RecordingHistory,
+                    stage: progress::ExecutionStage::SavingResult,
                 });
                 history
                     .write(
@@ -335,6 +335,9 @@ impl ProviderRegistry {
                 Ok(result)
             }
             Err(error) => {
+                observer.on_event(&progress::OperationEvent::StageChanged {
+                    stage: progress::ExecutionStage::SavingResult,
+                });
                 let failed = TransactionResult {
                     plan,
                     execution: ExecutionSummary {
@@ -535,6 +538,16 @@ impl ProviderRegistry {
         };
 
         observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::Preparing,
+        });
+
+        if plan.privilege == transaction::PrivilegeRequirement::Administrator {
+            observer.on_event(&progress::OperationEvent::StageChanged {
+                stage: progress::ExecutionStage::Authenticating,
+            });
+        }
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
             stage: progress::ExecutionStage::Executing,
         });
 
@@ -547,6 +560,9 @@ impl ProviderRegistry {
             .map_err(|error| error.to_string())?;
         if !output.success() {
             let msg = transaction::safe_process_message(&output);
+            observer.on_event(&progress::OperationEvent::StageChanged {
+                stage: progress::ExecutionStage::SavingResult,
+            });
             observer.on_event(&progress::OperationEvent::Finished {
                 stage: progress::ExecutionStage::Failed,
                 message: msg.clone(),
@@ -592,6 +608,10 @@ impl ProviderRegistry {
             }
             _ => maintenance::MaintenanceStatus::Failed,
         };
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::SavingResult,
+        });
 
         let final_stage = if status == maintenance::MaintenanceStatus::Failed {
             progress::ExecutionStage::Failed
@@ -1022,5 +1042,126 @@ mod tests {
             registry.plan_transaction(&request),
             Err(crate::transaction::TransactionError::Ambiguous { .. })
         ));
+    }
+
+    struct StageRecorder {
+        stages: std::sync::Mutex<Vec<crate::progress::ExecutionStage>>,
+    }
+
+    impl crate::progress::ProgressObserver for StageRecorder {
+        fn on_event(&self, event: &crate::progress::OperationEvent) {
+            match event {
+                crate::progress::OperationEvent::StageChanged { stage } => {
+                    self.stages.lock().unwrap().push(*stage);
+                }
+                crate::progress::OperationEvent::Finished { stage, .. } => {
+                    self.stages.lock().unwrap().push(*stage);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_progress_stages_are_strictly_monotonic() {
+        let runner = Arc::new(TransactionFakeRunner::new());
+        let registry = ProviderRegistry::with_runner(runner.clone());
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
+            scope: None,
+            channel: None,
+        };
+        let plan = registry.plan_transaction(&request).expect("plan");
+        let directory = temporary_test_directory("monotonic-progress");
+        let history = crate::transaction::history::HistoryStore::at(&directory);
+        let start_record = history.record_path(&plan.operation_id);
+
+        let recorder = Arc::new(StageRecorder { stages: std::sync::Mutex::new(Vec::new()) });
+
+        let result = registry
+            .execute_transaction_with_progress(
+                &request,
+                plan,
+                &FakeOperationExecutor { runner, start_record: Some(start_record), fail: false },
+                &history,
+                recorder.as_ref(),
+            )
+            .expect("execution");
+        assert_eq!(result.status, crate::transaction::TransactionStatus::Succeeded);
+
+        let recorded = recorder.stages.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                crate::progress::ExecutionStage::Preparing,
+                crate::progress::ExecutionStage::Authenticating,
+                crate::progress::ExecutionStage::Executing,
+                crate::progress::ExecutionStage::Verifying,
+                crate::progress::ExecutionStage::SavingResult,
+                crate::progress::ExecutionStage::Completed,
+            ]
+        );
+
+        for window in recorded.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "stages must move forward monotonically: {:?} followed by {:?}",
+                window[0],
+                window[1]
+            );
+        }
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn transaction_failure_progress_stages_are_strictly_monotonic() {
+        let runner = Arc::new(TransactionFakeRunner::new());
+        let registry = ProviderRegistry::with_runner(runner.clone());
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
+            scope: None,
+            channel: None,
+        };
+        let plan = registry.plan_transaction(&request).expect("plan");
+        let directory = temporary_test_directory("failure-progress");
+        let history = crate::transaction::history::HistoryStore::at(&directory);
+        let path = history.record_path(&plan.operation_id);
+
+        let recorder = Arc::new(StageRecorder { stages: std::sync::Mutex::new(Vec::new()) });
+
+        let result = registry.execute_transaction_with_progress(
+            &request,
+            plan,
+            &FakeOperationExecutor { runner, start_record: Some(path), fail: true },
+            &history,
+            recorder.as_ref(),
+        );
+        assert!(result.is_err());
+
+        let recorded = recorder.stages.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                crate::progress::ExecutionStage::Preparing,
+                crate::progress::ExecutionStage::Authenticating,
+                crate::progress::ExecutionStage::Executing,
+                crate::progress::ExecutionStage::SavingResult,
+                crate::progress::ExecutionStage::Failed,
+            ]
+        );
+
+        for window in recorded.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "failure stages must move forward monotonically: {:?} followed by {:?}",
+                window[0],
+                window[1]
+            );
+        }
+
+        let _ = fs::remove_dir_all(directory);
     }
 }

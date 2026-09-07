@@ -268,6 +268,7 @@ impl CommandRunner for RealCommandRunner {
 
         let mut stdout_output = String::new();
         let mut stderr_output = String::new();
+        let mut status_result = None;
 
         thread::scope(|s| {
             let stdout_thread = s.spawn(|| {
@@ -310,30 +311,38 @@ impl CommandRunner for RealCommandRunner {
                 output
             });
 
+            let status = match command.timeout {
+                Some(timeout) => match child.wait_timeout(timeout) {
+                    Ok(Some(status)) => Ok(status),
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Err(ProcessError::Timeout {
+                            program: command.program.clone(),
+                            timeout_ms: timeout.as_millis(),
+                        })
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Err(ProcessError::Io {
+                            program: command.program.clone(),
+                            message: error.to_string(),
+                        })
+                    }
+                },
+                None => child.wait().map_err(|error| ProcessError::Io {
+                    program: command.program.clone(),
+                    message: error.to_string(),
+                }),
+            };
+
             stdout_output = stdout_thread.join().unwrap_or_default();
             stderr_output = stderr_thread.join().unwrap_or_default();
+            status_result = Some(status);
         });
 
-        let status = match command.timeout {
-            Some(timeout) => match child.wait_timeout(timeout).map_err(|error| {
-                ProcessError::Io { program: command.program.clone(), message: error.to_string() }
-            })? {
-                Some(status) => status,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ProcessError::Timeout {
-                        program: command.program.clone(),
-                        timeout_ms: timeout.as_millis(),
-                    });
-                }
-            },
-            None => child.wait().map_err(|error| ProcessError::Io {
-                program: command.program.clone(),
-                message: error.to_string(),
-            })?,
-        };
-
+        let status = status_result.expect("status_result populated in scope")?;
         Ok(CommandOutput { stdout: stdout_output, stderr: stderr_output, status: status.code() })
     }
 }
@@ -402,5 +411,40 @@ mod tests {
         let output = runner.run(&CommandSpec::new("printf", ["hello"])).expect("printf works");
         assert_eq!(output.stdout, "hello");
         assert!(output.success());
+    }
+
+    #[test]
+    fn real_runner_streaming_captures_output() {
+        let runner = RealCommandRunner::new();
+        let delivered = std::sync::Mutex::new(Vec::new());
+        let output = runner
+            .run_streaming(&CommandSpec::new("printf", ["line1\nline2\n"]), &|line, stream| {
+                assert_eq!(stream, crate::progress::OutputStream::Stdout);
+                delivered.lock().unwrap().push(line.to_owned());
+            })
+            .expect("printf works");
+        assert_eq!(delivered.into_inner().unwrap(), vec!["line1", "line2"]);
+        assert_eq!(output.stdout, "line1\nline2\n");
+        assert!(output.success());
+    }
+
+    #[test]
+    fn real_runner_streaming_timeout_terminates_child_and_returns_error() {
+        let runner = RealCommandRunner::new();
+        let start = std::time::Instant::now();
+        let mut command = CommandSpec::new("sleep", ["2"]);
+        command.timeout = Some(Duration::from_millis(50));
+        let result = runner.run_streaming(&command, &|_line, _stream| {});
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ProcessError::Timeout { .. })),
+            "expected Timeout error, got {:?}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "streaming timeout should bound execution time (took {:?})",
+            elapsed
+        );
     }
 }
