@@ -538,6 +538,18 @@ impl<'a> App<'a> {
         subtitle: &str,
         body: Vec<Line<'static>>,
     ) {
+        self.shell_scrolled(frame, area, title, subtitle, body, 0);
+    }
+
+    fn shell_scrolled(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        subtitle: &str,
+        body: Vec<Line<'static>>,
+        scroll: u16,
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(4), Constraint::Min(1), Constraint::Length(2)])
@@ -559,7 +571,10 @@ impl<'a> App<'a> {
             )),
         ]));
         frame.render_widget(header, chunks[0]);
-        frame.render_widget(Paragraph::new(Text::from(body)).wrap(Wrap { trim: false }), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(Text::from(body)).scroll((scroll, 0)).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "/ Search   U Updates   S Sources   H History   ? Help   Q Quit",
@@ -884,7 +899,14 @@ impl<'a> App<'a> {
             )));
         }
         body.extend([Line::from(""), Line::from("Enter Details    ↑/↓ or j/k Move    Esc Back")]);
-        self.shell(frame, area, "History", "sanitized local records", body);
+        self.shell_scrolled(
+            frame,
+            area,
+            "History",
+            "sanitized local records",
+            body,
+            self.history_selected.saturating_sub(8) as u16,
+        );
     }
 
     fn draw_history_detail(&self, frame: &mut Frame<'_>, area: Rect) {
