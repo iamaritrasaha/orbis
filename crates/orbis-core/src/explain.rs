@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::models::{Package, PackageKind};
+use crate::models::{Package, PackageKind, PackageSource};
 
 /// The provenance of a sentence in an Orbis Brief.
 #[derive(Clone, Debug, Serialize)]
@@ -103,6 +103,56 @@ pub fn build_brief(package: Package) -> PackageBrief {
             Some(false),
             "high",
         )
+    } else if matches!(package.source, PackageSource::Cargo) {
+        evidence.push(Evidence {
+            kind: EvidenceKind::ProviderMetadata,
+            detail: "Cargo registry metadata and Cargo's installed-tool interface.".into(),
+        });
+        let summary =
+            package.summary.clone().unwrap_or_else(|| "Rust CLI tool managed by Cargo.".into());
+        (
+            summary.clone(),
+            vec![summary, "Installed through Cargo as a user-level Rust CLI application.".into()],
+            Some(true),
+            "high",
+        )
+    } else if matches!(package.source, PackageSource::Npm) {
+        evidence.push(Evidence {
+            kind: EvidenceKind::ProviderMetadata,
+            detail: "npm registry metadata and global package listing.".into(),
+        });
+        let summary = package.summary.clone().unwrap_or_else(|| "Global npm package.".into());
+        (
+            summary.clone(),
+            vec![summary, "This copy is managed as a globally installed npm package.".into()],
+            Some(true),
+            "high",
+        )
+    } else if matches!(package.source, PackageSource::Pnpm) {
+        evidence.push(Evidence {
+            kind: EvidenceKind::ProviderMetadata,
+            detail: "pnpm registry metadata and global package listing.".into(),
+        });
+        let summary = package.summary.clone().unwrap_or_else(|| "Global pnpm package.".into());
+        (
+            summary.clone(),
+            vec![summary, "This copy is managed as a globally installed pnpm package.".into()],
+            Some(true),
+            "high",
+        )
+    } else if matches!(package.source, PackageSource::Uv) {
+        evidence.push(Evidence {
+            kind: EvidenceKind::ProviderMetadata,
+            detail: "uv tool installed-state metadata; registry purpose metadata was not queried."
+                .into(),
+        });
+        ("A Python command-line tool managed by uv.".into(), vec!["It is installed in an isolated persistent uv tool environment.".into(), "Orbis does not currently have enough registry metadata to provide a richer purpose description.".into()], Some(true), "medium")
+    } else if matches!(package.source, PackageSource::Pipx) {
+        evidence.push(Evidence {
+            kind: EvidenceKind::ProviderMetadata,
+            detail: "pipx structured installed-package snapshot; registry purpose metadata was not queried.".into(),
+        });
+        ("A Python command-line tool managed by pipx.".into(), vec!["It is installed in an isolated pipx environment.".into(), "Orbis does not currently have enough registry metadata to provide a richer purpose description.".into()], Some(true), "medium")
     } else {
         evidence.push(Evidence { kind: EvidenceKind::ProviderMetadata, detail: "The wording below is taken from provider metadata; Orbis has not invented a richer description.".into() });
         let headline = package.summary.clone().unwrap_or_else(|| {

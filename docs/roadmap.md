@@ -23,7 +23,7 @@ This roadmap is deliberately staged around safety and user understanding.
 
 Not included in this milestone: upgrades, update-all, autoremove, cleanup, rollback, batch operations, or dependency-history intelligence.
 
-## Milestone 3 — maintenance and safety intelligence
+## Milestone 3 — maintenance and safety intelligence (complete)
 
 - Updates and upgrades.
 - Cleanup/autoremove planning.
@@ -33,11 +33,13 @@ Not included in this milestone: upgrades, update-all, autoremove, cleanup, rollb
 
 Milestone 3 establishes update versus updates versus upgrade semantics, provider-scoped maintenance, non-atomic unified results, revalidation, APT autoremove planning, history queries, and truthful provider limitations.
 
-## Milestone 4 — additional ecosystems
+## Milestone 4 — additional ecosystems (current)
 
 - Cargo.
 - npm and pnpm.
 - uv and pipx.
 - Additional sources only when their capability and safety models fit the provider contract.
+
+Milestone 4 manages user-wide developer tools only. It does not manage project dependency graphs, package manifests, lockfiles, virtual environments, or caches. Cargo automatic updates remain incomplete when original install provenance cannot be proven safely. npm excludes suspicious newer-than-latest installs, uv preserves recorded constraints/settings, and pipx preserves pins.
 
 The roadmap does not promise a daemon, hosted backend, telemetry, or AI dependency.

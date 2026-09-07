@@ -24,6 +24,8 @@ Flatpak uses scoped installed listings and `remote-info --show-details`. Flatpak
 
 Snap uses `snap info` and exact installed-state inspection. Snap plans are partial because the CLI does not expose an equivalent zero-action impact simulation. An omitted channel means the provider's normal latest/stable selection. Removal intentionally omits `--purge`, so Snap's normal retained-data snapshot behavior remains intact.
 
+Cargo, pnpm, uv, and pipx use truthful partial metadata plans; npm uses the provider's supported global dry run when it succeeds. No developer-provider plan uses sudo.
+
 Read-only queries and planning commands use bounded timeouts. The real provider mutation command has no generic wall-clock timeout: Orbis allows APT, Flatpak, or Snap to complete normally and does not automatically kill an active package transaction. Only the separate `sudo -v` authorization check remains bounded.
 
 ## Confirmation and privilege
@@ -50,7 +52,7 @@ The same operation ID is atomically replaced after execution and verification wi
 
 ## Scope exclusions
 
-Milestone 3 adds a separate maintenance path rather than folding system-wide maintenance into the single-package operation path. It provides normalized update inventories, coordinated non-atomic maintenance plans, revalidation, conservative APT autoremove planning, history queries, and provider-specific explanation evidence. Flatpak cleanup remains unsupported where exact non-mutating planning is unavailable, and Snap retention is never changed by Orbis.
+Milestones 3 and 4 add a separate maintenance path rather than folding system-wide or developer-tool maintenance into the single-package operation path. It provides normalized update inventories, coordinated non-atomic maintenance plans, revalidation, conservative APT autoremove planning, history queries, and provider-specific explanation evidence. Flatpak cleanup remains unsupported where exact non-mutating planning is unavailable, Snap retention is never changed by Orbis, and Cargo upgrade provenance remains incomplete when the original source cannot be proven.
 
 Single-package transactions still do not implement full-upgrade, rollback, undo, or arbitrary batch operations. Milestone 3 maintenance has its own plan models and safety review rather than being folded into the single-package operation path.
 

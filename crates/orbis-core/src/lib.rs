@@ -49,7 +49,12 @@ impl ProviderRegistry {
             providers: vec![
                 Box::new(providers::apt::AptProvider::new(shared.clone())),
                 Box::new(providers::flatpak::FlatpakProvider::new(shared.clone())),
-                Box::new(providers::snap::SnapProvider::new(shared)),
+                Box::new(providers::snap::SnapProvider::new(shared.clone())),
+                Box::new(providers::developer::CargoProvider::new(shared.clone())),
+                Box::new(providers::developer::NpmProvider::new(shared.clone())),
+                Box::new(providers::developer::PnpmProvider::new(shared.clone())),
+                Box::new(providers::developer::UvProvider::new(shared.clone())),
+                Box::new(providers::developer::PipxProvider::new(shared)),
             ],
         }
     }
@@ -69,12 +74,19 @@ impl ProviderRegistry {
         let mut results = Vec::new();
         let mut issues = Vec::new();
 
-        for provider in self.selected(source) {
-            match provider.search(query) {
-                Ok(packages) => results.extend(packages),
-                Err(error) => issues.push(issue(provider.source(), error)),
+        let providers = self.selected(source);
+        std::thread::scope(|scope| {
+            let handles = providers
+                .into_iter()
+                .map(|provider| scope.spawn(move || (provider.source(), provider.search(query))))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                match handle.join().expect("provider search thread panicked") {
+                    (_, Ok(packages)) => results.extend(packages),
+                    (source, Err(error)) => issues.push(issue(source, error)),
+                }
             }
-        }
+        });
 
         results.sort_by(|left, right| {
             (!left.installed.unwrap_or(false), left.name.to_ascii_lowercase(), left.source).cmp(&(
@@ -91,7 +103,9 @@ impl ProviderRegistry {
         let mut matches = Vec::new();
         let mut issues = Vec::new();
 
-        for provider in self.selected(package_ref.source) {
+        for provider in self.selected(package_ref.source).into_iter().filter(|provider| {
+            package_ref.source.is_some() || provider.supports_unqualified_resolution()
+        }) {
             match provider.info(&package_ref.query) {
                 Ok(package) => matches.push(package),
                 Err(ProviderError::NotFound { .. }) => {}
@@ -127,10 +141,21 @@ impl ProviderRegistry {
         if let Some(channel) = &request.channel {
             validate_channel(channel)?;
         }
+        if request.package.source.is_none()
+            && self.providers.iter().any(|provider| {
+                provider.source_info().available && provider.requires_source_qualification()
+            })
+        {
+            return Err(TransactionError::InvalidRequest(
+                "source qualification is required for mutation because one or more available developer providers cannot safely resolve unqualified package existence; use cargo:, npm:, pnpm:, uv:, or pipx:".into(),
+            ));
+        }
 
         let mut matches = Vec::new();
         let mut issues = Vec::new();
-        for provider in self.selected(request.package.source) {
+        for provider in self.selected(request.package.source).into_iter().filter(|provider| {
+            request.package.source.is_some() || provider.supports_unqualified_resolution()
+        }) {
             match provider.info(&request.package.query) {
                 Ok(package) => matches.push(package),
                 Err(ProviderError::NotFound { .. }) => {}
@@ -276,23 +301,33 @@ impl ProviderRegistry {
     pub fn updates(&self, source: Option<PackageSource>) -> UpdateInventoryReport {
         let mut inventories = Vec::new();
         let mut issues = Vec::new();
-        for provider in self.selected_maintenance(source) {
-            match provider.update_inventory() {
-                Ok(inventory) => inventories.push(inventory),
-                Err(error) => {
-                    issues.push(issue(provider.source(), error));
-                    inventories.push(maintenance::ProviderUpdateInventory {
-                        source: provider.source(),
-                        available: false,
-                        candidates: Vec::new(),
-                        notes: vec![
-                            "Provider could not answer this read-only inventory query.".into(),
-                        ],
-                        metadata_state: None,
-                    });
+        let providers = self.selected_maintenance(source);
+        std::thread::scope(|scope| {
+            let handles = providers
+                .into_iter()
+                .map(|provider| {
+                    scope.spawn(move || (provider.source(), provider.update_inventory()))
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                let (source, result) = handle.join().expect("provider update thread panicked");
+                match result {
+                    Ok(inventory) => inventories.push(inventory),
+                    Err(error) => {
+                        issues.push(issue(source, error));
+                        inventories.push(maintenance::ProviderUpdateInventory {
+                            source,
+                            available: false,
+                            candidates: Vec::new(),
+                            notes: vec![
+                                "Provider could not answer this read-only inventory query.".into(),
+                            ],
+                            metadata_state: None,
+                        });
+                    }
                 }
             }
-        }
+        });
         aggregate_inventory(inventories, issues)
     }
 
@@ -734,7 +769,7 @@ mod tests {
         let report = registry.search("btop", None);
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].source, PackageSource::Apt);
-        assert_eq!(report.issues.len(), 2);
+        assert_eq!(report.issues.len(), 5);
         assert!(
             registry
                 .sources()

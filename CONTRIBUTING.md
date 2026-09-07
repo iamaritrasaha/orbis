@@ -4,7 +4,7 @@ Orbis is a small, safety-first Rust CLI. The most useful contributions preserve 
 
 ## Before opening a change
 
-Maintenance commands must use normalized plans and typed maintenance operations. Do not turn a provider limitation into a guessed dry-run or hidden cleanup; test plan-only and JSON paths with fake runners rather than package-manager state.
+Maintenance commands must use normalized plans and typed maintenance operations. Do not turn a provider limitation into a guessed dry-run or hidden cleanup; test plan-only and JSON paths with fake runners rather than package-manager state. Developer providers are global/user-wide tool providers only, never project dependency managers.
 
 Read [docs/architecture.md](docs/architecture.md). In particular:
 

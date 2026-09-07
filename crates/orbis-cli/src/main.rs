@@ -174,6 +174,11 @@ enum SourceArg {
     Apt,
     Flatpak,
     Snap,
+    Cargo,
+    Npm,
+    Pnpm,
+    Uv,
+    Pipx,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -197,6 +202,11 @@ impl From<SourceArg> for PackageSource {
             SourceArg::Apt => Self::Apt,
             SourceArg::Flatpak => Self::Flatpak,
             SourceArg::Snap => Self::Snap,
+            SourceArg::Cargo => Self::Cargo,
+            SourceArg::Npm => Self::Npm,
+            SourceArg::Pnpm => Self::Pnpm,
+            SourceArg::Uv => Self::Uv,
+            SourceArg::Pipx => Self::Pipx,
         }
     }
 }
@@ -589,6 +599,25 @@ fn run_maintenance(
         }
 
         let executor = RealOperationExecutor::new(registry.runner());
+        if plan.providers.iter().any(|provider| {
+            provider.executable()
+                && provider.privilege
+                    == orbis_core::transaction::PrivilegeRequirement::Administrator
+        }) {
+            if let Err(error) = executor.authorize_administrator() {
+                let message = format!(
+                    "administrator authorization failed before provider mutations: {error}"
+                );
+                if json {
+                    print_json(&serde_json::json!({
+                        "status": "authorization_failed",
+                        "plan": plan,
+                        "message": message
+                    }))?;
+                }
+                return Err(message);
+            }
+        }
         let history = if plan.mutates {
             let history = orbis_core::transaction::history::HistoryStore::default_location()
                 .map_err(|error| format!("could not open history: {error}"))?;
@@ -881,19 +910,21 @@ impl Renderer {
         output.push_str(&self.heading("Orbis", "Your Linux software, in one place."));
         output.push_str("\nSources\n");
         for source in sources {
-            let marker = if source.available {
-                self.paint(if self.unicode { "●" } else { "*" }, Tone::Good)
-            } else {
-                self.paint(if self.unicode { "○" } else { "o" }, Tone::Muted)
-            };
+            let tone = source_state_tone(source);
+            let marker = self.paint(
+                if source.state == "ready" {
+                    if self.unicode { "●" } else { "*" }
+                } else if self.unicode {
+                    "○"
+                } else {
+                    "o"
+                },
+                tone,
+            );
             output.push_str(&format!(
                 "  {marker} {:<9} {}\n",
                 source.source.label(),
-                if source.available {
-                    self.paint("ready", Tone::Good)
-                } else {
-                    self.paint("unavailable", Tone::Muted)
-                }
+                self.paint(&source.state, tone)
             ));
         }
         output.push_str(
@@ -904,15 +935,20 @@ impl Renderer {
 
     fn sources(&self, sources: &[SourceInfo]) -> String {
         let mut output = self.heading("Sources", "Read-only package discovery available to Orbis.");
+        let mut last_group = None;
         for source in sources {
+            let group = matches!(
+                source.source,
+                PackageSource::Apt | PackageSource::Flatpak | PackageSource::Snap
+            );
+            if last_group != Some(group) {
+                output.push_str(if group { "\nSystem & desktop\n" } else { "\nDeveloper tools\n" });
+                last_group = Some(group);
+            }
             output.push_str(&format!(
                 "\n{}  {}\n",
                 self.paint(source.source.label(), Tone::Title),
-                if source.available {
-                    self.paint("ready", Tone::Good)
-                } else {
-                    self.paint("unavailable", Tone::Muted)
-                }
+                self.paint(&source.state, source_state_tone(source))
             ));
             if let Some(backend) = &source.backend {
                 output.push_str(&format!("  Backend       {backend}\n"));
@@ -930,8 +966,36 @@ impl Renderer {
             }
             output.push_str(&capabilities.join(", "));
             output.push('\n');
-            output.push_str("  Maintenance   updates, upgrade plan, clean plan\n");
-            output.push_str("  Mutations     install, remove (single package)\n");
+            output.push_str("  Maintenance   ");
+            let mut maintenance = Vec::new();
+            if source.capabilities.updates {
+                maintenance.push("updates");
+            }
+            if source.capabilities.upgrade {
+                maintenance.push("upgrade");
+            }
+            if source.capabilities.refresh {
+                maintenance.push("refresh");
+            }
+            if source.capabilities.cleanup {
+                maintenance.push("clean");
+            }
+            output.push_str(&maintenance.join(", "));
+            output.push('\n');
+            output.push_str("  Mutations     ");
+            let mut mutations = Vec::new();
+            if source.capabilities.install {
+                mutations.push("install");
+            }
+            if source.capabilities.remove {
+                mutations.push("remove");
+            }
+            output.push_str(&mutations.join(", "));
+            output.push('\n');
+            output.push_str(&format!(
+                "  Why           {}\n",
+                if source.capabilities.why { "supported" } else { "unsupported" }
+            ));
             for note in &source.notes {
                 output.push_str(&format!("  Note          {note}\n"));
             }
@@ -1170,7 +1234,16 @@ impl Renderer {
                 report.total(),
                 if report.total() == 1 { "" } else { "s" }
             ));
-            for source in [PackageSource::Apt, PackageSource::Flatpak, PackageSource::Snap] {
+            for source in [
+                PackageSource::Apt,
+                PackageSource::Flatpak,
+                PackageSource::Snap,
+                PackageSource::Cargo,
+                PackageSource::Npm,
+                PackageSource::Pnpm,
+                PackageSource::Uv,
+                PackageSource::Pipx,
+            ] {
                 let candidates: Vec<_> = report
                     .candidates
                     .iter()
@@ -1198,6 +1271,18 @@ impl Renderer {
                         if held { " · held" } else { "" }
                     ));
                 }
+            }
+        }
+        for inventory in &report.inventories {
+            if inventory
+                .metadata_state
+                .as_deref()
+                .is_some_and(|state| state.contains("incomplete") || state.contains("unknown"))
+            {
+                output.push_str(&format!(
+                    "\n  {} update status is incomplete; unknown is not counted as zero.\n",
+                    inventory.source
+                ));
             }
         }
         for inventory in &report.inventories {
@@ -1492,6 +1577,14 @@ enum Tone {
     Good,
     Warning,
     Muted,
+}
+
+fn source_state_tone(source: &SourceInfo) -> Tone {
+    match source.state.as_str() {
+        "ready" => Tone::Good,
+        "unavailable" => Tone::Muted,
+        _ => Tone::Warning,
+    }
 }
 
 fn status(installed: Option<bool>) -> &'static str {

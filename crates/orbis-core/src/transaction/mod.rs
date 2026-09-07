@@ -215,6 +215,41 @@ pub enum ProviderOperation {
         /// Optional validated channel.
         channel: Option<String>,
     },
+    /// Cargo registry install/uninstall for a user-level binary crate.
+    Cargo {
+        /// Requested action.
+        action: OperationAction,
+        /// Validated registry crate name.
+        package_id: String,
+    },
+    /// npm global install/uninstall for a package name.
+    Npm {
+        /// Requested action.
+        action: OperationAction,
+        /// Validated npm package name.
+        package_id: String,
+    },
+    /// pnpm global install/uninstall for a package name.
+    Pnpm {
+        /// Requested action.
+        action: OperationAction,
+        /// Validated npm-compatible package name.
+        package_id: String,
+    },
+    /// uv tool install/uninstall for a Python package.
+    Uv {
+        /// Requested action.
+        action: OperationAction,
+        /// Validated Python package name.
+        package_id: String,
+    },
+    /// pipx user install/uninstall for a Python application.
+    Pipx {
+        /// Requested action.
+        action: OperationAction,
+        /// Validated Python package name.
+        package_id: String,
+    },
     /// A provider-specific maintenance command produced by the maintenance planner.
     Maintenance {
         /// Closed, validated maintenance operation.
@@ -251,6 +286,26 @@ pub enum MaintenanceOperation {
         /// Validated Snap names.
         package_ids: Vec<String>,
     },
+    /// Upgrade exact npm global package specs selected by the reviewed plan.
+    NpmUpgrade {
+        /// Exact package specs, including reviewed target versions.
+        package_ids: Vec<String>,
+    },
+    /// Upgrade exact pnpm global packages selected by the reviewed plan.
+    PnpmUpgrade {
+        /// Exact package names.
+        package_ids: Vec<String>,
+    },
+    /// Upgrade exact uv tools while retaining uv's recorded constraints.
+    UvUpgrade {
+        /// Exact tool names.
+        package_ids: Vec<String>,
+    },
+    /// Upgrade exact unpinned pipx applications.
+    PipxUpgrade {
+        /// Exact package names.
+        package_ids: Vec<String>,
+    },
 }
 
 impl MaintenanceOperation {
@@ -260,6 +315,10 @@ impl MaintenanceOperation {
             Self::AptRefresh | Self::AptUpgrade | Self::AptAutoremove => PackageSource::Apt,
             Self::FlatpakAppstream { .. } | Self::FlatpakUpgrade { .. } => PackageSource::Flatpak,
             Self::SnapRefreshCheck | Self::SnapUpgrade { .. } => PackageSource::Snap,
+            Self::NpmUpgrade { .. } => PackageSource::Npm,
+            Self::PnpmUpgrade { .. } => PackageSource::Pnpm,
+            Self::UvUpgrade { .. } => PackageSource::Uv,
+            Self::PipxUpgrade { .. } => PackageSource::Pipx,
         }
     }
 }
@@ -271,6 +330,11 @@ impl ProviderOperation {
             Self::Apt { .. } => PackageSource::Apt,
             Self::Flatpak { .. } => PackageSource::Flatpak,
             Self::Snap { .. } => PackageSource::Snap,
+            Self::Cargo { .. } => PackageSource::Cargo,
+            Self::Npm { .. } => PackageSource::Npm,
+            Self::Pnpm { .. } => PackageSource::Pnpm,
+            Self::Uv { .. } => PackageSource::Uv,
+            Self::Pipx { .. } => PackageSource::Pipx,
             Self::Maintenance { operation } => operation.source(),
         }
     }
@@ -278,9 +342,14 @@ impl ProviderOperation {
     /// The operation action represented by this operation.
     pub const fn action(&self) -> OperationAction {
         match self {
-            Self::Apt { action, .. } | Self::Flatpak { action, .. } | Self::Snap { action, .. } => {
-                *action
-            }
+            Self::Apt { action, .. }
+            | Self::Flatpak { action, .. }
+            | Self::Snap { action, .. }
+            | Self::Cargo { action, .. }
+            | Self::Npm { action, .. }
+            | Self::Pnpm { action, .. }
+            | Self::Uv { action, .. }
+            | Self::Pipx { action, .. } => *action,
             // Maintenance has its own action enum. This method remains for the Milestone 2
             // transaction renderer and is not used to classify maintenance history.
             Self::Maintenance { .. } => OperationAction::Install,

@@ -2,13 +2,13 @@
 
 Your Linux software, in one place.
 
-Orbis is a Linux-first package-management experience built on top of the package managers people already trust. It brings APT, Flatpak, and Snap discovery into one calm, understandable terminal interface without reimplementing dependency resolution or inventing a new package format.
+Orbis is a Linux-first package-management experience built on top of the package managers people already trust. It brings system packages, desktop applications, and user-wide developer tools into one calm, understandable terminal interface without reimplementing dependency resolution or inventing a new package format.
 
-## Milestone 3: system-wide maintenance intelligence
+## Milestone 4: system and developer-tool coverage
 
 The current milestone keeps discovery and mutation as separate paths. Orbis can:
 
-- detect APT/Nala, Flatpak, and Snap;
+- detect APT/Nala, Flatpak, Snap, Cargo, npm, pnpm, uv tools, and pipx;
 - search available package sources and normalize the results;
 - show package metadata and installed state;
 - explain packages through deterministic, evidence-aware Orbis Briefs;
@@ -18,6 +18,8 @@ The current milestone keeps discovery and mutation as separate paths. Orbis can:
 - inspect unified updates across APT, Flatpak, and Snap;
 - plan safe coordinated upgrades and conservative cleanup; and
 - read sanitized transaction history and evidence-based package explanations.
+
+Developer providers manage user-wide tools only: Cargo binary crates, global npm/pnpm packages, `uv tool` environments, and pipx applications. They never edit project manifests, lockfiles, `node_modules`, `.venv`, or arbitrary Python environments. See [docs/developer-providers.md](docs/developer-providers.md).
 
 See docs/maintenance.md for the exact meaning of update, updates, upgrade, clean, history, and why.
 
@@ -38,6 +40,8 @@ orbis sources
 orbis search btop
 orbis search btop --source apt
 orbis info apt:libssl-dev
+orbis info cargo:ripgrep
+orbis info npm:typescript
 orbis explain ffmpeg
 orbis doctor
 orbis update --plan
@@ -48,6 +52,11 @@ orbis history
 orbis why apt:libssl3
 orbis --json search btop
 orbis install btop --source apt --plan
+orbis install cargo:ripgrep --plan
+orbis install npm:typescript --plan
+orbis install pnpm:typescript --plan
+orbis install uv:ruff --plan
+orbis install pipx:black --plan
 orbis remove snap:btop --plan
 orbis --json install apt:btop --dry-run
 ~~~
@@ -66,6 +75,11 @@ Sources
   ● APT       ready
   ○ Flatpak   unavailable
   ● Snap      ready
+  ● Cargo     ready
+  ● npm       ready
+  ● pnpm      restricted
+  ● uv        ready
+  ○ pipx      unavailable
 
 Try
   orbis search <package>
@@ -95,6 +109,11 @@ When Orbis cannot establish an answer, it represents the field as unknown or say
 | APT | Supported | local-index updates, safe apt-get upgrade, autoremove plan, exact install/remove |
 | Flatpak | Supported when installed | scoped AppStream refresh, update inventory, conservative cleanup refusal, install/uninstall |
 | Snap | Supported when installed | pending refresh inventory, exact-name refresh, snapd-managed cleanup diagnostics, install/remove |
+| Cargo | Supported when installed | user binary-crate install/remove, live search/info; upgrade provenance is intentionally incomplete |
+| npm | Supported when installed | global JSON discovery/info/outdated, global dry-run planning, exact reviewed upgrades |
+| pnpm | Supported when installed and configured | global JSON discovery/info/outdated, exact global operations; no authoritative global dry run |
+| uv | Supported when installed | installed `uv tool` state, constrained outdated/upgrade, explicit install/remove; no fuzzy search |
+| pipx | Supported when installed | user JSON snapshot, pinned-aware upgrades, exact install/remove; no fuzzy search |
 
 Nala is presented as an APT frontend, not as a separate package ecosystem. Orbis owns its own terminal presentation rather than scraping Nala's interactive output.
 
@@ -126,6 +145,7 @@ crates/
   orbis-cli/     clap command language and terminal presentation
 docs/
   architecture.md
+  developer-providers.md
   roadmap.md
   transactions.md
 ~~~
@@ -136,8 +156,8 @@ See [docs/roadmap.md](docs/roadmap.md) for the scoped plan:
 
 1. Foundation and read-only discovery — complete.
 2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records — complete.
-3. Updates, upgrades, cleanup, history, safety intelligence, and why — current.
-4. Cargo, npm/pnpm, uv, and pipx.
+3. Updates, upgrades, cleanup, history, safety intelligence, and why — complete.
+4. Cargo, npm/pnpm, uv, and pipx — current.
 
 ## Contributing
 

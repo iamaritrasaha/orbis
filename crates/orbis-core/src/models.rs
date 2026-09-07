@@ -14,6 +14,16 @@ pub enum PackageSource {
     Flatpak,
     /// Snap packages.
     Snap,
+    /// User-installed Rust binary crates through Cargo.
+    Cargo,
+    /// Globally installed npm packages.
+    Npm,
+    /// Globally installed pnpm packages.
+    Pnpm,
+    /// Persistent command-line tools managed by uv.
+    Uv,
+    /// User-installed Python applications managed by pipx.
+    Pipx,
 }
 
 impl PackageSource {
@@ -23,6 +33,11 @@ impl PackageSource {
             "apt" | "nala" | "deb" | "debian" | "ubuntu" => Some(Self::Apt),
             "flatpak" => Some(Self::Flatpak),
             "snap" => Some(Self::Snap),
+            "cargo" | "crate" | "crates" => Some(Self::Cargo),
+            "npm" => Some(Self::Npm),
+            "pnpm" => Some(Self::Pnpm),
+            "uv" => Some(Self::Uv),
+            "pipx" => Some(Self::Pipx),
             _ => None,
         }
     }
@@ -33,6 +48,11 @@ impl PackageSource {
             Self::Apt => "APT",
             Self::Flatpak => "Flatpak",
             Self::Snap => "Snap",
+            Self::Cargo => "Cargo",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Uv => "uv",
+            Self::Pipx => "pipx",
         }
     }
 }
@@ -144,6 +164,20 @@ pub struct ProviderCapabilities {
     pub installed_list: bool,
     /// Provider exposes the scoped install/remove transaction capability.
     pub mutations: bool,
+    /// Install is supported for exact package identifiers.
+    pub install: bool,
+    /// Remove is supported for exact package identifiers.
+    pub remove: bool,
+    /// Read-only update inventory is supported.
+    pub updates: bool,
+    /// Provider-wide upgrade is supported.
+    pub upgrade: bool,
+    /// Catalog or registry refresh is supported.
+    pub refresh: bool,
+    /// Conservative cleanup is supported.
+    pub cleanup: bool,
+    /// Provider-specific explanation is supported.
+    pub why: bool,
 }
 
 /// A provider's current availability snapshot.

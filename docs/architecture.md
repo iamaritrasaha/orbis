@@ -20,12 +20,12 @@ orbis-core
   narrow privilege boundary
   XDG transaction and maintenance history
         |
-  APT/Nala frontend | Flatpak | Snap
+  APT/Nala | Flatpak | Snap | Cargo | npm | pnpm | uv tool | pipx
 ~~~
 
 ## Provider boundary
 
-The separate MaintenanceProvider contract normalizes update inventories, provider-scoped upgrade plans, conservative cleanup candidates, and explanation evidence. It keeps system-wide maintenance out of the read-only Provider contract and uses the existing typed transaction boundary for mutations.
+The separate MaintenanceProvider contract normalizes update inventories, provider-scoped upgrade plans, conservative cleanup candidates, and explanation evidence. It keeps maintenance out of the read-only Provider contract and uses the existing typed transaction boundary for mutations. Capability fields are explicit per operation; developer providers do not pretend to support fuzzy search, cleanup, or authoritative simulation where their CLIs do not expose those safely.
 
 The `Provider` trait exposes the safe read surface:
 
@@ -36,13 +36,13 @@ The `Provider` trait exposes the safe read surface:
 
 The separate `TransactionProvider` trait exposes only plan, typed-operation, and post-operation verification methods. A provider can implement those methods only when it can represent the operation safely; the UI does not assume that every ecosystem has identical capabilities. The current providers expose single-package install/remove capability, while future update, cleanup, and batch operations remain outside this interface.
 
-`ProviderRegistry` creates the supported providers, selects one source when requested, or queries all providers when no source is specified. A failure from one provider becomes a structured issue and does not discard results from the others.
+`ProviderRegistry` creates the supported providers, selects one source when requested, or queries all providers when no source is specified. Independent blocking searches and update inventories use bounded standard-thread concurrency and are sorted after collection for deterministic output. A failure from one provider becomes a structured issue and does not discard results from the others. Providers whose exact existence resolution is incomplete are source-qualified for mutation rather than treated as negative matches.
 
 ## Normalized data
 
 `Package` contains provider-neutral fields such as source, canonical provider ID, display name, version, summary, description, installed state, classification, origin, architecture, homepage, license, and size. Optional fields are omitted from JSON when the provider cannot establish them. Provider-specific values remain in a metadata map instead of leaking into every shared field.
 
-Provider-qualified references use the concise form `apt:curl`, `flatpak:org.example.App`, or `snap:firefox`. A colon is interpreted as a source qualifier only when its prefix is a known source, so Debian architecture names such as `libssl:amd64` are not accidentally rewritten.
+Provider-qualified references use the concise form `apt:curl`, `flatpak:org.example.App`, `snap:firefox`, `cargo:ripgrep`, `npm:@scope/package`, `pnpm:typescript`, `uv:ruff`, or `pipx:black`. A colon is interpreted as a source qualifier only when its prefix is a known source, so Debian architecture names such as `libssl:amd64` are not accidentally rewritten.
 
 ## Read-only provider decisions
 
@@ -94,4 +94,4 @@ The core never emits ANSI or terminal decoration. The CLI renderer owns color, U
 
 ## Safety scope
 
-Milestone 3 adds update inventories, coordinated upgrade and cleanup plans, history queries, and provider-specific explanation evidence. Flatpak remote configuration, Snap retention, package indexes, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact maintenance plan is confirmed.
+Milestones 3 and 4 add update inventories, coordinated upgrade and cleanup plans, history queries, provider-specific explanation evidence, and user-wide developer-tool coverage. Flatpak remote configuration, Snap retention, package indexes, developer-tool configuration, project manifests, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact administrator-scoped maintenance plan is confirmed; Cargo, npm, pnpm, uv, and pipx operations never request it.

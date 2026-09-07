@@ -1,6 +1,7 @@
 //! Package-provider implementations and their shared contract.
 
 pub mod apt;
+pub mod developer;
 pub mod flatpak;
 pub mod snap;
 
@@ -30,6 +31,14 @@ pub trait Provider: Send + Sync {
     fn info(&self, package_id: &str) -> Result<Package, ProviderError>;
     /// Run a bounded, safe health check.
     fn diagnostic(&self) -> DiagnosticCheck;
+    /// Whether this provider can safely participate in unqualified resolution.
+    fn supports_unqualified_resolution(&self) -> bool {
+        true
+    }
+    /// Whether incomplete resolution means mutations must be source-qualified.
+    fn requires_source_qualification(&self) -> bool {
+        false
+    }
 }
 
 /// Mutation capability kept separate from the read-only provider contract.
@@ -141,6 +150,21 @@ fn friendly_command_failure(source: PackageSource, detail: &str) -> String {
         }
         PackageSource::Apt => {
             format!("Check the local package metadata. ({detail})")
+        }
+        PackageSource::Cargo => {
+            format!("Check Cargo's configured registry and toolchain. ({detail})")
+        }
+        PackageSource::Npm => {
+            format!("Check the npm registry and global prefix configuration. ({detail})")
+        }
+        PackageSource::Pnpm => {
+            format!("Check pnpm's global directory and registry configuration. ({detail})")
+        }
+        PackageSource::Uv => {
+            format!("Check uv's tool directory and Python index configuration. ({detail})")
+        }
+        PackageSource::Pipx => {
+            format!("Check pipx's user environment and Python interpreter. ({detail})")
         }
     }
 }

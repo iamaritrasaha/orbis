@@ -1,6 +1,6 @@
 # Orbis maintenance
 
-Milestone 3 gives Orbis one understandable maintenance view across APT, Flatpak, and Snap.
+Milestones 3 and 4 give Orbis one understandable maintenance view across system, desktop, and user-wide developer-tool providers.
 
 ## Command vocabulary
 
@@ -11,7 +11,13 @@ Milestone 3 gives Orbis one understandable maintenance view across APT, Flatpak,
 - orbis history reads sanitized Orbis transaction and maintenance records. It never executes a package-manager command.
 - orbis why <package> explains provider evidence, dependency consumers where they can be established, and Orbis installation provenance when a record exists.
 
-Every command has provider filtering with --source apt, --source flatpak, or --source snap. Maintenance commands support JSON output through the global --json flag.
+Every command has provider filtering with --source apt, --source flatpak, --source snap, --source cargo, --source npm, --source pnpm, --source uv, or --source pipx. Maintenance commands support JSON output through the global --json flag.
+
+## Developer-provider semantics
+
+Cargo means `cargo install` binary crates, not Cargo.toml dependencies. npm and pnpm mean global packages only. uv means persistent `uv tool` environments, and pipx means current-user pipx applications. None of these providers uses sudo; system-owned destinations are blocked and configuration is not rewritten. `orbis clean` does not prune their caches.
+
+Cargo uses `cargo install --list`, `cargo search`, and `cargo info`; stable Cargo's dry-run remains unstable and original install provenance is not reliably recoverable through the supported interface, so automatic Cargo upgrades remain incomplete. npm uses global JSON list/search/view/outdated commands and its supported global dry run. npm candidates newer than the latest dist-tag are excluded to prevent a downgrade. pnpm uses global JSON list/search/outdated and exact global commands, with no invented dry run. uv uses `uv tool list --outdated` and exact `uv tool upgrade`, preserving uv's original constraints/settings. pipx uses its JSON snapshot and `--skip-maintenance`; pinned applications are held and existing backends are preserved.
 
 ## Provider semantics
 
@@ -25,7 +31,7 @@ APT and system Flatpak changes cross the existing typed administrator boundary. 
 
 ## Coordinated, non-atomic maintenance
 
-APT, Flatpak, and Snap cannot be one atomic transaction. A unified plan contains independent provider plans, and the result reports each provider separately. If one independent provider fails after confirmation, the result can be partial while preserving the other provider results. Authorization failure stops later administrator-scoped work; an unsupported or stale provider plan is skipped rather than silently changed.
+APT, Flatpak, Snap, and the developer providers cannot be one atomic transaction. A unified plan contains independent provider plans, and the result reports each provider separately. If one independent provider fails after confirmation, the result can be partial while preserving the other provider results. Authorization failure stops later administrator-scoped work; an unsupported or stale provider plan is skipped rather than silently changed. Developer-provider mutations remain user-local and never trigger the administrator authorization path.
 
 Upgrade plans are revalidated before confirmation/execution. If the installed state, pending version/revision, scope, or hold state differs materially, Orbis aborts and asks for a new plan.
 

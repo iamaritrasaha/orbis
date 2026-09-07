@@ -1,6 +1,9 @@
 //! Narrow privilege boundary for validated provider operations.
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use thiserror::Error;
 
@@ -29,12 +32,36 @@ pub enum PrivilegeError {
 /// Production executor. It never accepts a caller-provided executable or shell string.
 pub struct RealOperationExecutor {
     runner: SharedRunner,
+    administrator_authorized: AtomicBool,
 }
 
 impl RealOperationExecutor {
     /// Creates an executor using the same injected process seam as the providers.
     pub fn new(runner: SharedRunner) -> Self {
-        Self { runner }
+        Self { runner, administrator_authorized: AtomicBool::new(false) }
+    }
+
+    /// Preflights administrator authorization once for a coordinated maintenance run.
+    pub fn authorize_administrator(&self) -> Result<(), PrivilegeError> {
+        self.ensure_authorized()
+    }
+
+    fn ensure_authorized(&self) -> Result<(), PrivilegeError> {
+        if self.administrator_authorized.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.runner.is_available("sudo") {
+            return Err(PrivilegeError::Unavailable);
+        }
+        let output = self
+            .runner
+            .run(&authorization_command())
+            .map_err(|error| PrivilegeError::Execution(PackageSource::Apt, error.to_string()))?;
+        if !output.success() {
+            return Err(PrivilegeError::Authorization);
+        }
+        self.administrator_authorized.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -45,16 +72,7 @@ impl OperationExecutor for RealOperationExecutor {
         requirement: PrivilegeRequirement,
     ) -> Result<CommandOutput, PrivilegeError> {
         if requirement == PrivilegeRequirement::Administrator {
-            if !self.runner.is_available("sudo") {
-                return Err(PrivilegeError::Unavailable);
-            }
-            let auth = authorization_command();
-            let output = self.runner.run(&auth).map_err(|error| {
-                PrivilegeError::Execution(PackageSource::Apt, error.to_string())
-            })?;
-            if !output.success() {
-                return Err(PrivilegeError::Authorization);
-            }
+            self.ensure_authorized()?;
         }
 
         let command =
@@ -92,6 +110,11 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
             }
             ("snap", *action, package_id.as_str())
         }
+        ProviderOperation::Cargo { action, package_id } => ("cargo", *action, package_id.as_str()),
+        ProviderOperation::Npm { action, package_id } => ("npm", *action, package_id.as_str()),
+        ProviderOperation::Pnpm { action, package_id } => ("pnpm", *action, package_id.as_str()),
+        ProviderOperation::Uv { action, package_id } => ("uv", *action, package_id.as_str()),
+        ProviderOperation::Pipx { action, package_id } => ("pipx", *action, package_id.as_str()),
         ProviderOperation::Maintenance { operation } => {
             return maintenance_command(operation, elevated);
         }
@@ -101,7 +124,13 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
         OperationAction::Install => "install",
         OperationAction::Remove => match operation.source() {
             PackageSource::Flatpak => "uninstall",
-            PackageSource::Apt | PackageSource::Snap => "remove",
+            PackageSource::Cargo => "uninstall",
+            PackageSource::Apt
+            | PackageSource::Snap
+            | PackageSource::Pnpm
+            | PackageSource::Uv
+            | PackageSource::Pipx => "remove",
+            PackageSource::Npm => "uninstall",
         },
     };
     if matches!(operation.source(), PackageSource::Apt) {
@@ -109,6 +138,36 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
         args.insert(0, subcommand.into());
         args.push("--".into());
         args.push(package_id.into());
+    } else if matches!(operation.source(), PackageSource::Cargo) {
+        let command_args = if action == OperationAction::Remove {
+            vec![subcommand.into(), "--package".into(), package_id.into()]
+        } else {
+            vec![subcommand.into(), package_id.into()]
+        };
+        args = command_args;
+    } else if matches!(operation.source(), PackageSource::Npm | PackageSource::Pnpm) {
+        let mut command_args = vec![subcommand.into()];
+        if matches!(operation.source(), PackageSource::Npm | PackageSource::Pnpm) {
+            command_args.push("--global".into());
+        }
+        command_args.extend(args);
+        if matches!(operation.source(), PackageSource::Npm | PackageSource::Pnpm) {
+            command_args.push("--".into());
+        }
+        command_args.push(package_id.into());
+        args = command_args;
+    } else if matches!(operation.source(), PackageSource::Uv) {
+        let command = match action {
+            OperationAction::Install => "install",
+            OperationAction::Remove => "uninstall",
+        };
+        args = vec!["tool".into(), command.into(), package_id.into()];
+    } else if matches!(operation.source(), PackageSource::Pipx) {
+        let command = match action {
+            OperationAction::Install => "install",
+            OperationAction::Remove => "uninstall",
+        };
+        args = vec![command.into(), "--skip-maintenance".into(), package_id.into()];
     } else {
         let mut command_args = vec![subcommand.into()];
         command_args.extend(args);
@@ -187,6 +246,26 @@ fn maintenance_command(
             let mut args = vec!["refresh".into()];
             args.extend(package_ids.iter().cloned());
             ("snap", args, false)
+        }
+        MaintenanceOperation::NpmUpgrade { package_ids } => {
+            let mut args = vec!["install".into(), "--global".into(), "--".into()];
+            args.extend(package_ids.iter().cloned());
+            ("npm", args, false)
+        }
+        MaintenanceOperation::PnpmUpgrade { package_ids } => {
+            let mut args = vec!["update".into(), "--global".into(), "--latest".into(), "--".into()];
+            args.extend(package_ids.iter().cloned());
+            ("pnpm", args, false)
+        }
+        MaintenanceOperation::UvUpgrade { package_ids } => {
+            let mut args = vec!["tool".into(), "upgrade".into()];
+            args.extend(package_ids.iter().cloned());
+            ("uv", args, false)
+        }
+        MaintenanceOperation::PipxUpgrade { package_ids } => {
+            let mut args = vec!["upgrade".into(), "--skip-maintenance".into()];
+            args.extend(package_ids.iter().cloned());
+            ("pipx", args, false)
         }
     };
 
@@ -271,6 +350,72 @@ mod tests {
             channel: None,
         };
         assert_eq!(provider_command(&operation, true).timeout, None);
+    }
+
+    #[test]
+    fn developer_mutations_are_user_local_and_shell_free() {
+        let cases = [
+            (
+                ProviderOperation::Cargo {
+                    action: OperationAction::Remove,
+                    package_id: "cargo-edit".into(),
+                },
+                "cargo",
+                vec!["uninstall", "--package", "cargo-edit"],
+            ),
+            (
+                ProviderOperation::Npm {
+                    action: OperationAction::Remove,
+                    package_id: "@scope/tool".into(),
+                },
+                "npm",
+                vec!["uninstall", "--global", "--", "@scope/tool"],
+            ),
+            (
+                ProviderOperation::Pnpm {
+                    action: OperationAction::Remove,
+                    package_id: "tool".into(),
+                },
+                "pnpm",
+                vec!["remove", "--global", "--", "tool"],
+            ),
+            (
+                ProviderOperation::Uv {
+                    action: OperationAction::Install,
+                    package_id: "ruff".into(),
+                },
+                "uv",
+                vec!["tool", "install", "ruff"],
+            ),
+            (
+                ProviderOperation::Pipx {
+                    action: OperationAction::Remove,
+                    package_id: "black".into(),
+                },
+                "pipx",
+                vec!["uninstall", "--skip-maintenance", "black"],
+            ),
+        ];
+        for (operation, program, args) in cases {
+            let command = provider_command(&operation, false);
+            assert_eq!(command.program, program);
+            assert_eq!(command.args, args);
+            assert_eq!(command.timeout, None);
+            assert!(!command.args.iter().any(|argument| argument == "sh" || argument == "-c"));
+        }
+    }
+
+    #[test]
+    fn developer_maintenance_is_exact_and_unprivileged() {
+        let operation = ProviderOperation::Maintenance {
+            operation: crate::transaction::MaintenanceOperation::UvUpgrade {
+                package_ids: vec!["ruff".into(), "black".into()],
+            },
+        };
+        let command = provider_command(&operation, false);
+        assert_eq!(command.program, "uv");
+        assert_eq!(command.args, ["tool", "upgrade", "ruff", "black"]);
+        assert_eq!(command.timeout, None);
     }
 
     #[test]

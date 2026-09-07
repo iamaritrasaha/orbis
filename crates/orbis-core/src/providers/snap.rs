@@ -510,6 +510,13 @@ fn capabilities() -> ProviderCapabilities {
         installed_state: true,
         installed_list: true,
         mutations: true,
+        install: true,
+        remove: true,
+        updates: true,
+        upgrade: true,
+        refresh: true,
+        cleanup: false,
+        why: true,
     }
 }
 

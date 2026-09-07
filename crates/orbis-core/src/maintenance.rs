@@ -379,6 +379,18 @@ pub fn maintenance_operation_for(plan: &ProviderMaintenancePlan) -> Option<Maint
                     .collect(),
             })
         }
+        (PackageSource::Npm, MaintenanceAction::Upgrade, _) => {
+            Some(MaintenanceOperation::NpmUpgrade { package_ids: Vec::new() })
+        }
+        (PackageSource::Pnpm, MaintenanceAction::Upgrade, _) => {
+            Some(MaintenanceOperation::PnpmUpgrade { package_ids: Vec::new() })
+        }
+        (PackageSource::Uv, MaintenanceAction::Upgrade, _) => {
+            Some(MaintenanceOperation::UvUpgrade { package_ids: Vec::new() })
+        }
+        (PackageSource::Pipx, MaintenanceAction::Upgrade, _) => {
+            Some(MaintenanceOperation::PipxUpgrade { package_ids: Vec::new() })
+        }
         _ => None,
     }
 }
