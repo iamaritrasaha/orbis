@@ -1,0 +1,90 @@
+.TH ORBIS 1 "2026-09-08" "Orbis 0.1.0-beta.1" "Orbis manual"
+.SH NAME
+orbis \- your Linux software, in one place
+.SH SYNOPSIS
+.B orbis
+.RI [ OPTIONS ]
+.RI [ COMMAND ]
+.SH DESCRIPTION
+Orbis is a Linux-first, provider-neutral interface for discovering software, explaining package metadata, reviewing transaction plans, and carrying out carefully confirmed package operations.
+.PP
+This is an early public Beta release. Orbis is safety-first but still evolving. Review every transaction plan before allowing package state to change.
+.SH OPTIONS
+.TP
+.B --json
+Emit structured JSON instead of terminal presentation.
+.TP
+.B --no-color
+Disable ANSI styling.
+.TP
+.B --plain
+Force the traditional terminal presentation.
+.TP
+.B -h, --help
+Print help.
+.TP
+.B -V, --version
+Print the Orbis version.
+.SH COMMANDS
+.TP
+.B dashboard
+Launch the interactive dashboard. \fBui\fR is an alias.
+.TP
+.B sources
+Show detected providers and read-only capabilities.
+.TP
+.B search \fIQUERY\fR
+Search available providers.
+.TP
+.B info \fIPACKAGE\fR
+Show normalized package metadata.
+.TP
+.B explain \fIPACKAGE\fR
+Explain a package in plain language.
+.TP
+.B doctor
+Run safe provider and environment diagnostics.
+.TP
+.B install \fIPACKAGE\fR
+Plan and, after confirmation, install one exact package.
+.TP
+.B remove \fIPACKAGE\fR
+Plan and, after confirmation, remove one exact package without purge or autoremove.
+.TP
+.B update
+Refresh package catalogs without upgrading installed software.
+.TP
+.B updates
+Show installed software with updates available. Read-only.
+.TP
+.B upgrade
+Plan and, after confirmation, apply safe available updates.
+.TP
+.B clean
+Plan and, after confirmation, remove confidently unused package-manager artifacts.
+.TP
+.B history
+Read sanitized Orbis transaction and maintenance history.
+.TP
+.B why \fIPACKAGE\fR
+Explain why one installed package or ref is present.
+.SH SAFETY
+.B --plan
+and
+.B --dry-run
+stop before execution. Without
+.B --yes,
+an actual operation requires an interactive terminal and an explicit confirmation. Administrator authorization is requested only for the exact system-scoped operation that has been reviewed.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/orbis/transactions/
+Sanitized transaction records.
+.TP
+.I $HOME/.local/state/orbis/transactions/
+Fallback transaction-record directory.
+.SH SEE ALSO
+.BR apt-get (8),
+.BR flatpak (1),
+.BR snap (8)
+.SH AUTHOR
+Aritra Saha

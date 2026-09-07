@@ -1,0 +1,23 @@
+# fish completion for Orbis 0.1.0-beta.1
+
+complete -c orbis -f
+complete -c orbis -n '__fish_use_subcommand' -a dashboard -d 'Launch the interactive dashboard'
+complete -c orbis -n '__fish_use_subcommand' -a ui -d 'Alias for dashboard'
+complete -c orbis -n '__fish_use_subcommand' -a sources -d 'Show detected providers'
+complete -c orbis -n '__fish_use_subcommand' -a search -d 'Search available providers'
+complete -c orbis -n '__fish_use_subcommand' -a info -d 'Show package metadata'
+complete -c orbis -n '__fish_use_subcommand' -a explain -d 'Explain a package'
+complete -c orbis -n '__fish_use_subcommand' -a doctor -d 'Run safe diagnostics'
+complete -c orbis -n '__fish_use_subcommand' -a install -d 'Plan and install a package'
+complete -c orbis -n '__fish_use_subcommand' -a remove -d 'Plan and remove a package'
+complete -c orbis -n '__fish_use_subcommand' -a update -d 'Refresh package catalogs'
+complete -c orbis -n '__fish_use_subcommand' -a updates -d 'Show available updates'
+complete -c orbis -n '__fish_use_subcommand' -a upgrade -d 'Plan and apply updates'
+complete -c orbis -n '__fish_use_subcommand' -a clean -d 'Plan conservative cleanup'
+complete -c orbis -n '__fish_use_subcommand' -a history -d 'Read transaction history'
+complete -c orbis -n '__fish_use_subcommand' -a why -d 'Explain why a package is present'
+complete -c orbis -l json -d 'Emit structured JSON'
+complete -c orbis -l no-color -d 'Disable ANSI styling'
+complete -c orbis -l plain -d 'Force plain presentation'
+complete -c orbis -l help -s h -d 'Print help'
+complete -c orbis -l version -s V -d 'Print version'

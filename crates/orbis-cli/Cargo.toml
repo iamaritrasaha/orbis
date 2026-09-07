@@ -3,11 +3,12 @@ name = "orbis"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Your Linux software, in one place."
+readme = "../../README.md"
 default-run = "orbis"
 
 [[bin]]
@@ -16,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-orbis-core = { path = "../orbis-core" }
+orbis-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true

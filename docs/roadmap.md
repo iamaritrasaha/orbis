@@ -44,7 +44,7 @@ Milestone 4 manages user-wide developer tools only. It does not manage project d
 
 The roadmap does not promise a daemon, hosted backend, telemetry, or AI dependency.
 
-## Milestone 5 — Signature terminal experience (current)
+## Milestone 5 — Signature terminal experience (complete)
 
 - Interactive Ratatui dashboard with read-only background loading.
 - Search, Orbis Brief package detail, unified updates, sources, history, why, help, resize, and safe plan review screens.
@@ -54,6 +54,8 @@ The roadmap does not promise a daemon, hosted backend, telemetry, or AI dependen
 
 This milestone does not add package ecosystems or a background service. The ordinary CLI and JSON contracts remain the automation surface.
 
-## Milestone 6 — release maturity (future)
+## Milestone 6 — release maturity (current)
 
-Installer/distribution, shell completions, man pages, packaging, release artifacts, a real integration matrix, performance work, documentation polish, and the first beta belong here. New provider breadth is not the immediate focus.
+The first beta release gate covers the release identity, reproducible Linux artifacts, user-owned installation, checksums, provenance, package/licensing metadata, release documentation, and CI validation. New provider breadth is not part of this milestone.
+
+The repository is release-ready for `v0.1.0-beta.1` once the complete local and CI validation suite passes. Publishing the version tag and GitHub Release remains an explicit final gate after those checks.

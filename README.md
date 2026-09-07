@@ -4,6 +4,10 @@ Your Linux software, in one place.
 
 Orbis is a Linux-first package-management experience built on top of the package managers people already trust. It brings system packages, desktop applications, and user-wide developer tools into one calm, understandable terminal interface without reimplementing dependency resolution or inventing a new package format.
 
+## 0.1.0-beta.1 — Beta
+
+This is Orbis's early public release: safety-first but still evolving. Orbis is Linux-first and currently targets GNU/Linux on x86_64 and ARM64. It is not a stable release. Continue reviewing every Orbis transaction plan before allowing package state to change; `--plan` and `--dry-run` are available whenever you want to inspect a plan without mutation.
+
 ## Milestone 4: system and developer-tool coverage — complete
 
 The current milestone keeps discovery and mutation as separate paths. Orbis can:
@@ -23,7 +27,7 @@ Developer providers manage user-wide tools only: Cargo binary crates, global npm
 
 See docs/maintenance.md for the exact meaning of update, updates, upgrade, clean, history, and why.
 
-## Milestone 5: Signature terminal experience
+## Milestone 5: Signature terminal experience — complete
 
 Orbis now has two complementary modes:
 
@@ -48,7 +52,46 @@ Updates   checking…
   r refreshes local/provider state · no catalog mutation
 ~~~
 
-## Try it
+## Install Beta 1
+
+Orbis 0.1.0-beta.1 is distributed through GitHub Releases. The installer and archives are Linux-only for this beta.
+
+### Recommended: GitHub release installer
+
+Once the release is available, install the matching prebuilt binary with the generated first-party installer:
+
+~~~sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/iamaritrasaha/orbis/releases/download/v0.1.0-beta.1/orbis-installer.sh | sh
+~~~
+
+The installer places Orbis in the user-owned `~/.local/bin` directory and does not require `sudo`. It may offer to add that directory to your login path; restarting the shell or sourcing the suggested environment file makes the command available. Installing Orbis is separate from Orbis later requesting administrator authorization for a system package operation.
+
+### Download an archive manually
+
+Choose the archive for your Linux architecture from the [0.1.0-beta.1 release](https://github.com/iamaritrasaha/orbis/releases/tag/v0.1.0-beta.1), download its matching `.sha256` file, and verify it before extracting. For x86_64, the archive is named `orbis-x86_64-unknown-linux-gnu.tar.xz`; ARM64 uses `orbis-aarch64-unknown-linux-gnu.tar.xz`. The archive contains the `orbis` binary, `README.md`, `LICENSE`, a man page, and shell completions.
+
+~~~sh
+version=0.1.0-beta.1
+target=x86_64-unknown-linux-gnu
+base=https://github.com/iamaritrasaha/orbis/releases/download/v${version}
+archive=orbis-${target}.tar.xz
+curl --proto '=https' --tlsv1.2 -fL -o "${archive}" "${base}/${archive}"
+curl --proto '=https' --tlsv1.2 -fL -o "${archive}.sha256" "${base}/${archive}.sha256"
+sha256sum --check "${archive}.sha256"
+tar -xJf "${archive}"
+cd "orbis-${target}"
+install -Dm755 orbis "$HOME/.local/bin/orbis"
+~~~
+
+### Build and install from source
+
+For developers working from a clone, install the CLI package explicitly from this workspace:
+
+~~~sh
+cargo install --path crates/orbis-cli
+~~~
+
+Or build without installing it:
 
 Build the binary with stable Rust:
 
@@ -174,6 +217,7 @@ docs/
   architecture.md
   developer-providers.md
   roadmap.md
+  releases.md
   transactions.md
 ~~~
 
@@ -185,8 +229,8 @@ See [docs/roadmap.md](docs/roadmap.md) for the scoped plan:
 2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records — complete.
 3. Updates, upgrades, cleanup, history, safety intelligence, and why — complete.
 4. Cargo, npm/pnpm, uv, and pipx — complete.
-5. Signature terminal experience — current.
-6. Release maturity — future: installer/distribution, completions, man pages, packaging, release artifacts, integration matrix, performance, docs, and first beta.
+5. Signature terminal experience — complete.
+6. Release maturity — current; see [docs/releases.md](docs/releases.md) for the beta release gate.
 
 ## Contributing
 
