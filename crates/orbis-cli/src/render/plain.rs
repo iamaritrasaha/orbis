@@ -20,7 +20,10 @@ impl Renderer {
     }
 
     pub(crate) fn home(&self, sources: &[SourceInfo]) -> String {
-        let mut output = self.heading("◈ ORBIS", "Your Linux software, in one place.");
+        let mut output = self.heading(
+            &format!("{} ORBIS", self.theme.mark(Token::Primary)),
+            "Your Linux software, in one place.",
+        );
         output.push_str("Sources\n");
         for source in sources {
             let token = state_token(&source.state);
@@ -609,6 +612,7 @@ mod tests {
             notes: Vec::new(),
         };
         assert!(renderer.home(std::slice::from_ref(&source)).contains("Your Linux software"));
+        assert!(renderer.home(std::slice::from_ref(&source)).contains("@ ORBIS"));
         assert!(renderer.sources(&[source]).contains("SYSTEM & DESKTOP"));
         let report = SearchReport {
             results: vec![package(PackageSource::Cargo, "bat", Some(true))],

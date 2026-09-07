@@ -100,6 +100,7 @@ impl Theme {
     pub(crate) fn mark(self, token: Token) -> &'static str {
         if self.unicode {
             match token {
+                Token::Primary => "◈",
                 Token::Positive => "●",
                 Token::Unavailable => "○",
                 Token::Caution => "◐",
@@ -107,6 +108,7 @@ impl Theme {
             }
         } else {
             match token {
+                Token::Primary => "@",
                 Token::Positive => "*",
                 Token::Unavailable => "o",
                 Token::Caution => "!",
