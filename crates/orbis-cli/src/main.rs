@@ -364,36 +364,38 @@ fn run_transaction(
             print!("{}", renderer.transaction_plan(&plan));
         }
 
+        let history = match orbis_core::transaction::history::HistoryStore::default_location() {
+            Ok(history) => history,
+            Err(error) => {
+                if json {
+                    print_json(&serde_json::json!({
+                        "status": "error",
+                        "message": format!("could not start transaction: {error}")
+                    }))?;
+                }
+                return Err(format!("could not start transaction: {error}"));
+            }
+        };
         let executor = RealOperationExecutor::new(registry.runner());
-        let result = match registry.execute_transaction(plan.clone(), &executor) {
+        let result = match registry.execute_transaction_with_history(
+            &request,
+            plan.clone(),
+            &executor,
+            &history,
+        ) {
             Ok(result) => result,
             Err(error) => {
-                let failed = TransactionResult {
-                    plan: plan.clone(),
-                    execution: orbis_core::transaction::ExecutionSummary {
-                        exit_status: None,
-                        process_succeeded: false,
-                        message: Some(error.to_string()),
-                    },
-                    verification: orbis_core::transaction::VerificationResult::Failed,
-                    status: orbis_core::transaction::TransactionStatus::Failed,
-                };
-                let history_error = record_transaction(&request, &failed).err();
                 if json {
-                    print_json(&failed)?;
-                }
-                if let Some(history_error) = history_error {
-                    return Err(history_error);
+                    print_json(&serde_json::json!({
+                        "status": "error",
+                        "message": error.to_string()
+                    }))?;
                 }
                 return Err(error.to_string());
             }
         };
-        let history_error = record_transaction(&request, &result).err();
         if json {
             print_json(&result)?;
-        }
-        if let Some(history_error) = history_error {
-            return Err(history_error);
         }
         if json {
             Ok(())
@@ -402,23 +404,6 @@ fn run_transaction(
             Ok(())
         }
     }
-}
-
-fn record_transaction(
-    request: &OperationRequest,
-    result: &TransactionResult,
-) -> Result<(), String> {
-    let store = orbis_core::transaction::history::HistoryStore::default_location()
-        .map_err(|error| format!("transaction completed but history was not written: {error}"))?;
-    let mut persisted = result.clone();
-    persisted.execution.message = None;
-    store
-        .write(
-            &orbis_core::transaction::history::TransactionRecord::new(request.clone(), persisted),
-            &result.plan.operation_id,
-        )
-        .map_err(|error| format!("transaction completed but history was not written: {error}"))?;
-    Ok(())
 }
 
 fn parse_transaction_ref(

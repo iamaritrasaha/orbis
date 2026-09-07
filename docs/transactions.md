@@ -24,6 +24,8 @@ Flatpak uses scoped installed listings and `remote-info --show-details`. Flatpak
 
 Snap uses `snap info` and exact installed-state inspection. Snap plans are partial because the CLI does not expose an equivalent zero-action impact simulation. An omitted channel means the provider's normal latest/stable selection. Removal intentionally omits `--purge`, so Snap's normal retained-data snapshot behavior remains intact.
 
+Read-only queries and planning commands use bounded timeouts. The real provider mutation command has no generic wall-clock timeout: Orbis allows APT, Flatpak, or Snap to complete normally and does not automatically kill an active package transaction. Only the separate `sudo -v` authorization check remains bounded.
+
 ## Confirmation and privilege
 
 Ambiguous resolution, invalid identifiers, unknown Flatpak remotes, incomplete plans, and blocked APT impact never reach confirmation. Noninteractive execution without `--yes` is refused. `--yes` only skips the Orbis prompt for the already resolved plan; it does not turn off provider safety checks.
@@ -32,7 +34,7 @@ System operations are represented by a closed `ProviderOperation` enum. The prod
 
 ## Records
 
-After an attempted execution, Orbis writes one JSON file under:
+After confirmation and immediately before invoking the typed provider operation, Orbis writes one JSON file with lifecycle `executing` under:
 
 ~~~text
 $XDG_STATE_HOME/orbis/transactions/
@@ -44,7 +46,7 @@ or, when `XDG_STATE_HOME` is not set:
 $HOME/.local/state/orbis/transactions/
 ~~~
 
-Records contain the request, resolved plan, exit status, and verification status. They do not contain raw stdout/stderr, command-line dumps, passwords, or tokens. A temporary file and rename provide atomic replacement for each record.
+The same operation ID is atomically replaced after execution and verification with lifecycle `succeeded`, `partially_verified`, or `failed`. Records contain the request, resolved plan, exit status, lifecycle, and verification status. They do not contain raw stdout/stderr, command-line dumps, passwords, or tokens. A temporary file and rename provide atomic replacement for each record. Legacy Milestone 2 records remain readable through schema defaults and lifecycle inference from their final result.
 
 ## Scope exclusions
 

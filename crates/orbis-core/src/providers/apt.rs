@@ -286,13 +286,7 @@ impl TransactionProvider for AptProvider {
             OperationAction::Install => "install",
             OperationAction::Remove => "remove",
         };
-        let command = CommandSpec::new(
-            "apt-get",
-            ["-s", "-o", "Debug::NoLocking=true", action, "--", target.provider_id.as_str()],
-        )
-        .with_env("LC_ALL", "C")
-        .with_env("DEBIAN_FRONTEND", "noninteractive")
-        .with_timeout(Duration::from_secs(60));
+        let command = simulation_command(action, &target.provider_id);
         let output =
             execute(&self.runner, PackageSource::Apt, "simulate the APT transaction", command)?;
         let output = expect_success(PackageSource::Apt, "simulate the APT transaction", output)?;
@@ -389,6 +383,13 @@ fn validate_package_id(package_id: &str) -> Result<(), TransactionError> {
         ));
     }
     Ok(())
+}
+
+fn simulation_command(action: &str, package_id: &str) -> CommandSpec {
+    CommandSpec::new("apt-get", ["-s", "-o", "Debug::NoLocking=true", action, "--", package_id])
+        .with_env("LC_ALL", "C")
+        .with_env("DEBIAN_FRONTEND", "noninteractive")
+        .with_timeout(Duration::from_secs(60))
 }
 
 fn parse_simulation_changes(output: &str) -> Vec<crate::transaction::PlannedChange> {
@@ -543,5 +544,10 @@ mod tests {
         assert_eq!(changes[1].kind, ChangeKind::Configure);
         assert_eq!(find_apt_size(output, "Need to get"), Some(2_500_000));
         assert_eq!(find_apt_disk_delta(output), Some(8_000_000));
+    }
+
+    #[test]
+    fn planning_command_remains_bounded() {
+        assert_eq!(simulation_command("install", "btop").timeout, Some(Duration::from_secs(60)));
     }
 }

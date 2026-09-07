@@ -57,11 +57,13 @@ Providers receive a `CommandRunner`. The production implementation uses `std::pr
 
 The test seam accepts a fake runner, allowing parser, aggregation, and unavailable-provider tests to run without executing any package manager. The process module also captures non-zero status and retains technical detail for JSON or debugging without exposing it in normal prose.
 
+Timeout policy is part of the process boundary: metadata and planning calls are bounded, while an active typed package mutation has no generic automatic kill timeout. Provider-aware cancellation is intentionally deferred.
+
 The transaction planner produces a typed `ProviderOperation`, never an arbitrary program and argument string. The production privilege boundary performs a narrow `sudo -v` authorization followed by an exact non-interactive typed command. It does not accept shell input, handle passwords, or expose `run_as_root(program, args)`.
 
 APT planning invokes `apt-get -s -o Debug::NoLocking=true` with `LC_ALL=C` and `DEBIAN_FRONTEND=noninteractive` scoped to that process. The parser normalizes install/remove/configure lines and blocks plans that report additional removals. Flatpak planning uses read-only `remote-info` and scoped installed listings; it is marked partial because runtimes and extensions may be resolved at commit. Snap planning uses `snap info`, defaults to latest/stable when no channel is supplied, and is marked partial because Snap has no equivalent no-action impact simulation.
 
-Provider execution is followed by a scoped installed-state check. Results distinguish succeeded, partially verified, and failed. The CLI writes sanitized JSON transaction records atomically under `$XDG_STATE_HOME/orbis/transactions`, falling back to `$HOME/.local/state/orbis/transactions`.
+Provider execution is followed by a scoped installed-state check. Results distinguish succeeded, partially verified, and failed. After confirmation, the core writes an `executing` record before invoking the provider operation, then atomically replaces the same operation ID with the final sanitized result under `$XDG_STATE_HOME/orbis/transactions`, falling back to `$HOME/.local/state/orbis/transactions`.
 
 ## Orbis Brief
 

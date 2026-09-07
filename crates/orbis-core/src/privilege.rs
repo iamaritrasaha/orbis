@@ -48,10 +48,7 @@ impl OperationExecutor for RealOperationExecutor {
             if !self.runner.is_available("sudo") {
                 return Err(PrivilegeError::Unavailable);
             }
-            let auth = CommandSpec::new("sudo", ["-v"])
-                .with_timeout(Duration::from_secs(300))
-                .with_stdio(StdioMode::Inherit)
-                .with_stdin(StdioMode::Inherit);
+            let auth = authorization_command();
             let output = self.runner.run(&auth).map_err(|error| {
                 PrivilegeError::Execution(PackageSource::Apt, error.to_string())
             })?;
@@ -118,7 +115,6 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
 
     let mut command = if elevated {
         let mut sudo_args = vec!["-n".into()];
-        // `-n` was already added to `args` for the provider branch; remove that duplicate.
         sudo_args.push(program.into());
         sudo_args.extend(args);
         CommandSpec::new("sudo", sudo_args)
@@ -128,7 +124,16 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
     if matches!(operation.source(), PackageSource::Apt) {
         command = command.with_env("LC_ALL", "C").with_env("DEBIAN_FRONTEND", "noninteractive");
     }
-    command.with_timeout(Duration::from_secs(30))
+    // Mutation commands intentionally have no generic wall-clock timeout. A provider-aware
+    // cancellation design can be added later without killing an active package transaction.
+    command
+}
+
+fn authorization_command() -> CommandSpec {
+    CommandSpec::new("sudo", ["-v"])
+        .with_timeout(Duration::from_secs(300))
+        .with_stdio(StdioMode::Inherit)
+        .with_stdin(StdioMode::Inherit)
 }
 
 fn scope_flag(scope: InstallScope) -> &'static str {
@@ -181,5 +186,21 @@ mod tests {
         assert_eq!(command.args[0..3], ["-n", "flatpak", "install"]);
         assert!(!command.args[3..].contains(&"-n".into()));
         assert!(command.args.contains(&"--system".into()));
+    }
+
+    #[test]
+    fn typed_mutation_commands_have_no_generic_timeout() {
+        let operation = ProviderOperation::Snap {
+            action: OperationAction::Remove,
+            package_id: "example".into(),
+            channel: None,
+        };
+        assert_eq!(provider_command(&operation, true).timeout, None);
+    }
+
+    #[test]
+    fn authorization_has_a_separate_bounded_timeout() {
+        let auth = authorization_command();
+        assert_eq!(auth.timeout, Some(Duration::from_secs(300)));
     }
 }

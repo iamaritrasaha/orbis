@@ -195,6 +195,69 @@ impl ProviderRegistry {
         Ok(TransactionResult { plan, execution, verification, status })
     }
 
+    /// Writes an executing record before invoking a typed mutation, then atomically replaces it
+    /// with the verified outcome. An inability to write the start record fails closed.
+    pub fn execute_transaction_with_history(
+        &self,
+        request: &OperationRequest,
+        plan: OperationPlan,
+        executor: &dyn OperationExecutor,
+        history: &transaction::history::HistoryStore,
+    ) -> Result<TransactionResult, TransactionError> {
+        if !plan.executable() {
+            return Err(TransactionError::Blocked(
+                "the plan is incomplete or was classified as blocked".into(),
+            ));
+        }
+        let operation_id = plan.operation_id.clone();
+        history
+            .write(
+                &transaction::history::TransactionRecord::execution_started(
+                    request.clone(),
+                    plan.clone(),
+                ),
+                &operation_id,
+            )
+            .map_err(TransactionError::History)?;
+
+        match self.execute_transaction(plan.clone(), executor) {
+            Ok(result) => {
+                history
+                    .write(
+                        &transaction::history::TransactionRecord::completed(
+                            request.clone(),
+                            result.clone(),
+                        ),
+                        &operation_id,
+                    )
+                    .map_err(TransactionError::History)?;
+                Ok(result)
+            }
+            Err(error) => {
+                let failed = TransactionResult {
+                    plan,
+                    execution: ExecutionSummary {
+                        exit_status: None,
+                        process_succeeded: false,
+                        message: Some(error.to_string()),
+                    },
+                    verification: VerificationResult::Failed,
+                    status: TransactionStatus::Failed,
+                };
+                history
+                    .write(
+                        &transaction::history::TransactionRecord::completed(
+                            request.clone(),
+                            failed,
+                        ),
+                        &operation_id,
+                    )
+                    .map_err(TransactionError::History)?;
+                Err(error)
+            }
+        }
+    }
+
     /// Runs safe diagnostics for every selected provider.
     pub fn diagnostics(&self, source: Option<PackageSource>) -> diagnostics::DoctorReport {
         let mut checks = Vec::new();
@@ -297,7 +360,9 @@ mod tests {
     };
     use std::{
         collections::BTreeSet,
+        fs,
         sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     struct FakeRunner {
@@ -398,6 +463,8 @@ mod tests {
 
     struct FakeOperationExecutor {
         runner: Arc<TransactionFakeRunner>,
+        start_record: Option<std::path::PathBuf>,
+        fail: bool,
     }
 
     impl OperationExecutor for FakeOperationExecutor {
@@ -406,6 +473,22 @@ mod tests {
             operation: &crate::transaction::ProviderOperation,
             _requirement: crate::transaction::PrivilegeRequirement,
         ) -> Result<CommandOutput, crate::privilege::PrivilegeError> {
+            if let Some(path) = &self.start_record {
+                let body = fs::read_to_string(path).expect("start record exists before executor");
+                let record: crate::transaction::history::TransactionRecord =
+                    serde_json::from_str(&body).expect("start record parses");
+                assert_eq!(
+                    record.lifecycle,
+                    crate::transaction::history::TransactionLifecycle::Executing
+                );
+                assert!(record.result.is_none());
+            }
+            if self.fail {
+                return Err(crate::privilege::PrivilegeError::Execution(
+                    PackageSource::Apt,
+                    "simulated provider failure".into(),
+                ));
+            }
             if let crate::transaction::ProviderOperation::Apt { action, .. } = operation {
                 *self.runner.installed.lock().expect("state lock") =
                     *action == OperationAction::Install;
@@ -482,10 +565,85 @@ mod tests {
         let plan = registry.plan_transaction(&request).expect("plan");
         assert!(plan.authoritative_simulation);
         let result = registry
-            .execute_transaction(plan, &FakeOperationExecutor { runner })
+            .execute_transaction(
+                plan,
+                &FakeOperationExecutor { runner, start_record: None, fail: false },
+            )
             .expect("execution");
         assert_eq!(result.status, crate::transaction::TransactionStatus::Succeeded);
         assert_eq!(result.verification, crate::transaction::VerificationResult::Verified);
+    }
+
+    #[test]
+    fn history_starts_before_successful_execution_and_is_replaced() {
+        let runner = Arc::new(TransactionFakeRunner::new());
+        let registry = ProviderRegistry::with_runner(runner.clone());
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
+            scope: None,
+            channel: None,
+        };
+        let plan = registry.plan_transaction(&request).expect("plan");
+        let directory = temporary_test_directory("success");
+        let history = crate::transaction::history::HistoryStore::at(&directory);
+        let start_record = history.record_path(&plan.operation_id);
+        let result = registry
+            .execute_transaction_with_history(
+                &request,
+                plan,
+                &FakeOperationExecutor {
+                    runner,
+                    start_record: Some(start_record.clone()),
+                    fail: false,
+                },
+                &history,
+            )
+            .expect("execution");
+        assert_eq!(result.status, crate::transaction::TransactionStatus::Succeeded);
+        let body = fs::read_to_string(start_record).expect("final record exists");
+        let record: crate::transaction::history::TransactionRecord =
+            serde_json::from_str(&body).expect("final record parses");
+        assert_eq!(record.lifecycle, crate::transaction::history::TransactionLifecycle::Succeeded);
+        assert!(record.result.is_some());
+        assert!(record.result.as_ref().is_some_and(|result| result.execution.message.is_none()));
+        assert!(!body.contains("simulated"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn history_records_failed_execution_after_the_start_record() {
+        let runner = Arc::new(TransactionFakeRunner::new());
+        let registry = ProviderRegistry::with_runner(runner.clone());
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
+            scope: None,
+            channel: None,
+        };
+        let plan = registry.plan_transaction(&request).expect("plan");
+        let directory = temporary_test_directory("failure");
+        let history = crate::transaction::history::HistoryStore::at(&directory);
+        let path = history.record_path(&plan.operation_id);
+        let result = registry.execute_transaction_with_history(
+            &request,
+            plan,
+            &FakeOperationExecutor { runner, start_record: Some(path.clone()), fail: true },
+            &history,
+        );
+        assert!(matches!(result, Err(crate::transaction::TransactionError::Execution(_))));
+        let body = fs::read_to_string(path).expect("failed record exists");
+        let record: crate::transaction::history::TransactionRecord =
+            serde_json::from_str(&body).expect("failed record parses");
+        assert_eq!(record.lifecycle, crate::transaction::history::TransactionLifecycle::Failed);
+        assert!(record.result.is_some());
+        assert!(record.result.as_ref().is_some_and(|result| result.execution.message.is_none()));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    fn temporary_test_directory(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        std::env::temp_dir().join(format!("orbis-transaction-{label}-{unique}"))
     }
 
     #[test]
