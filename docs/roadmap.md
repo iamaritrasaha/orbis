@@ -33,7 +33,7 @@ Not included in this milestone: upgrades, update-all, autoremove, cleanup, rollb
 
 Milestone 3 establishes update versus updates versus upgrade semantics, provider-scoped maintenance, non-atomic unified results, revalidation, APT autoremove planning, history queries, and truthful provider limitations.
 
-## Milestone 4 — additional ecosystems (current)
+## Milestone 4 — additional ecosystems (complete)
 
 - Cargo.
 - npm and pnpm.
@@ -43,3 +43,17 @@ Milestone 3 establishes update versus updates versus upgrade semantics, provider
 Milestone 4 manages user-wide developer tools only. It does not manage project dependency graphs, package manifests, lockfiles, virtual environments, or caches. Cargo automatic updates remain incomplete when original install provenance cannot be proven safely. npm excludes suspicious newer-than-latest installs, uv preserves recorded constraints/settings, and pipx preserves pins.
 
 The roadmap does not promise a daemon, hosted backend, telemetry, or AI dependency.
+
+## Milestone 5 — Signature terminal experience (current)
+
+- Interactive Ratatui dashboard with read-only background loading.
+- Search, Orbis Brief package detail, unified updates, sources, history, why, help, resize, and safe plan review screens.
+- Centralized terminal theme with color, `NO_COLOR`, monochrome, and ASCII fallbacks.
+- Extracted CLI parsing, command orchestration, plain rendering, and TUI presentation boundaries.
+- Deterministic plain and in-memory TUI rendering tests.
+
+This milestone does not add package ecosystems or a background service. The ordinary CLI and JSON contracts remain the automation surface.
+
+## Milestone 6 — release maturity (future)
+
+Installer/distribution, shell completions, man pages, packaging, release artifacts, a real integration matrix, performance work, documentation polish, and the first beta belong here. New provider breadth is not the immediate focus.

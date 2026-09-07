@@ -903,11 +903,11 @@ fn parse_control_records(text: &str) -> Vec<BTreeMap<String, String>> {
                 last_key = None;
             }
         } else if line.starts_with(char::is_whitespace) {
-            if let Some(key) = &last_key {
-                if let Some(value) = record.get_mut(key) {
-                    value.push('\n');
-                    value.push_str(line.trim_end());
-                }
+            if let Some(key) = &last_key
+                && let Some(value) = record.get_mut(key)
+            {
+                value.push('\n');
+                value.push_str(line.trim_end());
             }
         } else if let Some((key, value)) = line.split_once(':') {
             let key = key.to_owned();

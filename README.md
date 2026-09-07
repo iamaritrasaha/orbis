@@ -4,7 +4,7 @@ Your Linux software, in one place.
 
 Orbis is a Linux-first package-management experience built on top of the package managers people already trust. It brings system packages, desktop applications, and user-wide developer tools into one calm, understandable terminal interface without reimplementing dependency resolution or inventing a new package format.
 
-## Milestone 4: system and developer-tool coverage
+## Milestone 4: system and developer-tool coverage — complete
 
 The current milestone keeps discovery and mutation as separate paths. Orbis can:
 
@@ -23,6 +23,31 @@ Developer providers manage user-wide tools only: Cargo binary crates, global npm
 
 See docs/maintenance.md for the exact meaning of update, updates, upgrade, clean, history, and why.
 
+## Milestone 5: Signature terminal experience
+
+Orbis now has two complementary modes:
+
+- fast, script-friendly commands such as `orbis search ripgrep`, `orbis updates`, and `orbis upgrade --plan`;
+- an interactive dashboard launched by `orbis` in a capable TTY, or explicitly with `orbis dashboard` (the short alias is `orbis ui`).
+
+The dashboard opens with provider state and confirmed updates, then lets you search with `/`, move with arrows or `j`/`k`, inspect an Orbis Brief, review updates, browse sources and history, and read `why` explanations. `r` refreshes read-only local/provider state; it never refreshes package indexes. TUI mutations always return to the same typed plan, confirmation, executor, verification, and history path used by the CLI. `--plain`, `TERM=dumb`, `NO_COLOR`, JSON mode, pipes, and non-interactive input remain safe fallbacks.
+
+Preview at 80 columns:
+
+~~~text
+◈ ORBIS
+  Your Linux software, in one place.
+
+SYSTEM & DESKTOP             DEVELOPER TOOLS
+  ● APT       ready             ● Cargo     ready
+  ○ Flatpak   unavailable       ● npm       ready
+  ● Snap      ready             ◐ pnpm      restricted
+                                 ● uv        ready
+                                 ○ pipx      unavailable
+Updates   checking…
+  r refreshes local/provider state · no catalog mutation
+~~~
+
 ## Try it
 
 Build the binary with stable Rust:
@@ -36,6 +61,8 @@ Typical commands:
 
 ~~~text
 orbis
+orbis dashboard
+orbis --plain
 orbis sources
 orbis search btop
 orbis search btop --source apt
@@ -142,7 +169,7 @@ The test suite uses provider fixtures and an injectable process runner. It does 
 ~~~text
 crates/
   orbis-core/    models, process runner, providers, transactions, privilege, explanations, diagnostics
-  orbis-cli/     clap command language and terminal presentation
+  orbis-cli/     cli.rs parsing, commands.rs orchestration, render/ plain output and theme, tui/ dashboard
 docs/
   architecture.md
   developer-providers.md
@@ -157,7 +184,9 @@ See [docs/roadmap.md](docs/roadmap.md) for the scoped plan:
 1. Foundation and read-only discovery — complete.
 2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records — complete.
 3. Updates, upgrades, cleanup, history, safety intelligence, and why — complete.
-4. Cargo, npm/pnpm, uv, and pipx — current.
+4. Cargo, npm/pnpm, uv, and pipx — complete.
+5. Signature terminal experience — current.
+6. Release maturity — future: installer/distribution, completions, man pages, packaging, release artifacts, integration matrix, performance, docs, and first beta.
 
 ## Contributing
 

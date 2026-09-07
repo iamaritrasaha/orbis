@@ -289,29 +289,29 @@ impl HistoryStore {
                 continue;
             }
             let body = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-            if let Ok(record) = serde_json::from_str::<MaintenanceRecord>(&body) {
-                if record.plan.operation_id.starts_with("maint-") {
-                    let status = record.result.as_ref().map_or_else(
-                        || "executing".into(),
-                        |result| format!("{:?}", result.status).to_ascii_lowercase(),
-                    );
-                    entries.push(HistoryEntry {
-                        kind: "maintenance".into(),
-                        operation_id: record.plan.operation_id.clone(),
-                        recorded_at_unix_ms: record.recorded_at_unix_ms,
-                        action: record.plan.action.label().into(),
-                        source: record.plan.source,
-                        package: None,
-                        scope: None,
-                        status,
-                        verification: None,
-                        risk: Some(record.plan.risk),
-                        message: record.result.as_ref().and_then(|result| {
-                            result.providers.iter().find_map(|provider| provider.message.clone())
-                        }),
-                    });
-                    continue;
-                }
+            if let Ok(record) = serde_json::from_str::<MaintenanceRecord>(&body)
+                && record.plan.operation_id.starts_with("maint-")
+            {
+                let status = record.result.as_ref().map_or_else(
+                    || "executing".into(),
+                    |result| format!("{:?}", result.status).to_ascii_lowercase(),
+                );
+                entries.push(HistoryEntry {
+                    kind: "maintenance".into(),
+                    operation_id: record.plan.operation_id.clone(),
+                    recorded_at_unix_ms: record.recorded_at_unix_ms,
+                    action: record.plan.action.label().into(),
+                    source: record.plan.source,
+                    package: None,
+                    scope: None,
+                    status,
+                    verification: None,
+                    risk: Some(record.plan.risk),
+                    message: record.result.as_ref().and_then(|result| {
+                        result.providers.iter().find_map(|provider| provider.message.clone())
+                    }),
+                });
+                continue;
             }
             if let Ok(record) = serde_json::from_str::<TransactionRecord>(&body) {
                 let Some(plan) = record.resolved_plan() else { continue };

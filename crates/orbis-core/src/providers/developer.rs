@@ -1340,26 +1340,25 @@ impl MaintenanceProvider for PipxProvider {
                 ));
                 continue;
             }
-            if let Some(latest) = metadata.get("latest_version") {
-                if tool.package.version.as_deref() != Some(latest) {
-                    candidates.push(UpdateCandidate {
-                        source: PackageSource::Pipx,
-                        provider_id: tool.package.provider_id.clone(),
-                        name: tool.package.name.clone(),
-                        current_version: tool.package.version.clone(),
-                        available_version: Some(latest.clone()),
-                        architecture: None,
-                        scope: Some(InstallScope::User),
-                        channel: None,
-                        held: Some(false),
-                        security_relevance: None,
-                        notes: vec![
-                            "pipx upgrade candidate from pipx's structured outdated snapshot."
-                                .into(),
-                        ],
-                        metadata: metadata.clone(),
-                    });
-                }
+            if let Some(latest) = metadata.get("latest_version")
+                && tool.package.version.as_deref() != Some(latest)
+            {
+                candidates.push(UpdateCandidate {
+                    source: PackageSource::Pipx,
+                    provider_id: tool.package.provider_id.clone(),
+                    name: tool.package.name.clone(),
+                    current_version: tool.package.version.clone(),
+                    available_version: Some(latest.clone()),
+                    architecture: None,
+                    scope: Some(InstallScope::User),
+                    channel: None,
+                    held: Some(false),
+                    security_relevance: None,
+                    notes: vec![
+                        "pipx upgrade candidate from pipx's structured outdated snapshot.".into(),
+                    ],
+                    metadata: metadata.clone(),
+                });
             }
         }
         Ok(ProviderUpdateInventory {
@@ -2067,16 +2066,16 @@ fn parse_pnpm_outdated(
             item.get("latest").or_else(|| item.get("latestVersion")).and_then(Value::as_str);
         let wanted =
             item.get("wanted").or_else(|| item.get("wantedVersion")).and_then(Value::as_str);
-        if let (Some(current), Some(latest)) = (current, latest) {
-            if current != latest {
-                candidates.push(update_candidate(
-                    PackageSource::Pnpm,
-                    name,
-                    current.into(),
-                    Some(latest.into()),
-                    wanted.map(str::to_owned),
-                ));
-            }
+        if let (Some(current), Some(latest)) = (current, latest)
+            && current != latest
+        {
+            candidates.push(update_candidate(
+                PackageSource::Pnpm,
+                name,
+                current.into(),
+                Some(latest.into()),
+                wanted.map(str::to_owned),
+            ));
         }
     };
     if let Some(object) = value.as_object() {

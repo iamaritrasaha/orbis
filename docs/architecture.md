@@ -4,8 +4,10 @@ Orbis is split into a small library crate and a binary crate:
 
 ~~~text
 orbis-cli
-  command parsing
-  terminal renderer
+  cli.rs              command parsing and typed CLI arguments
+  commands.rs         command orchestration and safety-boundary calls
+  render/             plain output and centralized theme tokens
+  tui/                event loop, screens, workers, and Ratatui rendering
   JSON/stdout policy
         |
 orbis-core
@@ -88,7 +90,11 @@ The evidence structure leaves room for richer local metadata sources later witho
 
 ## Rendering and automation
 
-The core never emits ANSI or terminal decoration. The CLI renderer owns color, Unicode fallback, wrapping, and spacing. ANSI is enabled only for a TTY and is disabled by `NO_COLOR` or `--no-color`. Piped output remains plain, and the renderer uses simple ASCII markers when `TERM=dumb`.
+The core never emits ANSI or terminal decoration. `render/theme.rs` owns semantic tokens for identity, hierarchy, state, provider badges, risk, and surfaces. It adapts plain output and Ratatui styles to truecolor, 256-color, or basic terminals, and disables styling for `NO_COLOR`, `--no-color`, or monochrome operation. Piped output remains plain, and `TERM=dumb` selects ASCII markers.
+
+`orbis` launches the TUI only when stdin and stdout are terminals and `TERM` is not `dumb`. `orbis dashboard`/`orbis ui` can be explicit, while `--plain` is an escape hatch. JSON always bypasses the TUI. `ratatui::run` owns the Crossterm raw-mode/alternate-screen lifecycle and restores the terminal on normal exit or returned initialization/draw errors. The event loop handles Ctrl-C, Escape/back, resize through Ratatui's current frame area, and a minimum-size message instead of drawing off-screen.
+
+The dashboard creates bounded, read-only standard-thread workers for source snapshots, update inventories, searches, and plans. They communicate through a channel; the event loop never waits on provider I/O. Package mutations are not background work: a selected action first requests an `OperationPlan`, displays it in a review overlay, rejects blocked plans, and only then calls the same typed executor and history lifecycle as the plain CLI. Upgrade review is likewise a read-only maintenance plan.
 
 `--json` changes the stdout contract to structured data for the home view, `sources`, `search`, `info`, `explain`, `doctor`, and transaction plans/results. Decorative messages are not mixed into JSON stdout. Human-readable provider issues remain available as structured fields. Mutation commands refuse non-interactive execution unless `--yes` is supplied; `--plan` and `--dry-run` never cross the execution boundary.
 
