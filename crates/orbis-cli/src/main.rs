@@ -8,6 +8,10 @@ use orbis_core::{
     ProviderRegistry, ResolveReport, SearchReport,
     diagnostics::DoctorReport,
     explain::build_brief,
+    maintenance::{
+        MaintenanceAction, MaintenancePlan, MaintenanceProviderResult, MaintenanceProviderStatus,
+        MaintenanceResult, MaintenanceStatus, UpdateInventoryReport, WhyReport,
+    },
     models::{Package, PackageSource, SourceInfo},
     parse_package_ref,
     privilege::RealOperationExecutor,
@@ -102,6 +106,67 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Refresh package catalogs without upgrading installed software.
+    Update {
+        /// Restrict the refresh to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// Show the refresh plan without changing catalog metadata.
+        #[arg(long)]
+        plan: bool,
+        /// Skip Orbis's confirmation prompt for this exact refresh plan.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show installed software with updates available. Read-only.
+    Updates {
+        /// Restrict the inventory to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+    },
+    /// Plan and, after confirmation, apply safe available updates.
+    Upgrade {
+        /// Restrict the upgrade to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// Show the coordinated upgrade plan without changing package state.
+        #[arg(long)]
+        plan: bool,
+        /// Skip Orbis's confirmation prompt for this exact plan.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Plan and, after confirmation, remove confidently unused package-manager artifacts.
+    Clean {
+        /// Restrict cleanup to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// Show cleanup candidates without changing package state.
+        #[arg(long)]
+        plan: bool,
+        /// Skip Orbis's confirmation prompt for this exact plan.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Read Orbis transaction and maintenance history.
+    History {
+        /// Show one exact operation ID instead of the recent list.
+        operation_id: Option<String>,
+        /// Maximum number of rows to display.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Restrict history rows to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+    },
+    /// Explain why one installed package or ref is present.
+    Why {
+        /// Package ID or source-qualified reference.
+        package: String,
+        /// Restrict resolution to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -162,7 +227,8 @@ fn run() -> Result<(), String> {
                     "tagline": "Your Linux software, in one place.",
                     "sources": registry.sources(),
                     "planning_read_only": true,
-                    "supported_mutations": ["install", "remove"]
+                    "supported_mutations": ["install", "remove", "update", "upgrade", "clean"],
+                    "read_only_maintenance": ["updates", "history", "why"]
                 });
                 print_json(&payload)
             } else {
@@ -282,6 +348,54 @@ fn run() -> Result<(), String> {
                 yes,
             },
         ),
+        Some(Command::Update { source, plan, yes }) => run_maintenance(
+            &registry,
+            &renderer,
+            cli.json,
+            MaintenanceOptions {
+                action: MaintenanceAction::Refresh,
+                source: source.map(Into::into),
+                plan_only: plan,
+                yes,
+            },
+        ),
+        Some(Command::Updates { source }) => {
+            let report = registry.updates(source.map(Into::into));
+            if cli.json {
+                print_json(&report)
+            } else {
+                print!("{}", renderer.updates(&report));
+                Ok(())
+            }
+        }
+        Some(Command::Upgrade { source, plan, yes }) => run_maintenance(
+            &registry,
+            &renderer,
+            cli.json,
+            MaintenanceOptions {
+                action: MaintenanceAction::Upgrade,
+                source: source.map(Into::into),
+                plan_only: plan,
+                yes,
+            },
+        ),
+        Some(Command::Clean { source, plan, yes }) => run_maintenance(
+            &registry,
+            &renderer,
+            cli.json,
+            MaintenanceOptions {
+                action: MaintenanceAction::Cleanup,
+                source: source.map(Into::into),
+                plan_only: plan,
+                yes,
+            },
+        ),
+        Some(Command::History { operation_id, limit, source }) => {
+            run_history(&renderer, cli.json, operation_id, limit, source.map(Into::into))
+        }
+        Some(Command::Why { package, source }) => {
+            run_why(&registry, &renderer, cli.json, package, source.map(Into::into))
+        }
     }
 }
 
@@ -406,6 +520,305 @@ fn run_transaction(
     }
 }
 
+struct MaintenanceOptions {
+    action: MaintenanceAction,
+    source: Option<PackageSource>,
+    plan_only: bool,
+    yes: bool,
+}
+
+fn run_maintenance(
+    registry: &ProviderRegistry,
+    renderer: &Renderer,
+    json: bool,
+    options: MaintenanceOptions,
+) -> Result<(), String> {
+    let plan = match registry.maintenance_plan(options.action, options.source) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if json {
+                print_json(&serde_json::json!({ "status": "error", "message": error }))?;
+            }
+            return Err(error);
+        }
+    };
+    if options.plan_only {
+        if json {
+            print_json(&plan)
+        } else {
+            print!("{}", renderer.maintenance_plan(&plan));
+            Ok(())
+        }
+    } else if !plan.executable() {
+        let message = "no executable provider plan is available; unsupported or blocked providers were not changed";
+        if json {
+            print_json(&serde_json::json!({
+                "status": "blocked",
+                "plan": plan,
+                "message": message
+            }))?;
+        }
+        Err(message.into())
+    } else if plan.mutates
+        && !options.yes
+        && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
+    {
+        let message = "confirmation is required: use an interactive terminal or pass --yes after reviewing the plan";
+        if json {
+            print_json(&serde_json::json!({
+                "status": "confirmation_required",
+                "plan": plan,
+                "message": message
+            }))?;
+        }
+        Err(message.into())
+    } else {
+        if options.action == MaintenanceAction::Upgrade {
+            registry.revalidate_upgrade_plan(&plan)?;
+        }
+        if plan.mutates && !options.yes {
+            print!("{}", renderer.maintenance_plan(&plan));
+            if !confirm_maintenance(&plan)? {
+                return Err("operation cancelled; no package state was changed".into());
+            }
+            if options.action == MaintenanceAction::Upgrade {
+                registry.revalidate_upgrade_plan(&plan)?;
+            }
+        } else if !json {
+            print!("{}", renderer.maintenance_plan(&plan));
+        }
+
+        let executor = RealOperationExecutor::new(registry.runner());
+        let history = if plan.mutates {
+            let history = orbis_core::transaction::history::HistoryStore::default_location()
+                .map_err(|error| format!("could not open history: {error}"))?;
+            history
+                .write_maintenance(
+                    &orbis_core::transaction::history::MaintenanceRecord::execution_started(
+                        plan.clone(),
+                    ),
+                    &plan.operation_id,
+                )
+                .map_err(|error| format!("could not start maintenance record: {error}"))?;
+            Some(history)
+        } else {
+            None
+        };
+        let mut provider_results = Vec::new();
+        let mut authorization_failed = false;
+        for provider_plan in &plan.providers {
+            if !provider_plan.executable() {
+                provider_results.push(MaintenanceProviderResult {
+                    source: provider_plan.source,
+                    action: provider_plan.action,
+                    status: MaintenanceProviderStatus::Skipped,
+                    candidate_count: provider_plan
+                        .candidates
+                        .len()
+                        .max(provider_plan.cleanup_candidates.len()),
+                    verification: None,
+                    message: provider_plan.warnings.iter().find_map(|warning| {
+                        (warning.level == orbis_core::transaction::WarningLevel::Blocked)
+                            .then(|| warning.message.clone())
+                    }),
+                });
+                continue;
+            }
+            match registry.execute_maintenance(provider_plan, &executor) {
+                Ok(result) => provider_results.extend(result.providers),
+                Err(error) => {
+                    provider_results.push(MaintenanceProviderResult {
+                        source: provider_plan.source,
+                        action: provider_plan.action,
+                        status: MaintenanceProviderStatus::Failed,
+                        candidate_count: provider_plan
+                            .candidates
+                            .len()
+                            .max(provider_plan.cleanup_candidates.len()),
+                        verification: None,
+                        message: Some(error.clone()),
+                    });
+                    if provider_plan.privilege
+                        == orbis_core::transaction::PrivilegeRequirement::Administrator
+                        && error.to_ascii_lowercase().contains("authoriz")
+                    {
+                        authorization_failed = true;
+                    }
+                    if authorization_failed {
+                        break;
+                    }
+                }
+            }
+        }
+        let status = maintenance_status(&provider_results);
+        let result = MaintenanceResult {
+            operation_id: plan.operation_id.clone(),
+            action: plan.action,
+            status,
+            providers: provider_results,
+        };
+
+        if let Some(history) = history {
+            history
+                .write_maintenance(
+                    &orbis_core::transaction::history::MaintenanceRecord::completed(
+                        plan.clone(),
+                        result.clone(),
+                    ),
+                    &plan.operation_id,
+                )
+                .map_err(|error| format!("could not record maintenance: {error}"))?;
+        }
+        if json {
+            print_json(&result)?;
+        } else {
+            print!("{}", renderer.maintenance_result(&result));
+        }
+        if matches!(result.status, MaintenanceStatus::Failed | MaintenanceStatus::Blocked) {
+            Err(format!("{} run did not complete successfully", options.action.label()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn maintenance_status(results: &[MaintenanceProviderResult]) -> MaintenanceStatus {
+    if results.is_empty() {
+        return MaintenanceStatus::Blocked;
+    }
+    let succeeded = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.status,
+                MaintenanceProviderStatus::Succeeded
+                    | MaintenanceProviderStatus::PartiallySucceeded
+            )
+        })
+        .count();
+    let failed = results.iter().any(|result| result.status == MaintenanceProviderStatus::Failed);
+    let skipped = results.iter().any(|result| {
+        matches!(
+            result.status,
+            MaintenanceProviderStatus::Skipped | MaintenanceProviderStatus::Blocked
+        )
+    });
+    if failed && succeeded > 0 || skipped && succeeded > 0 {
+        MaintenanceStatus::PartiallySucceeded
+    } else if failed {
+        MaintenanceStatus::Failed
+    } else if succeeded == results.len() {
+        if results
+            .iter()
+            .any(|result| result.status == MaintenanceProviderStatus::PartiallySucceeded)
+        {
+            MaintenanceStatus::PartiallySucceeded
+        } else {
+            MaintenanceStatus::Succeeded
+        }
+    } else {
+        MaintenanceStatus::Blocked
+    }
+}
+
+fn confirm_maintenance(plan: &MaintenancePlan) -> Result<bool, String> {
+    if plan.risk >= orbis_core::transaction::RiskLevel::HighImpact {
+        eprint!("This maintenance plan contains high-impact changes. Type YES to continue: ");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+        Ok(answer.trim() == "YES")
+    } else {
+        eprint!("Continue with this maintenance plan? [Y/n] ");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+        Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
+    }
+}
+
+fn run_history(
+    renderer: &Renderer,
+    json: bool,
+    operation_id: Option<String>,
+    limit: usize,
+    source: Option<PackageSource>,
+) -> Result<(), String> {
+    let history = orbis_core::transaction::history::HistoryStore::default_location()
+        .map_err(|error| format!("could not open history: {error}"))?;
+    if let Some(operation_id) = operation_id {
+        let entry = history
+            .entry(&operation_id)?
+            .ok_or_else(|| format!("history operation {operation_id} was not found"))?;
+        if json {
+            print_json(&entry)
+        } else {
+            print!("{}", renderer.history_entry(&entry));
+            Ok(())
+        }
+    } else {
+        let entries = history
+            .entries()?
+            .into_iter()
+            .filter(|entry| source.is_none_or(|wanted| entry.source == Some(wanted)))
+            .take(limit)
+            .collect::<Vec<_>>();
+        if json {
+            print_json(&entries)
+        } else {
+            print!("{}", renderer.history(&entries, limit));
+            Ok(())
+        }
+    }
+}
+
+fn run_why(
+    registry: &ProviderRegistry,
+    renderer: &Renderer,
+    json: bool,
+    package: String,
+    source: Option<PackageSource>,
+) -> Result<(), String> {
+    let package_ref = parse_transaction_ref(&package, source)?;
+    let report = registry.resolve(&package_ref);
+    let ResolveReport::Found { package, .. } = report else {
+        let message = "package reference was not resolved uniquely";
+        if json {
+            print_json(
+                &serde_json::json!({ "status": "not_found_or_ambiguous", "message": message }),
+            )?;
+        }
+        return Err(message.into());
+    };
+    let mut why = registry.why(&package)?;
+    if let Ok(history) = orbis_core::transaction::history::HistoryStore::default_location() {
+        if let Ok(entries) = history.entries() {
+            why.orbis_history = entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.source == Some(package.source)
+                        && entry.package.as_deref().is_some_and(|name| {
+                            name == package.provider_id || name.eq_ignore_ascii_case(&package.name)
+                        })
+                        && entry.action.eq_ignore_ascii_case("install")
+                })
+                .map(|entry| orbis_core::maintenance::WhyHistoryEntry {
+                    operation_id: entry.operation_id,
+                    action: entry.action,
+                    recorded_at_unix_ms: entry.recorded_at_unix_ms,
+                })
+                .collect();
+        }
+    }
+    if why.orbis_history.is_empty() {
+        why.notes.push("Orbis has no installation record for this package; that does not establish who installed it.".into());
+    }
+    if json {
+        print_json(&why)
+    } else {
+        print!("{}", renderer.why(&why));
+        Ok(())
+    }
+}
+
 fn parse_transaction_ref(
     input: &str,
     source: Option<PackageSource>,
@@ -484,7 +897,7 @@ impl Renderer {
             ));
         }
         output.push_str(
-            "\nTry\n  orbis search <package>\n  orbis explain <package>\n  orbis doctor\n",
+            "\nTry\n  orbis search <package>\n  orbis updates\n  orbis upgrade --plan\n  orbis explain <package>\n  orbis doctor\n",
         );
         output
     }
@@ -517,6 +930,7 @@ impl Renderer {
             }
             output.push_str(&capabilities.join(", "));
             output.push('\n');
+            output.push_str("  Maintenance   updates, upgrade plan, clean plan\n");
             output.push_str("  Mutations     install, remove (single package)\n");
             for note in &source.notes {
                 output.push_str(&format!("  Note          {note}\n"));
@@ -746,6 +1160,250 @@ impl Renderer {
         output
     }
 
+    fn updates(&self, report: &UpdateInventoryReport) -> String {
+        let mut output = self.heading("Updates", "Installed software with updates available.");
+        if report.candidates.is_empty() {
+            output.push_str("\n  No pending updates were reported by the available sources.\n");
+        } else {
+            output.push_str(&format!(
+                "\n  {} update{} available\n",
+                report.total(),
+                if report.total() == 1 { "" } else { "s" }
+            ));
+            for source in [PackageSource::Apt, PackageSource::Flatpak, PackageSource::Snap] {
+                let candidates: Vec<_> = report
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.source == source)
+                    .collect();
+                if candidates.is_empty() {
+                    continue;
+                }
+                output.push_str(&format!(
+                    "\n{}  {}\n",
+                    self.paint(source.label(), Tone::Title),
+                    candidates.len()
+                ));
+                for candidate in candidates {
+                    let current = candidate.current_version.as_deref().unwrap_or("current");
+                    let available = candidate.available_version.as_deref().unwrap_or("latest");
+                    let scope = candidate
+                        .scope
+                        .map(|scope| format!(" · {}", scope.label()))
+                        .unwrap_or_default();
+                    let held = candidate.held == Some(true);
+                    output.push_str(&format!(
+                        "  {:<28} {current} → {available}{scope}{}\n",
+                        candidate.name,
+                        if held { " · held" } else { "" }
+                    ));
+                }
+            }
+        }
+        for inventory in &report.inventories {
+            for note in &inventory.notes {
+                if inventory.candidates.is_empty() && !note.is_empty() {
+                    output.push_str(&format!("\n  {}: {note}\n", inventory.source));
+                }
+            }
+        }
+        if !report.issues.is_empty() {
+            output.push_str("\n  Source notes\n");
+            for issue in &report.issues {
+                output.push_str(&format!("  - {}: {}\n", issue.source, issue.message));
+            }
+        }
+        output.push_str("\n  Read-only inventory; package state and indexes were not changed.\n");
+        output.push_str("  Run orbis upgrade --plan to review the coordinated upgrade.\n");
+        output
+    }
+
+    fn maintenance_plan(&self, plan: &MaintenancePlan) -> String {
+        let mut output = self.heading(
+            &format!("{} plan", plan.action.label()),
+            "Provider plans are coordinated for review, not atomic.",
+        );
+        let total_updates: usize =
+            plan.providers.iter().map(|provider| provider.candidates.len()).sum();
+        let total_cleanup: usize =
+            plan.providers.iter().map(|provider| provider.cleanup_candidates.len()).sum();
+        if plan.action == MaintenanceAction::Upgrade {
+            output.push_str(&format!(
+                "\n  {total_updates} update{} across {} provider plan{}\n",
+                if total_updates == 1 { "" } else { "s" },
+                plan.providers.len(),
+                if plan.providers.len() == 1 { "" } else { "s" }
+            ));
+        } else if plan.action == MaintenanceAction::Cleanup {
+            output.push_str(&format!(
+                "\n  {total_cleanup} cleanup candidate{} across {} provider plan{}\n",
+                if total_cleanup == 1 { "" } else { "s" },
+                plan.providers.len(),
+                if plan.providers.len() == 1 { "" } else { "s" }
+            ));
+        }
+        for provider in &plan.providers {
+            output.push_str(&format!(
+                "\n{}{}\n",
+                self.paint(provider.source.label(), Tone::Title),
+                provider.scope.map(|scope| format!(" · {}", scope.label())).unwrap_or_default()
+            ));
+            if provider.action == MaintenanceAction::Upgrade {
+                for candidate in &provider.candidates {
+                    output.push_str(&format!(
+                        "  {:<28} {} → {}\n",
+                        candidate.name,
+                        candidate.current_version.as_deref().unwrap_or("current"),
+                        candidate.available_version.as_deref().unwrap_or("latest")
+                    ));
+                }
+            }
+            for candidate in &provider.cleanup_candidates {
+                output.push_str(&format!(
+                    "  - {:<28} {} · {}\n",
+                    candidate.name,
+                    candidate.reason,
+                    candidate.risk.label()
+                ));
+            }
+            if provider.candidates.is_empty()
+                && provider.cleanup_candidates.is_empty()
+                && provider.action != MaintenanceAction::Refresh
+            {
+                output.push_str("  No changes reported.\n");
+            }
+            for note in &provider.notes {
+                output.push_str(&format!("  Note  {note}\n"));
+            }
+            for warning in &provider.warnings {
+                let marker = match warning.level {
+                    orbis_core::transaction::WarningLevel::Info => "·",
+                    orbis_core::transaction::WarningLevel::Caution => "!",
+                    orbis_core::transaction::WarningLevel::Blocked => "×",
+                };
+                output.push_str(&format!("  {marker} {}\n", warning.message));
+            }
+            self.field(
+                &mut output,
+                "  Privilege",
+                match provider.privilege {
+                    orbis_core::transaction::PrivilegeRequirement::None => "user scope / none",
+                    orbis_core::transaction::PrivilegeRequirement::Administrator => "administrator",
+                },
+            );
+        }
+        if !plan.warnings.is_empty() {
+            output.push_str("\n  Notes\n");
+            for warning in &plan.warnings {
+                output.push_str(&format!("  · {}\n", warning.message));
+            }
+        }
+        self.field(&mut output, "\n  Risk", plan.risk.label());
+        self.field(&mut output, "  Plan ID", &plan.operation_id);
+        output.push_str("  No package state has been changed by planning.\n");
+        output
+    }
+
+    fn maintenance_result(&self, result: &MaintenanceResult) -> String {
+        let title = match result.status {
+            MaintenanceStatus::Succeeded => "Completed",
+            MaintenanceStatus::PartiallySucceeded => "Partially completed",
+            MaintenanceStatus::Failed => "Failed",
+            MaintenanceStatus::Cancelled => "Cancelled",
+            MaintenanceStatus::Blocked => "Blocked",
+        };
+        let mut output =
+            self.heading(title, &format!("{} maintenance across providers", result.action.label()));
+        for provider in &result.providers {
+            let status = match provider.status {
+                MaintenanceProviderStatus::Succeeded => "succeeded",
+                MaintenanceProviderStatus::PartiallySucceeded => "partially succeeded",
+                MaintenanceProviderStatus::Failed => "failed",
+                MaintenanceProviderStatus::Skipped => "skipped",
+                MaintenanceProviderStatus::Blocked => "blocked",
+            };
+            output.push_str(&format!(
+                "  {:<10} {:<20} {} candidate(s)\n",
+                provider.source.label(),
+                status,
+                provider.candidate_count
+            ));
+            if let Some(message) = &provider.message {
+                output.push_str(&format!("    {message}\n"));
+            }
+        }
+        output.push_str(&format!("\n  Maintenance ID  {}\n", result.operation_id));
+        output
+    }
+
+    fn history(
+        &self,
+        entries: &[orbis_core::transaction::history::HistoryEntry],
+        limit: usize,
+    ) -> String {
+        let mut output =
+            self.heading("History", &format!("Recent Orbis operations (limit {limit})."));
+        if entries.is_empty() {
+            output.push_str("\n  No recorded operations.\n");
+            return output;
+        }
+        for entry in entries {
+            output.push_str(&format!(
+                "\n  {}  {:<12} {:<10} {}{}\n",
+                entry.operation_id,
+                entry.action,
+                entry.status,
+                entry.source.map(|source| source.label()).unwrap_or("Orbis"),
+                entry.package.as_deref().map(|package| format!(" · {package}")).unwrap_or_default()
+            ));
+            if let Some(message) = &entry.message {
+                output.push_str(&format!("    {message}\n"));
+            }
+        }
+        output
+    }
+
+    fn history_entry(&self, entry: &serde_json::Value) -> String {
+        let body = serde_json::to_string_pretty(entry).unwrap_or_else(|_| "{}".into());
+        self.heading("History record", "Sanitized persisted operation record.") + &body + "\n"
+    }
+
+    fn why(&self, report: &WhyReport) -> String {
+        let mut output = self.heading("Why", &report.package.name);
+        output.push_str(&format!("\n  {}\n", report.installed_as));
+        self.field(&mut output, "Source", &report.package.source.to_string());
+        self.field(&mut output, "Provider ID", &report.package.provider_id);
+        if !report.used_by.is_empty() {
+            output.push_str("\n  Used by\n");
+            for consumer in &report.used_by {
+                output.push_str(&format!(
+                    "  - {} · {} ({})\n",
+                    consumer.name, consumer.provider_id, consumer.relationship
+                ));
+            }
+        }
+        if !report.orbis_history.is_empty() {
+            output.push_str("\n  Installed through Orbis\n");
+            for record in &report.orbis_history {
+                output.push_str(&format!("  - {} · {}\n", record.action, record.operation_id));
+            }
+        }
+        output.push_str(&format!(
+            "\n  Removal advice\n  {}\n",
+            wrap(&report.removal_advice, self.width.saturating_sub(2))
+        ));
+        if !report.evidence.is_empty() {
+            output.push_str("\n  Evidence\n");
+            for evidence in &report.evidence {
+                output.push_str(&format!("  - {evidence}\n"));
+            }
+        }
+        for note in &report.notes {
+            output.push_str(&format!("  Note  {note}\n"));
+        }
+        output
+    }
+
     fn doctor(&self, report: &DoctorReport) -> String {
         let mut output = self.heading("Doctor", "Safe checks only; no package state was changed.");
         for check in &report.checks {
@@ -935,5 +1593,23 @@ mod tests {
             cli.command,
             Some(Command::Install { plan: true, yes: true, scope: Some(ScopeArg::User), .. })
         ));
+    }
+
+    #[test]
+    fn maintenance_commands_keep_read_only_and_mutating_paths_distinct() {
+        let updates =
+            Cli::try_parse_from(["orbis", "updates", "--source", "apt"]).expect("updates args");
+        assert!(matches!(updates.command, Some(Command::Updates { source: Some(SourceArg::Apt) })));
+        let upgrade =
+            Cli::try_parse_from(["orbis", "upgrade", "--plan", "--yes"]).expect("upgrade args");
+        assert!(matches!(upgrade.command, Some(Command::Upgrade { plan: true, yes: true, .. })));
+    }
+
+    #[test]
+    fn maintenance_renderer_is_plain_when_color_is_disabled() {
+        let renderer = Renderer::new(false);
+        let plan =
+            MaintenancePlan::new(MaintenanceAction::Upgrade, Some(PackageSource::Apt), Vec::new());
+        assert!(!renderer.maintenance_plan(&plan).contains('\x1b'));
     }
 }

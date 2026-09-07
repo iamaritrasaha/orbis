@@ -4,6 +4,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     diagnostics::DiagnosticCheck,
+    maintenance::{
+        CleanupCandidate, MaintenanceAction, MaintenanceProvider, ProviderMaintenancePlan,
+        ProviderUpdateInventory, UpdateCandidate, WhyReport, maintenance_operation_for,
+    },
     models::{Package, PackageKind, PackageSource, ProviderCapabilities, SourceInfo},
     process::{CommandRunner, CommandSpec, SharedRunner},
     providers::{
@@ -11,7 +15,7 @@ use crate::{
     },
     transaction::{
         InstallScope, OperationAction, OperationPlan, OperationRequest, PlanCompleteness,
-        PlanConfidence, PrivilegeRequirement, ProviderOperation, TransactionError,
+        PlanConfidence, PrivilegeRequirement, ProviderOperation, RiskLevel, TransactionError,
         VerificationResult, WarningLevel, base_risk, target_change,
     },
 };
@@ -117,6 +121,203 @@ impl TransactionProvider for SnapProvider {
     }
 }
 
+impl MaintenanceProvider for SnapProvider {
+    fn update_inventory(&self) -> Result<ProviderUpdateInventory, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Snap,
+                program: "snap".into(),
+            });
+        }
+        let installed = self.installed_detailed()?;
+        let output = execute(
+            &self.runner,
+            PackageSource::Snap,
+            "inspect pending Snap refreshes",
+            CommandSpec::new("snap", ["refresh", "--list"]).with_timeout(short_timeout()),
+        )?;
+        let output = expect_success(PackageSource::Snap, "inspect pending Snap refreshes", output)?;
+        Ok(ProviderUpdateInventory {
+            source: PackageSource::Snap,
+            available: true,
+            candidates: parse_pending_refreshes(&output.stdout, &installed),
+            notes: vec![
+                "Pending updates come from `snap refresh --list`; snapd normally checks automatically.".into(),
+                "A Snap refresh can race with automatic snapd refreshes, so upgrade plans are revalidated before execution.".into(),
+            ],
+            metadata_state: Some("snapd_pending_refresh_awareness".into()),
+        })
+    }
+
+    fn refresh_plan(&self) -> Result<Vec<ProviderMaintenancePlan>, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Snap,
+                program: "snap".into(),
+            });
+        }
+        Ok(vec![ProviderMaintenancePlan {
+            operation_id: snap_maintenance_id(MaintenanceAction::Refresh),
+            source: PackageSource::Snap,
+            action: MaintenanceAction::Refresh,
+            scope: None,
+            candidates: Vec::new(),
+            cleanup_candidates: Vec::new(),
+            privilege: PrivilegeRequirement::None,
+            completeness: PlanCompleteness::Complete,
+            confidence: PlanConfidence::High,
+            authoritative_simulation: false,
+            risk: RiskLevel::Normal,
+            supported: true,
+            mutates: false,
+            warnings: Vec::new(),
+            notes: vec!["snapd manages store awareness automatically; Orbis checks pending refreshes without calling mutating `snap refresh`.".into()],
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        }])
+    }
+
+    fn upgrade_plan(&self) -> Result<Vec<ProviderMaintenancePlan>, ProviderError> {
+        let inventory = self.update_inventory()?;
+        let held = inventory.candidates.iter().any(|candidate| candidate.held == Some(true));
+        let has_candidates = !inventory.candidates.is_empty();
+        let mut warnings = vec![crate::transaction::PlanWarning {
+            level: WarningLevel::Info,
+            message: "Execution targets the names observed in `snap refresh --list`; it does not alter refresh schedules or holds.".into(),
+        }];
+        if held {
+            warnings.push(crate::transaction::PlanWarning {
+                level: WarningLevel::Blocked,
+                message:
+                    "One or more pending Snap updates are held; Orbis will not bypass the hold."
+                        .into(),
+            });
+        }
+        if inventory.candidates.is_empty() {
+            warnings.push(crate::transaction::PlanWarning {
+                level: WarningLevel::Info,
+                message: "Snap reports no pending refreshes.".into(),
+            });
+        }
+        Ok(vec![ProviderMaintenancePlan {
+            operation_id: snap_maintenance_id(MaintenanceAction::Upgrade),
+            source: PackageSource::Snap,
+            action: MaintenanceAction::Upgrade,
+            scope: None,
+            candidates: inventory.candidates,
+            cleanup_candidates: Vec::new(),
+            privilege: PrivilegeRequirement::Administrator,
+            completeness: PlanCompleteness::Complete,
+            confidence: PlanConfidence::High,
+            authoritative_simulation: false,
+            risk: if held { RiskLevel::Blocked } else { RiskLevel::Normal },
+            supported: !held && has_candidates,
+            mutates: true,
+            warnings,
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        }])
+    }
+
+    fn cleanup_plan(&self) -> Result<ProviderMaintenancePlan, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Snap,
+                program: "snap".into(),
+            });
+        }
+        let retained = self
+            .installed_detailed()?
+            .into_iter()
+            .filter(|(_, snap)| snap.notes.contains("disabled"))
+            .map(|(name, snap)| CleanupCandidate {
+                source: PackageSource::Snap,
+                provider_id: name.clone(),
+                name,
+                version: Some(snap.version),
+                scope: Some(InstallScope::System),
+                reason: "snapd reports a retained disabled revision.".into(),
+                risk: RiskLevel::Caution,
+                notes: vec![
+                    "Orbis deliberately does not delete Snap revisions from snapd internals."
+                        .into(),
+                ],
+            })
+            .collect();
+        let mut plan = ProviderMaintenancePlan::blocked(
+            PackageSource::Snap,
+            MaintenanceAction::Cleanup,
+            "Snap retention is managed by snapd; Orbis does not delete revisions, snapshots, or change refresh.retain.",
+        );
+        plan.cleanup_candidates = retained;
+        plan.notes.push("Use snapd's supported retention settings and commands if you intentionally want to change this state.".into());
+        Ok(plan)
+    }
+
+    fn why(&self, package: &Package) -> Result<WhyReport, ProviderError> {
+        let record = self.info_record(&package.provider_id)?;
+        let base = record.get("base").cloned();
+        let mut notes = vec!["Snap does not expose APT-style reverse dependency reasoning.".into()];
+        if let Some(base) = &base {
+            notes.push(format!("Base snap reported by Snap metadata: {base}."));
+        }
+        Ok(WhyReport {
+            package: package.clone(),
+            installed_as: match record.get("type").map(String::as_str) {
+                Some("app") => "Installed Snap application".into(),
+                Some(kind) => format!("Installed Snap {kind}"),
+                None => "Installed Snap; role not exposed by this snapd response".into(),
+            },
+            used_by: Vec::new(),
+            evidence: vec!["Local `snap info` metadata, including publisher, tracking channel, type, and base where exposed.".into()],
+            removal_advice: "Snap does not provide an Orbis-level dependency graph here; use the exact Snap identity and review snapd's own removal behavior.".into(),
+            orbis_history: Vec::new(),
+            notes,
+        })
+    }
+
+    fn maintenance_operation(
+        &self,
+        plan: &ProviderMaintenancePlan,
+    ) -> Result<ProviderOperation, ProviderError> {
+        let operation = maintenance_operation_for(plan).ok_or_else(|| ProviderError::Parse {
+            package_source: PackageSource::Snap,
+            operation: "build maintenance operation".into(),
+            technical: "Snap maintenance plan has an unsupported shape".into(),
+        })?;
+        Ok(ProviderOperation::Maintenance { operation })
+    }
+
+    fn verify_maintenance(
+        &self,
+        plan: &ProviderMaintenancePlan,
+    ) -> Result<VerificationResult, ProviderError> {
+        match plan.action {
+            MaintenanceAction::Refresh => Ok(VerificationResult::Verified),
+            MaintenanceAction::Upgrade => {
+                let remaining = self.update_inventory()?.candidates;
+                let requested: std::collections::BTreeSet<_> = plan
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.provider_id.as_str())
+                    .collect();
+                Ok(
+                    if remaining
+                        .iter()
+                        .any(|candidate| requested.contains(candidate.provider_id.as_str()))
+                    {
+                        VerificationResult::PartiallyVerified
+                    } else {
+                        VerificationResult::Verified
+                    },
+                )
+            }
+            MaintenanceAction::Cleanup => Ok(VerificationResult::Failed),
+        }
+    }
+}
+
 fn validate_package_id(package_id: &str) -> Result<(), TransactionError> {
     if package_id.is_empty()
         || package_id.starts_with('-')
@@ -191,6 +392,18 @@ impl SnapProvider {
         }
         let output = expect_success(PackageSource::Snap, "read Snap information", output)?;
         Ok(parse_info(&output.stdout))
+    }
+
+    fn installed_detailed(&self) -> Result<BTreeMap<String, InstalledSnap>, ProviderError> {
+        let output = execute(
+            &self.runner,
+            PackageSource::Snap,
+            "read detailed installed Snap state",
+            CommandSpec::new("snap", ["list"]).with_timeout(short_timeout()),
+        )?;
+        let output =
+            expect_success(PackageSource::Snap, "read detailed installed Snap state", output)?;
+        Ok(output.stdout.lines().skip(1).filter_map(parse_installed_record).collect())
     }
 }
 
@@ -315,6 +528,78 @@ fn parse_installed_line(line: &str) -> Option<(String, String)> {
     let name = fields.next()?.to_owned();
     let version = fields.next()?.to_owned();
     Some((name, version))
+}
+
+#[derive(Clone, Debug)]
+struct InstalledSnap {
+    version: String,
+    revision: String,
+    tracking: String,
+    publisher: String,
+    notes: String,
+}
+
+fn parse_installed_record(line: &str) -> Option<(String, InstalledSnap)> {
+    let mut fields = line.split_whitespace();
+    let name = fields.next()?.to_owned();
+    let version = fields.next()?.to_owned();
+    let revision = fields.next()?.to_owned();
+    let tracking = fields.next()?.to_owned();
+    let publisher = fields.next()?.to_owned();
+    let notes = fields.collect::<Vec<_>>().join(" ");
+    Some((name, InstalledSnap { version, revision, tracking, publisher, notes }))
+}
+
+fn parse_pending_refreshes(
+    output: &str,
+    installed: &BTreeMap<String, InstalledSnap>,
+) -> Vec<UpdateCandidate> {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let provider_id = fields.next()?.to_owned();
+            if provider_id.eq_ignore_ascii_case("all") || provider_id.eq_ignore_ascii_case("snaps")
+            {
+                return None;
+            }
+            let available_version = fields.next()?.to_owned();
+            let available_revision = fields.next()?.to_owned();
+            let publisher = fields.next()?.to_owned();
+            let notes = fields.collect::<Vec<_>>().join(" ");
+            let current = installed.get(&provider_id);
+            let held = notes.split_whitespace().any(|note| note.eq_ignore_ascii_case("held"))
+                || current.is_some_and(|snap| {
+                    snap.notes.split_whitespace().any(|note| note.eq_ignore_ascii_case("held"))
+                });
+            let mut metadata = BTreeMap::new();
+            metadata.insert("available_revision".into(), available_revision);
+            metadata.insert("publisher".into(), publisher);
+            if let Some(current) = current {
+                metadata.insert("current_revision".into(), current.revision.clone());
+                metadata.insert("current_publisher".into(), current.publisher.clone());
+            }
+            Some(UpdateCandidate {
+                source: PackageSource::Snap,
+                provider_id: provider_id.clone(),
+                name: provider_id,
+                current_version: current.map(|snap| snap.version.clone()),
+                available_version: Some(available_version),
+                architecture: None,
+                scope: Some(InstallScope::System),
+                channel: current.map(|snap| snap.tracking.clone()),
+                held: Some(held),
+                security_relevance: None,
+                notes: if notes.is_empty() { Vec::new() } else { vec![notes] },
+                metadata,
+            })
+        })
+        .collect()
+}
+
+fn snap_maintenance_id(action: MaintenanceAction) -> String {
+    format!("maint-snap-{}-{}", action.label().to_ascii_lowercase(), std::process::id())
 }
 
 fn parse_info(text: &str) -> BTreeMap<String, String> {
@@ -452,5 +737,39 @@ mod tests {
         assert_eq!(record["name"], "btop");
         assert!(record["description"].contains("Watches CPU"));
         assert_eq!(record["installed"], "1.4.7 (1004) 2.03MB -");
+    }
+
+    #[test]
+    fn parses_pending_refresh_with_current_revision_and_hold() {
+        let installed = BTreeMap::from([(
+            "firefox".into(),
+            InstalledSnap {
+                version: "145".into(),
+                revision: "211".into(),
+                tracking: "latest/stable".into(),
+                publisher: "mozilla".into(),
+                notes: "held".into(),
+            },
+        )]);
+        let candidates = parse_pending_refreshes(
+            "Name    Version Rev Publisher Notes\n\
+             firefox 146 214 mozilla -\n",
+            &installed,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].current_version.as_deref(), Some("145"));
+        assert_eq!(candidates[0].available_version.as_deref(), Some("146"));
+        assert_eq!(candidates[0].metadata["current_revision"], "211");
+        assert_eq!(candidates[0].held, Some(true));
+    }
+
+    #[test]
+    fn snap_cleanup_never_becomes_a_mutating_plan() {
+        let plan = ProviderMaintenancePlan::blocked(
+            PackageSource::Snap,
+            MaintenanceAction::Cleanup,
+            "snapd owns retained revisions",
+        );
+        assert!(!plan.executable());
     }
 }

@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     diagnostics::DiagnosticCheck,
+    maintenance::MaintenanceProvider,
     models::{Package, PackageSource, SourceInfo},
     process::{CommandOutput, CommandSpec, ProcessError, SharedRunner},
     transaction::{
@@ -32,7 +33,7 @@ pub trait Provider: Send + Sync {
 }
 
 /// Mutation capability kept separate from the read-only provider contract.
-pub trait TransactionProvider: Provider {
+pub trait TransactionProvider: Provider + MaintenanceProvider {
     /// Produces a provider-backed plan without mutating the machine.
     fn plan_transaction(
         &self,

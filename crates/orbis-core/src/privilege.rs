@@ -92,6 +92,9 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
             }
             ("snap", *action, package_id.as_str())
         }
+        ProviderOperation::Maintenance { operation } => {
+            return maintenance_command(operation, elevated);
+        }
     };
 
     let subcommand = match action {
@@ -126,6 +129,78 @@ fn provider_command(operation: &ProviderOperation, elevated: bool) -> CommandSpe
     }
     // Mutation commands intentionally have no generic wall-clock timeout. A provider-aware
     // cancellation design can be added later without killing an active package transaction.
+    command
+}
+
+fn maintenance_command(
+    operation: &crate::transaction::MaintenanceOperation,
+    elevated: bool,
+) -> CommandSpec {
+    use crate::transaction::MaintenanceOperation;
+
+    let (program, mut args, apt_environment) = match operation {
+        MaintenanceOperation::AptRefresh => {
+            ("apt-get", vec!["update".into(), "-o".into(), "Dpkg::Use-Pty=0".into()], true)
+        }
+        MaintenanceOperation::AptUpgrade => (
+            "apt-get",
+            vec![
+                "upgrade".into(),
+                "--assume-yes".into(),
+                "--no-remove".into(),
+                "-o".into(),
+                "Dpkg::Use-Pty=0".into(),
+            ],
+            true,
+        ),
+        MaintenanceOperation::AptAutoremove => (
+            "apt-get",
+            vec!["autoremove".into(), "--assume-yes".into(), "-o".into(), "Dpkg::Use-Pty=0".into()],
+            true,
+        ),
+        MaintenanceOperation::FlatpakAppstream { scope } => (
+            "flatpak",
+            vec![
+                scope_flag(*scope).into(),
+                "update".into(),
+                "--appstream".into(),
+                "--assumeyes".into(),
+                "--noninteractive".into(),
+            ],
+            false,
+        ),
+        MaintenanceOperation::FlatpakUpgrade { scope, refs } => {
+            let mut args = vec![
+                scope_flag(*scope).into(),
+                "update".into(),
+                "--no-related".into(),
+                "--assumeyes".into(),
+                "--noninteractive".into(),
+            ];
+            args.extend(refs.iter().cloned());
+            ("flatpak", args, false)
+        }
+        MaintenanceOperation::SnapRefreshCheck => {
+            ("snap", vec!["refresh".into(), "--list".into()], false)
+        }
+        MaintenanceOperation::SnapUpgrade { package_ids } => {
+            let mut args = vec!["refresh".into()];
+            args.extend(package_ids.iter().cloned());
+            ("snap", args, false)
+        }
+    };
+
+    let mut command = if elevated {
+        let mut sudo_args = vec!["-n".into(), program.into()];
+        sudo_args.append(&mut args);
+        CommandSpec::new("sudo", sudo_args)
+    } else {
+        CommandSpec::new(program, args)
+    };
+    if apt_environment {
+        command = command.with_env("LC_ALL", "C").with_env("DEBIAN_FRONTEND", "noninteractive");
+    }
+    // Real maintenance mutations intentionally have no generic wall-clock timeout.
     command
 }
 
@@ -202,5 +277,29 @@ mod tests {
     fn authorization_has_a_separate_bounded_timeout() {
         let auth = authorization_command();
         assert_eq!(auth.timeout, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn maintenance_upgrade_uses_ordinary_apt_upgrade_without_removal_override() {
+        let operation = ProviderOperation::Maintenance {
+            operation: crate::transaction::MaintenanceOperation::AptUpgrade,
+        };
+        let command = provider_command(&operation, true);
+        assert_eq!(command.program, "sudo");
+        assert!(command.args.contains(&"upgrade".into()));
+        assert!(command.args.contains(&"--no-remove".into()));
+        assert!(!command.args.iter().any(|argument| argument.contains("full-upgrade")));
+        assert_eq!(command.timeout, None);
+    }
+
+    #[test]
+    fn snap_check_is_read_only_and_unprivileged() {
+        let operation = ProviderOperation::Maintenance {
+            operation: crate::transaction::MaintenanceOperation::SnapRefreshCheck,
+        };
+        let command = provider_command(&operation, false);
+        assert_eq!(command.program, "snap");
+        assert_eq!(command.args, ["refresh", "--list"]);
+        assert_eq!(command.timeout, None);
     }
 }

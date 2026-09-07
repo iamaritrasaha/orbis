@@ -166,7 +166,7 @@ pub struct SourceInfo {
 }
 
 /// A non-fatal provider-specific problem.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderIssue {
     /// Provider that reported the problem.
     pub source: PackageSource,

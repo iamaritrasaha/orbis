@@ -50,7 +50,9 @@ The same operation ID is atomically replaced after execution and verification wi
 
 ## Scope exclusions
 
-This milestone does not implement upgrades, update-all, autoremove, cleanup, rollback, batch transactions, history queries, or dependency graph intelligence. Those features need their own plan models and safety review rather than being folded into the single-package operation path.
+Milestone 3 adds a separate maintenance path rather than folding system-wide maintenance into the single-package operation path. It provides normalized update inventories, coordinated non-atomic maintenance plans, revalidation, conservative APT autoremove planning, history queries, and provider-specific explanation evidence. Flatpak cleanup remains unsupported where exact non-mutating planning is unavailable, and Snap retention is never changed by Orbis.
+
+Single-package transactions still do not implement full-upgrade, rollback, undo, or arbitrary batch operations. Milestone 3 maintenance has its own plan models and safety review rather than being folded into the single-package operation path.
 
 ## Primary references
 

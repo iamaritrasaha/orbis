@@ -42,7 +42,7 @@ impl OperationAction {
 }
 
 /// Provider scope where a package will be changed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstallScope {
     /// Machine-wide package state.
@@ -215,6 +215,53 @@ pub enum ProviderOperation {
         /// Optional validated channel.
         channel: Option<String>,
     },
+    /// A provider-specific maintenance command produced by the maintenance planner.
+    Maintenance {
+        /// Closed, validated maintenance operation.
+        operation: MaintenanceOperation,
+    },
+}
+
+/// The closed set of provider-wide maintenance commands Orbis may execute.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MaintenanceOperation {
+    /// Refresh APT repository indexes without installing packages.
+    AptRefresh,
+    /// Apply the ordinary APT upgrade without removals.
+    AptUpgrade,
+    /// Remove APT packages selected by an autoremove simulation.
+    AptAutoremove,
+    /// Refresh Flatpak AppStream metadata in one installation scope.
+    FlatpakAppstream {
+        /// Flatpak installation scope.
+        scope: InstallScope,
+    },
+    /// Update an exact set of Flatpak refs in one installation scope.
+    FlatpakUpgrade {
+        /// Flatpak installation scope.
+        scope: InstallScope,
+        /// Validated application or runtime refs.
+        refs: Vec<String>,
+    },
+    /// Query Snap's pending refresh list without changing state.
+    SnapRefreshCheck,
+    /// Refresh an exact set of Snap names.
+    SnapUpgrade {
+        /// Validated Snap names.
+        package_ids: Vec<String>,
+    },
+}
+
+impl MaintenanceOperation {
+    /// Returns the provider represented by this operation.
+    pub const fn source(&self) -> PackageSource {
+        match self {
+            Self::AptRefresh | Self::AptUpgrade | Self::AptAutoremove => PackageSource::Apt,
+            Self::FlatpakAppstream { .. } | Self::FlatpakUpgrade { .. } => PackageSource::Flatpak,
+            Self::SnapRefreshCheck | Self::SnapUpgrade { .. } => PackageSource::Snap,
+        }
+    }
 }
 
 impl ProviderOperation {
@@ -224,6 +271,7 @@ impl ProviderOperation {
             Self::Apt { .. } => PackageSource::Apt,
             Self::Flatpak { .. } => PackageSource::Flatpak,
             Self::Snap { .. } => PackageSource::Snap,
+            Self::Maintenance { operation } => operation.source(),
         }
     }
 
@@ -233,6 +281,9 @@ impl ProviderOperation {
             Self::Apt { action, .. } | Self::Flatpak { action, .. } | Self::Snap { action, .. } => {
                 *action
             }
+            // Maintenance has its own action enum. This method remains for the Milestone 2
+            // transaction renderer and is not used to classify maintenance history.
+            Self::Maintenance { .. } => OperationAction::Install,
         }
     }
 }

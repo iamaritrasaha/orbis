@@ -4,7 +4,7 @@ Your Linux software, in one place.
 
 Orbis is a Linux-first package-management experience built on top of the package managers people already trust. It brings APT, Flatpak, and Snap discovery into one calm, understandable terminal interface without reimplementing dependency resolution or inventing a new package format.
 
-## Milestone 2: careful single-package operations
+## Milestone 3: system-wide maintenance intelligence
 
 The current milestone keeps discovery and mutation as separate paths. Orbis can:
 
@@ -14,10 +14,12 @@ The current milestone keeps discovery and mutation as separate paths. Orbis can:
 - explain packages through deterministic, evidence-aware Orbis Briefs;
 - run safe diagnostics; and
 - emit JSON for scripts and automation;
-- build provider-specific install/remove plans; and
-- execute one exact install or remove only after a clear confirmation boundary.
+- build provider-specific install/remove plans;
+- inspect unified updates across APT, Flatpak, and Snap;
+- plan safe coordinated upgrades and conservative cleanup; and
+- read sanitized transaction history and evidence-based package explanations.
 
-Milestone 2 does not implement upgrades, refreshes, autoremove, cleanup, rollback, batch operations, or package-manager index changes as part of planning. Flatpak and Snap plans are explicitly marked partial where their CLIs do not provide an APT-style no-action simulation.
+See docs/maintenance.md for the exact meaning of update, updates, upgrade, clean, history, and why.
 
 ## Try it
 
@@ -38,6 +40,12 @@ orbis search btop --source apt
 orbis info apt:libssl-dev
 orbis explain ffmpeg
 orbis doctor
+orbis update --plan
+orbis updates
+orbis upgrade --plan
+orbis clean --plan
+orbis history
+orbis why apt:libssl3
 orbis --json search btop
 orbis install btop --source apt --plan
 orbis remove snap:btop --plan
@@ -82,11 +90,11 @@ When Orbis cannot establish an answer, it represents the field as unknown or say
 
 ## Supported sources and operations
 
-| Source | Discovery | Milestone 2 operations |
+| Source | Discovery | Maintenance and operations |
 | --- | --- | --- |
-| APT | Supported | apt-get -s plan, exact apt-get install/remove |
-| Flatpak | Supported when installed | scoped install/uninstall; partial remote metadata plan |
-| Snap | Supported when installed | install/remove; partial store metadata plan |
+| APT | Supported | local-index updates, safe apt-get upgrade, autoremove plan, exact install/remove |
+| Flatpak | Supported when installed | scoped AppStream refresh, update inventory, conservative cleanup refusal, install/uninstall |
+| Snap | Supported when installed | pending refresh inventory, exact-name refresh, snapd-managed cleanup diagnostics, install/remove |
 
 Nala is presented as an APT frontend, not as a separate package ecosystem. Orbis owns its own terminal presentation rather than scraping Nala's interactive output.
 
@@ -127,8 +135,8 @@ docs/
 See [docs/roadmap.md](docs/roadmap.md) for the scoped plan:
 
 1. Foundation and read-only discovery — complete.
-2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records — current.
-3. Updates, upgrades, cleanup, history, safety intelligence, and 'why'.
+2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records — complete.
+3. Updates, upgrades, cleanup, history, safety intelligence, and why — current.
 4. Cargo, npm/pnpm, uv, and pipx.
 
 ## Contributing

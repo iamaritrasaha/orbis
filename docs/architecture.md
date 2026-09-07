@@ -16,13 +16,16 @@ orbis-core
   provider contract
   shell-free process runner
   typed transaction plans
+  normalized maintenance plans
   narrow privilege boundary
-  XDG transaction history
+  XDG transaction and maintenance history
         |
   APT/Nala frontend | Flatpak | Snap
 ~~~
 
 ## Provider boundary
+
+The separate MaintenanceProvider contract normalizes update inventories, provider-scoped upgrade plans, conservative cleanup candidates, and explanation evidence. It keeps system-wide maintenance out of the read-only Provider contract and uses the existing typed transaction boundary for mutations.
 
 The `Provider` trait exposes the safe read surface:
 
@@ -67,6 +70,8 @@ Provider execution is followed by a scoped installed-state check. Results distin
 
 ## Orbis Brief
 
+Maintenance uses the same typed operation executor and privilege boundary. A coordinated MaintenancePlan contains independent provider plans and is explicitly non-atomic. APT refresh, safe upgrade, and autoremove use fixed maintenance operation variants; Flatpak AppStream refresh is scoped, Flatpak upgrade is blocked when its documented side effects cannot be planned safely, and Snap refresh checks use read-only refresh-list commands. Upgrade plans are revalidated before execution.
+
 `PackageBrief` combines a normalized package with:
 
 - a plain-language headline;
@@ -89,4 +94,4 @@ The core never emits ANSI or terminal decoration. The CLI renderer owns color, U
 
 ## Safety scope
 
-Milestone 2 adds only single-package install/remove for APT, Flatpak, and Snap. There is no update, upgrade, autoremove, cleanup, rollback, batch operation, daemon, telemetry, or background service. Flatpak remote configuration, Snap refresh, package indexes, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact plan is confirmed.
+Milestone 3 adds update inventories, coordinated upgrade and cleanup plans, history queries, and provider-specific explanation evidence. Flatpak remote configuration, Snap retention, package indexes, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact maintenance plan is confirmed.

@@ -4,6 +4,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     diagnostics::DiagnosticCheck,
+    maintenance::{
+        MaintenanceAction, MaintenanceProvider, ProviderMaintenancePlan, ProviderUpdateInventory,
+        UpdateCandidate, WhyConsumer, WhyReport, maintenance_operation_for,
+    },
     models::{Package, PackageKind, PackageSource, ProviderCapabilities, SourceInfo},
     process::{CommandRunner, CommandSpec, SharedRunner},
     providers::{
@@ -180,6 +184,67 @@ impl FlatpakProvider {
             return Ok(Some(details));
         }
         Ok(None)
+    }
+
+    fn update_inventory_scope(
+        &self,
+        scope: InstallScope,
+    ) -> Result<Vec<UpdateCandidate>, ProviderError> {
+        let output = execute(
+            &self.runner,
+            PackageSource::Flatpak,
+            "inspect available Flatpak updates",
+            CommandSpec::new(
+                "flatpak",
+                [
+                    scope_flag(scope),
+                    "remote-ls",
+                    "--updates",
+                    "--columns=ref,application,name,version,arch,branch,origin,download-size,installed-size",
+                ],
+            )
+            .with_timeout(short_timeout()),
+        )?;
+        let output =
+            expect_success(PackageSource::Flatpak, "inspect available Flatpak updates", output)?;
+        let installed = self.installed_records(scope)?;
+        Ok(output
+            .stdout
+            .lines()
+            .filter_map(parse_columns)
+            .filter_map(|fields| update_candidate_from_fields(fields, scope, &installed))
+            .collect())
+    }
+
+    fn installed_records(
+        &self,
+        scope: InstallScope,
+    ) -> Result<BTreeMap<String, String>, ProviderError> {
+        let output = execute(
+            &self.runner,
+            PackageSource::Flatpak,
+            "read scoped Flatpak versions",
+            CommandSpec::new(
+                "flatpak",
+                [
+                    scope_flag(scope),
+                    "list",
+                    "--columns=ref,application,version,arch,branch,origin,name,runtime",
+                ],
+            )
+            .with_timeout(short_timeout()),
+        )?;
+        let output =
+            expect_success(PackageSource::Flatpak, "read scoped Flatpak versions", output)?;
+        Ok(output
+            .stdout
+            .lines()
+            .filter_map(parse_columns)
+            .filter_map(|fields| {
+                let id = fields.get(1).cloned().or_else(|| fields.first().cloned())?;
+                Some((id, fields.get(2).cloned().unwrap_or_default()))
+            })
+            .collect())
     }
 }
 
@@ -449,6 +514,222 @@ impl TransactionProvider for FlatpakProvider {
     }
 }
 
+impl MaintenanceProvider for FlatpakProvider {
+    fn update_inventory(&self) -> Result<ProviderUpdateInventory, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Flatpak,
+                program: "flatpak".into(),
+            });
+        }
+        let mut candidates = Vec::new();
+        for scope in [InstallScope::System, InstallScope::User] {
+            candidates.extend(self.update_inventory_scope(scope)?);
+        }
+        Ok(ProviderUpdateInventory {
+            source: PackageSource::Flatpak,
+            available: true,
+            candidates,
+            notes: vec![
+                "Read-only inventory uses scoped `flatpak remote-ls --updates` metadata.".into(),
+                "System and user installations remain separate candidates.".into(),
+            ],
+            metadata_state: Some("local_flatpak_remote_metadata".into()),
+        })
+    }
+
+    fn refresh_plan(&self) -> Result<Vec<ProviderMaintenancePlan>, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Flatpak,
+                program: "flatpak".into(),
+            });
+        }
+        Ok([InstallScope::System, InstallScope::User]
+            .into_iter()
+            .map(|scope| ProviderMaintenancePlan {
+                operation_id: flatpak_maintenance_id(MaintenanceAction::Refresh, scope),
+                source: PackageSource::Flatpak,
+                action: MaintenanceAction::Refresh,
+                scope: Some(scope),
+                candidates: Vec::new(),
+                cleanup_candidates: Vec::new(),
+                privilege: if scope == InstallScope::System {
+                    PrivilegeRequirement::Administrator
+                } else {
+                    PrivilegeRequirement::None
+                },
+                completeness: PlanCompleteness::Complete,
+                confidence: PlanConfidence::High,
+                authoritative_simulation: false,
+                risk: RiskLevel::Normal,
+                supported: true,
+                mutates: true,
+                warnings: Vec::new(),
+                notes: vec!["Only Flatpak AppStream metadata is refreshed; installed refs are not upgraded.".into()],
+                download_size_bytes: None,
+                disk_delta_bytes: None,
+            })
+            .collect())
+    }
+
+    fn upgrade_plan(&self) -> Result<Vec<ProviderMaintenancePlan>, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Flatpak,
+                program: "flatpak".into(),
+            });
+        }
+        let mut plans = Vec::new();
+        for scope in [InstallScope::System, InstallScope::User] {
+            let inventory = self.update_inventory_scope(scope)?;
+            let download_size_bytes = if inventory.is_empty() {
+                None
+            } else {
+                Some(
+                    inventory
+                        .iter()
+                        .filter_map(|candidate| {
+                            candidate
+                                .metadata
+                                .get("download_size_bytes")
+                                .and_then(|value| value.parse::<u64>().ok())
+                        })
+                        .sum(),
+                )
+            };
+            plans.push(ProviderMaintenancePlan {
+                operation_id: flatpak_maintenance_id(MaintenanceAction::Upgrade, scope),
+                source: PackageSource::Flatpak,
+                action: MaintenanceAction::Upgrade,
+                scope: Some(scope),
+                candidates: inventory,
+                cleanup_candidates: Vec::new(),
+                privilege: if scope == InstallScope::System {
+                    PrivilegeRequirement::Administrator
+                } else {
+                    PrivilegeRequirement::None
+                },
+                completeness: PlanCompleteness::Partial,
+                confidence: PlanConfidence::Medium,
+                authoritative_simulation: false,
+                risk: RiskLevel::Caution,
+                // Flatpak documents that update may also offer unused EOL runtime removal.
+                // Without a no-action interface that proves the complete commit, Orbis does
+                // not run this provider automatically in the unified `upgrade` path.
+                supported: false,
+                mutates: true,
+                warnings: vec![crate::transaction::PlanWarning {
+                    level: WarningLevel::Blocked,
+                    message: "Flatpak update may offer unused end-of-life runtime removal; exact non-mutating impact is not available, so automatic unified execution is disabled.".into(),
+                }],
+                notes: vec!["Review and run Flatpak's own update flow separately when this limitation is acceptable.".into()],
+                download_size_bytes,
+                disk_delta_bytes: None,
+            });
+        }
+        Ok(plans)
+    }
+
+    fn cleanup_plan(&self) -> Result<ProviderMaintenancePlan, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Flatpak,
+                program: "flatpak".into(),
+            });
+        }
+        Ok(ProviderMaintenancePlan::blocked(
+            PackageSource::Flatpak,
+            MaintenanceAction::Cleanup,
+            "Exact unused Flatpak refs cannot be enumerated through the currently supported non-mutating planning path; Orbis will not run `flatpak uninstall --unused`.",
+        ))
+    }
+
+    fn why(&self, package: &Package) -> Result<WhyReport, ProviderError> {
+        if !self.available() {
+            return Err(ProviderError::Unavailable {
+                package_source: PackageSource::Flatpak,
+                program: "flatpak".into(),
+            });
+        }
+        let mut used_by = Vec::new();
+        let mut is_installed_app = false;
+        for scope in [InstallScope::System, InstallScope::User] {
+            let output = execute(
+                &self.runner,
+                PackageSource::Flatpak,
+                "explain Flatpak runtime use",
+                CommandSpec::new(
+                    "flatpak",
+                    [scope_flag(scope), "list", "--app", "--columns=application,name,runtime"],
+                )
+                .with_timeout(short_timeout()),
+            )?;
+            let output =
+                expect_success(PackageSource::Flatpak, "explain Flatpak runtime use", output)?;
+            for fields in output.stdout.lines().filter_map(parse_columns) {
+                let Some(application) = fields.first() else { continue };
+                if application == &package.provider_id {
+                    is_installed_app = true;
+                }
+                if fields.get(2).is_some_and(|runtime| runtime.contains(&package.provider_id)) {
+                    used_by.push(WhyConsumer {
+                        source: PackageSource::Flatpak,
+                        provider_id: application.clone(),
+                        name: fields.get(1).cloned().unwrap_or_else(|| application.clone()),
+                        relationship: "uses this Flatpak runtime".into(),
+                        scope: Some(scope),
+                    });
+                }
+            }
+        }
+        let runtime_like = package.provider_id.contains(".Platform")
+            || package.provider_id.contains(".Sdk")
+            || package.provider_id.contains(".Locale")
+            || !is_installed_app;
+        Ok(WhyReport {
+            package: package.clone(),
+            installed_as: if runtime_like {
+                "Shared runtime or extension".into()
+            } else {
+                "Installed application".into()
+            },
+            used_by,
+            evidence: vec!["Scoped Flatpak app listings and their declared runtime fields.".into()],
+            removal_advice: if runtime_like {
+                "Keep this runtime while installed applications use it; Flatpak's own unused-ref logic is stronger evidence than name-based guesses.".into()
+            } else {
+                "This is an application ref; removal affects the selected Flatpak installation scope.".into()
+            },
+            orbis_history: Vec::new(),
+            notes: Vec::new(),
+        })
+    }
+
+    fn maintenance_operation(
+        &self,
+        plan: &ProviderMaintenancePlan,
+    ) -> Result<ProviderOperation, ProviderError> {
+        let operation = maintenance_operation_for(plan).ok_or_else(|| ProviderError::Parse {
+            package_source: PackageSource::Flatpak,
+            operation: "build maintenance operation".into(),
+            technical: "Flatpak maintenance plan has an unsupported shape".into(),
+        })?;
+        Ok(ProviderOperation::Maintenance { operation })
+    }
+
+    fn verify_maintenance(
+        &self,
+        plan: &ProviderMaintenancePlan,
+    ) -> Result<VerificationResult, ProviderError> {
+        match plan.action {
+            MaintenanceAction::Refresh => Ok(VerificationResult::Verified),
+            MaintenanceAction::Upgrade => Ok(VerificationResult::PartiallyVerified),
+            MaintenanceAction::Cleanup => Ok(VerificationResult::Failed),
+        }
+    }
+}
+
 #[derive(Default)]
 struct RemoteDetails {
     remote: Option<String>,
@@ -535,6 +816,71 @@ fn parse_columns(line: &str) -> Option<Vec<String>> {
     (!fields.is_empty() && fields.first().is_some_and(|field| !field.is_empty())).then_some(fields)
 }
 
+fn scope_flag(scope: InstallScope) -> &'static str {
+    match scope {
+        InstallScope::System => "--system",
+        InstallScope::User => "--user",
+    }
+}
+
+fn flatpak_maintenance_id(action: MaintenanceAction, scope: InstallScope) -> String {
+    format!(
+        "maint-flatpak-{}-{}-{}",
+        action.label().to_ascii_lowercase(),
+        scope.label(),
+        std::process::id()
+    )
+}
+
+fn update_candidate_from_fields(
+    fields: Vec<String>,
+    scope: InstallScope,
+    installed: &BTreeMap<String, String>,
+) -> Option<UpdateCandidate> {
+    let reference = fields.first()?.clone();
+    let provider_id = fields
+        .get(1)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| reference.split('/').nth(1).map(str::to_owned))?;
+    if provider_id.is_empty() {
+        return None;
+    }
+    let available_version = fields.get(3).cloned().filter(|value| !value.is_empty());
+    let mut metadata = BTreeMap::new();
+    if let Some(reference) = (!reference.is_empty()).then_some(reference) {
+        metadata.insert("ref".into(), reference);
+    }
+    if let Some(size) = fields.get(7).and_then(|value| crate::transaction::parse_human_size(value))
+    {
+        metadata.insert("download_size_bytes".into(), size.to_string());
+    }
+    if let Some(size) = fields.get(8).and_then(|value| crate::transaction::parse_human_size(value))
+    {
+        metadata.insert("installed_size_bytes".into(), size.to_string());
+    }
+    Some(UpdateCandidate {
+        source: PackageSource::Flatpak,
+        provider_id: provider_id.clone(),
+        name: fields
+            .get(2)
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| provider_id.clone()),
+        current_version: installed.get(&provider_id).cloned().filter(|value| !value.is_empty()),
+        available_version,
+        architecture: fields.get(4).cloned().filter(|value| !value.is_empty()),
+        scope: Some(scope),
+        channel: fields.get(5).cloned().filter(|value| !value.is_empty()),
+        held: None,
+        security_relevance: None,
+        notes: vec![
+            "Flatpak update metadata does not provide an APT-style security classification.".into(),
+        ],
+        metadata,
+    })
+}
+
 fn package_from_fields(
     fields: Vec<String>,
     installed: Option<&BTreeMap<String, String>>,
@@ -595,5 +941,37 @@ mod tests {
         assert_eq!(package.provider_id, "org.example.App");
         assert_eq!(package.origin.as_deref(), Some("flathub"));
         assert_eq!(package.kind, Some(PackageKind::Application));
+    }
+
+    #[test]
+    fn normalizes_update_scope_and_versions_separately() {
+        let installed = BTreeMap::from([("org.example.App".into(), "1.0".into())]);
+        let system = update_candidate_from_fields(
+            parse_columns("app/org.example.App/x86_64/stable\torg.example.App\tExample App\t2.0\tx86_64\tstable\tflathub\t4.0 MB\t10.0 MB").expect("fields"),
+            InstallScope::System,
+            &installed,
+        )
+        .expect("system update");
+        let user = update_candidate_from_fields(
+            parse_columns("app/org.example.App/x86_64/stable\torg.example.App\tExample App\t2.1\tx86_64\tstable\tflathub\t5.0 MB\t11.0 MB").expect("fields"),
+            InstallScope::User,
+            &installed,
+        )
+        .expect("user update");
+        assert_eq!(system.scope, Some(InstallScope::System));
+        assert_eq!(user.scope, Some(InstallScope::User));
+        assert_eq!(system.current_version.as_deref(), Some("1.0"));
+        assert_eq!(user.available_version.as_deref(), Some("2.1"));
+    }
+
+    #[test]
+    fn flatpak_cleanup_is_explicitly_blocked() {
+        let plan = ProviderMaintenancePlan::blocked(
+            PackageSource::Flatpak,
+            MaintenanceAction::Cleanup,
+            "exact planning unavailable",
+        );
+        assert!(!plan.executable());
+        assert_eq!(plan.risk, RiskLevel::Blocked);
     }
 }

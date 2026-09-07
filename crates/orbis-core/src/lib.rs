@@ -5,6 +5,7 @@
 
 pub mod diagnostics;
 pub mod explain;
+pub mod maintenance;
 pub mod models;
 pub mod privilege;
 pub mod process;
@@ -13,6 +14,10 @@ pub mod transaction;
 
 use std::collections::BTreeSet;
 
+use maintenance::{
+    MaintenanceAction, MaintenancePlan, MaintenanceProvider, MaintenanceResult,
+    ProviderMaintenancePlan, UpdateInventoryReport, WhyReport, aggregate_inventory,
+};
 use models::{Package, PackageRef, PackageSource, ProviderIssue, SourceInfo};
 use providers::{Provider, ProviderError, TransactionProvider};
 use transaction::{
@@ -267,12 +272,222 @@ impl ProviderRegistry {
         diagnostics::DoctorReport { checks, read_only: true }
     }
 
+    /// Collects a unified, read-only update inventory from selected providers.
+    pub fn updates(&self, source: Option<PackageSource>) -> UpdateInventoryReport {
+        let mut inventories = Vec::new();
+        let mut issues = Vec::new();
+        for provider in self.selected_maintenance(source) {
+            match provider.update_inventory() {
+                Ok(inventory) => inventories.push(inventory),
+                Err(error) => {
+                    issues.push(issue(provider.source(), error));
+                    inventories.push(maintenance::ProviderUpdateInventory {
+                        source: provider.source(),
+                        available: false,
+                        candidates: Vec::new(),
+                        notes: vec![
+                            "Provider could not answer this read-only inventory query.".into(),
+                        ],
+                        metadata_state: None,
+                    });
+                }
+            }
+        }
+        aggregate_inventory(inventories, issues)
+    }
+
+    /// Builds a coordinated but non-atomic maintenance plan.
+    pub fn maintenance_plan(
+        &self,
+        action: MaintenanceAction,
+        source: Option<PackageSource>,
+    ) -> Result<MaintenancePlan, String> {
+        let mut providers = Vec::new();
+        let mut issues = Vec::new();
+        for provider in self.selected_maintenance(source) {
+            let result = match action {
+                MaintenanceAction::Refresh => provider.refresh_plan(),
+                MaintenanceAction::Upgrade => provider.upgrade_plan(),
+                MaintenanceAction::Cleanup => provider.cleanup_plan().map(|plan| vec![plan]),
+            };
+            match result {
+                Ok(plans) => providers.extend(plans),
+                Err(error) => issues.push(format!("{}: {}", provider.source(), error)),
+            }
+        }
+        if providers.is_empty() && !issues.is_empty() {
+            return Err(issues.join("; "));
+        }
+        let mut plan = MaintenancePlan::new(action, source, providers);
+        plan.warnings.extend(issues.into_iter().map(|message| transaction::PlanWarning {
+            level: transaction::WarningLevel::Caution,
+            message,
+        }));
+        plan.warnings.push(transaction::PlanWarning {
+            level: transaction::WarningLevel::Info,
+            message: "Providers are coordinated for reporting but are not one atomic transaction."
+                .into(),
+        });
+        Ok(plan)
+    }
+
+    /// Re-checks an upgrade plan immediately before execution.
+    pub fn revalidate_upgrade_plan(&self, plan: &MaintenancePlan) -> Result<(), String> {
+        if plan.action != MaintenanceAction::Upgrade {
+            return Ok(());
+        }
+        for expected in plan.providers.iter().filter(|provider| provider.executable()) {
+            let provider = self
+                .providers
+                .iter()
+                .find(|provider| provider.source() == expected.source)
+                .ok_or_else(|| format!("{} is no longer available", expected.source))?;
+            let current_plans = provider
+                .upgrade_plan()
+                .map_err(|error| format!("{} could not be revalidated: {error}", expected.source))?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let current_fingerprint = current_plans
+                .iter()
+                .filter(|item| item.scope == expected.scope)
+                .flat_map(|item| item.candidates.clone())
+                .collect::<Vec<_>>();
+            let mut expected_fingerprint = expected.candidates.clone();
+            expected_fingerprint.sort_by_key(|candidate| candidate.key());
+            let mut actual_fingerprint = current_fingerprint;
+            actual_fingerprint.sort_by_key(|candidate| candidate.key());
+            let expected_keys: Vec<_> = expected_fingerprint
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.key(),
+                        candidate.current_version.clone(),
+                        candidate.available_version.clone(),
+                        candidate.held,
+                    )
+                })
+                .collect();
+            let actual_keys: Vec<_> = actual_fingerprint
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.key(),
+                        candidate.current_version.clone(),
+                        candidate.available_version.clone(),
+                        candidate.held,
+                    )
+                })
+                .collect();
+            if expected_keys != actual_keys {
+                return Err(format!(
+                    "{} upgrade plan is stale; review a new plan",
+                    expected.source
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves provider-specific reasoning for one already-resolved package.
+    pub fn why(&self, package: &Package) -> Result<WhyReport, String> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.source() == package.source)
+            .ok_or_else(|| format!("{} is unavailable", package.source))?;
+        provider.why(package).map_err(|error| error.to_string())
+    }
+
+    /// Executes one provider plan through the existing typed privilege boundary.
+    pub fn execute_maintenance(
+        &self,
+        plan: &ProviderMaintenancePlan,
+        executor: &dyn OperationExecutor,
+    ) -> Result<MaintenanceResult, String> {
+        if !plan.executable() {
+            return Err(format!("{} maintenance plan is blocked or unsupported", plan.source));
+        }
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.source() == plan.source)
+            .ok_or_else(|| format!("{} is unavailable", plan.source))?;
+        let operation = provider.maintenance_operation(plan).map_err(|error| error.to_string())?;
+        let operation = match operation {
+            transaction::ProviderOperation::Maintenance { operation } => operation,
+            _ => return Err("provider returned a non-maintenance operation".into()),
+        };
+        let output = executor
+            .execute(&transaction::ProviderOperation::Maintenance { operation }, plan.privilege)
+            .map_err(|error| error.to_string())?;
+        if !output.success() {
+            return Ok(MaintenanceResult {
+                operation_id: plan.operation_id.clone(),
+                action: plan.action,
+                status: maintenance::MaintenanceStatus::Failed,
+                providers: vec![maintenance::MaintenanceProviderResult {
+                    source: plan.source,
+                    action: plan.action,
+                    status: maintenance::MaintenanceProviderStatus::Failed,
+                    candidate_count: plan.candidates.len().max(plan.cleanup_candidates.len()),
+                    verification: Some(transaction::VerificationResult::Failed),
+                    message: transaction::safe_process_message(&output),
+                }],
+            });
+        }
+        let verification = provider.verify_maintenance(plan).map_err(|error| error.to_string())?;
+        let provider_status = match verification {
+            transaction::VerificationResult::Verified => {
+                maintenance::MaintenanceProviderStatus::Succeeded
+            }
+            transaction::VerificationResult::PartiallyVerified => {
+                maintenance::MaintenanceProviderStatus::PartiallySucceeded
+            }
+            transaction::VerificationResult::Failed => {
+                maintenance::MaintenanceProviderStatus::Failed
+            }
+        };
+        let status = match provider_status {
+            maintenance::MaintenanceProviderStatus::Succeeded => {
+                maintenance::MaintenanceStatus::Succeeded
+            }
+            maintenance::MaintenanceProviderStatus::PartiallySucceeded => {
+                maintenance::MaintenanceStatus::PartiallySucceeded
+            }
+            _ => maintenance::MaintenanceStatus::Failed,
+        };
+        Ok(MaintenanceResult {
+            operation_id: plan.operation_id.clone(),
+            action: plan.action,
+            status,
+            providers: vec![maintenance::MaintenanceProviderResult {
+                source: plan.source,
+                action: plan.action,
+                status: provider_status,
+                candidate_count: plan.candidates.len().max(plan.cleanup_candidates.len()),
+                verification: Some(verification),
+                message: None,
+            }],
+        })
+    }
+
     fn selected(&self, source: Option<PackageSource>) -> Vec<&dyn Provider> {
         self.providers
             .iter()
             .filter(|provider| source.is_none_or(|wanted| provider.source() == wanted))
             .map(|provider| {
                 let provider: &dyn Provider = provider.as_ref();
+                provider
+            })
+            .collect()
+    }
+
+    fn selected_maintenance(&self, source: Option<PackageSource>) -> Vec<&dyn MaintenanceProvider> {
+        self.providers
+            .iter()
+            .filter(|provider| source.is_none_or(|wanted| provider.source() == wanted))
+            .map(|provider| {
+                let provider: &dyn MaintenanceProvider = provider.as_ref();
                 provider
             })
             .collect()

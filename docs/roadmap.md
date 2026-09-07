@@ -11,7 +11,7 @@ This roadmap is deliberately staged around safety and user understanding.
 - Provider-neutral package models and source-qualified references.
 - Search aggregation, ambiguity handling, Orbis Brief explanations, JSON, diagnostics, tests, and CI.
 
-## Milestone 2 — safe package operations (current)
+## Milestone 2 — safe package operations (complete)
 
 - Typed operation planner and strict single-package resolution.
 - APT install/remove plans using `apt-get -s`.
@@ -30,6 +30,8 @@ Not included in this milestone: upgrades, update-all, autoremove, cleanup, rollb
 - Package history.
 - Reverse-dependency and safety context.
 - A trustworthy `why` command for installed software.
+
+Milestone 3 establishes update versus updates versus upgrade semantics, provider-scoped maintenance, non-atomic unified results, revalidation, APT autoremove planning, history queries, and truthful provider limitations.
 
 ## Milestone 4 — additional ecosystems
 

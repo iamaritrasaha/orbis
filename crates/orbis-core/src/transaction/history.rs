@@ -7,7 +7,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{OperationPlan, OperationRequest, TransactionResult, TransactionStatus};
+use super::{
+    OperationPlan, OperationRequest, TransactionResult, TransactionStatus, VerificationResult,
+};
+use crate::maintenance::{MaintenancePlan, MaintenanceResult};
+use crate::models::PackageSource;
 
 /// Current on-disk transaction record schema.
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -51,6 +55,86 @@ pub struct TransactionRecord {
     /// Final execution result, absent while lifecycle is executing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<TransactionResult>,
+}
+
+/// A durable record for one coordinated maintenance run.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaintenanceRecord {
+    /// On-disk schema version.
+    #[serde(default = "legacy_schema_version")]
+    pub schema_version: u32,
+    /// Unix timestamp in milliseconds when the record was first written.
+    pub recorded_at_unix_ms: u64,
+    /// Unix timestamp in milliseconds when the record was last replaced.
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
+    /// Coordinated plan shown to the user.
+    pub plan: MaintenancePlan,
+    /// Final result, absent while the run is executing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<MaintenanceResult>,
+}
+
+impl MaintenanceRecord {
+    /// Creates the pre-execution record.
+    pub fn execution_started(plan: MaintenancePlan) -> Self {
+        Self::with_state(plan, None)
+    }
+
+    /// Creates the final record.
+    pub fn completed(plan: MaintenancePlan, result: MaintenanceResult) -> Self {
+        let mut sanitized = result;
+        for provider in &mut sanitized.providers {
+            provider.message = provider.message.take().map(sanitize_message);
+        }
+        Self::with_state(plan, Some(sanitized))
+    }
+
+    fn with_state(plan: MaintenancePlan, result: Option<MaintenanceResult>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64);
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            recorded_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            plan,
+            result,
+        }
+    }
+}
+
+/// A compact, provider-neutral history row suitable for terminal and JSON output.
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryEntry {
+    /// transaction or maintenance.
+    pub kind: String,
+    /// Stable operation or maintenance run ID.
+    pub operation_id: String,
+    /// Creation timestamp in Unix milliseconds.
+    pub recorded_at_unix_ms: u64,
+    /// Human-readable action.
+    pub action: String,
+    /// Provider, when one provider owns the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PackageSource>,
+    /// Package name for a legacy/single-package operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Flatpak or system scope where known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Lifecycle or final maintenance status.
+    pub status: String,
+    /// Verification state for single-package records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationResult>,
+    /// Highest planned risk, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<crate::transaction::RiskLevel>,
+    /// Sanitized failure or limitation summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl TransactionRecord {
@@ -160,11 +244,30 @@ impl HistoryStore {
 
     /// Returns the stable path used for one operation ID.
     pub fn record_path(&self, operation_id: &str) -> PathBuf {
-        self.directory.join(format!("{operation_id}.json"))
+        if is_safe_operation_id(operation_id) {
+            self.directory.join(format!("{operation_id}.json"))
+        } else {
+            self.directory.join(".invalid-operation-id.json")
+        }
     }
 
     /// Atomically writes one JSON record without command output or credentials.
     pub fn write(&self, record: &TransactionRecord, operation_id: &str) -> Result<PathBuf, String> {
+        validate_operation_id(operation_id)?;
+        self.write_json(record, operation_id)
+    }
+
+    /// Atomically writes a coordinated maintenance record.
+    pub fn write_maintenance(
+        &self,
+        record: &MaintenanceRecord,
+        operation_id: &str,
+    ) -> Result<PathBuf, String> {
+        validate_operation_id(operation_id)?;
+        self.write_json(record, operation_id)
+    }
+
+    fn write_json<T: Serialize>(&self, record: &T, operation_id: &str) -> Result<PathBuf, String> {
         fs::create_dir_all(&self.directory).map_err(|error| error.to_string())?;
         let final_path = self.record_path(operation_id);
         let temporary_path = self.directory.join(format!(".{operation_id}.tmp"));
@@ -173,6 +276,105 @@ impl HistoryStore {
         fs::rename(&temporary_path, &final_path).map_err(|error| error.to_string())?;
         Ok(final_path)
     }
+
+    /// Reads and summarizes all current and legacy records, newest first.
+    pub fn entries(&self) -> Result<Vec<HistoryEntry>, String> {
+        if !self.directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for item in fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
+            let path = item.map_err(|error| error.to_string())?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let body = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            if let Ok(record) = serde_json::from_str::<MaintenanceRecord>(&body) {
+                if record.plan.operation_id.starts_with("maint-") {
+                    let status = record.result.as_ref().map_or_else(
+                        || "executing".into(),
+                        |result| format!("{:?}", result.status).to_ascii_lowercase(),
+                    );
+                    entries.push(HistoryEntry {
+                        kind: "maintenance".into(),
+                        operation_id: record.plan.operation_id.clone(),
+                        recorded_at_unix_ms: record.recorded_at_unix_ms,
+                        action: record.plan.action.label().into(),
+                        source: record.plan.source,
+                        package: None,
+                        scope: None,
+                        status,
+                        verification: None,
+                        risk: Some(record.plan.risk),
+                        message: record.result.as_ref().and_then(|result| {
+                            result.providers.iter().find_map(|provider| provider.message.clone())
+                        }),
+                    });
+                    continue;
+                }
+            }
+            if let Ok(record) = serde_json::from_str::<TransactionRecord>(&body) {
+                let Some(plan) = record.resolved_plan() else { continue };
+                let operation_id = plan.operation_id.clone();
+                let (status, verification, message) = match &record.result {
+                    Some(result) => (
+                        format!("{:?}", record.effective_lifecycle()).to_ascii_lowercase(),
+                        Some(result.verification),
+                        result.execution.message.clone(),
+                    ),
+                    None => (
+                        format!("{:?}", record.effective_lifecycle()).to_ascii_lowercase(),
+                        None,
+                        None,
+                    ),
+                };
+                entries.push(HistoryEntry {
+                    kind: "transaction".into(),
+                    operation_id,
+                    recorded_at_unix_ms: record.recorded_at_unix_ms,
+                    action: plan.action.label().into(),
+                    source: Some(plan.target.source),
+                    package: Some(plan.target.name.clone()),
+                    scope: Some(plan.scope.label().into()),
+                    status,
+                    verification,
+                    risk: Some(plan.risk),
+                    message,
+                });
+            }
+        }
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.recorded_at_unix_ms));
+        Ok(entries)
+    }
+
+    /// Reads a single sanitized record by its operation ID.
+    pub fn entry(&self, operation_id: &str) -> Result<Option<serde_json::Value>, String> {
+        validate_operation_id(operation_id)?;
+        let path = self.record_path(operation_id);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        serde_json::from_str(&body).map(Some).map_err(|error| error.to_string())
+    }
+}
+
+fn is_safe_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id.len() <= 160
+        && operation_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn validate_operation_id(operation_id: &str) -> Result<(), String> {
+    is_safe_operation_id(operation_id)
+        .then_some(())
+        .ok_or_else(|| "history operation ID contains unsafe path characters".into())
+}
+
+fn sanitize_message(message: String) -> String {
+    message.lines().next().unwrap_or_default().chars().take(300).collect()
 }
 
 #[cfg(test)]
@@ -250,5 +452,12 @@ mod tests {
         assert_eq!(legacy_record.effective_lifecycle(), TransactionLifecycle::Succeeded);
         assert!(legacy_record.resolved_plan().is_some());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rejects_history_path_traversal() {
+        let store = HistoryStore::at("/tmp/orbis-history-safety-test");
+        assert!(store.entry("../outside").is_err());
+        assert!(!store.record_path("../outside").starts_with("/tmp/outside"));
     }
 }
