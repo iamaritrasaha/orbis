@@ -1,12 +1,19 @@
 //! APT metadata provider using non-mutating `apt-cache` and `dpkg-query`.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use crate::{
     diagnostics::DiagnosticCheck,
     models::{Package, PackageKind, PackageSource, ProviderCapabilities, SourceInfo},
     process::{CommandRunner, CommandSpec, SharedRunner},
-    providers::{Provider, ProviderError, execute, expect_success, short_timeout},
+    providers::{
+        Provider, ProviderError, TransactionProvider, execute, expect_success, short_timeout,
+    },
+    transaction::{
+        ChangeKind, InstallScope, OperationAction, OperationPlan, OperationRequest, PackageState,
+        PlanCompleteness, PlanConfidence, PrivilegeRequirement, ProviderOperation, RiskLevel,
+        TransactionError, VerificationResult, WarningLevel, base_risk, target_change,
+    },
 };
 
 /// APT provider. Nala is detected as an optional frontend, but APT remains the source identity.
@@ -42,17 +49,20 @@ impl AptProvider {
         if !output.success() {
             return BTreeMap::new();
         }
-        output
-            .stdout
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split('\t');
-                let name = fields.next()?.to_owned();
-                let status = fields.next()?;
-                let version = fields.next()?.to_owned();
-                status.contains("install ok installed").then_some((name, version))
-            })
-            .collect()
+        let mut installed = BTreeMap::new();
+        for line in output.stdout.lines() {
+            let mut fields = line.split('\t');
+            let Some(name) = fields.next().map(str::to_owned) else { continue };
+            let Some(status) = fields.next() else { continue };
+            let Some(version) = fields.next().map(str::to_owned) else { continue };
+            if status.contains("install ok installed") {
+                installed.insert(name.clone(), version.clone());
+                if let Some(base_name) = name.split_once(':').map(|(base, _)| base) {
+                    installed.entry(base_name.to_owned()).or_insert(version);
+                }
+            }
+        }
+        installed
     }
 
     fn package_from_record(&self, record: &BTreeMap<String, String>) -> Package {
@@ -238,13 +248,207 @@ impl Provider for AptProvider {
     }
 }
 
+impl TransactionProvider for AptProvider {
+    fn plan_transaction(
+        &self,
+        request: &OperationRequest,
+        target: &Package,
+    ) -> Result<OperationPlan, TransactionError> {
+        if request.scope == Some(InstallScope::User) {
+            return Err(TransactionError::InvalidRequest(
+                "APT packages use the system scope; omit `--scope user`".into(),
+            ));
+        }
+        if request.channel.is_some() {
+            return Err(TransactionError::InvalidRequest(
+                "`--channel` is only supported for Snap operations".into(),
+            ));
+        }
+        validate_package_id(&target.provider_id)?;
+        let current = target.installed.unwrap_or(false);
+        match (request.action, current) {
+            (OperationAction::Install, true) => {
+                return Err(TransactionError::Planning(format!(
+                    "APT package `{}` is already installed",
+                    target.provider_id
+                )));
+            }
+            (OperationAction::Remove, false) => {
+                return Err(TransactionError::Planning(format!(
+                    "APT package `{}` is not installed",
+                    target.provider_id
+                )));
+            }
+            _ => {}
+        }
+
+        let action = match request.action {
+            OperationAction::Install => "install",
+            OperationAction::Remove => "remove",
+        };
+        let command = CommandSpec::new(
+            "apt-get",
+            ["-s", "-o", "Debug::NoLocking=true", action, "--", target.provider_id.as_str()],
+        )
+        .with_env("LC_ALL", "C")
+        .with_env("DEBIAN_FRONTEND", "noninteractive")
+        .with_timeout(Duration::from_secs(60));
+        let output =
+            execute(&self.runner, PackageSource::Apt, "simulate the APT transaction", command)?;
+        let output = expect_success(PackageSource::Apt, "simulate the APT transaction", output)?;
+        let mut plan = OperationPlan::new(request.action, target.clone(), InstallScope::System);
+        plan.current_state =
+            if current { PackageState::Installed } else { PackageState::NotInstalled };
+        plan.privilege = PrivilegeRequirement::Administrator;
+        plan.completeness = PlanCompleteness::Complete;
+        plan.confidence = PlanConfidence::High;
+        plan.authoritative_simulation = true;
+        plan.changes = parse_simulation_changes(&output.stdout);
+        if !plan.changes.iter().any(|change| change.package_id == target.provider_id) {
+            plan.changes.push(target_change(&plan));
+        }
+        plan.download_size_bytes = find_apt_size(&output.stdout, "Need to get");
+        plan.disk_delta_bytes = find_apt_disk_delta(&output.stdout);
+        let extra_removals = plan
+            .changes
+            .iter()
+            .filter(|change| {
+                change.kind == ChangeKind::Remove && change.package_id != target.provider_id
+            })
+            .count();
+        let essential_removal = output
+            .stdout
+            .to_ascii_lowercase()
+            .contains("essential packages will be removed")
+            || output.stderr.to_ascii_lowercase().contains("essential packages will be removed");
+        plan.risk = if extra_removals > 0 || essential_removal {
+            let message = if essential_removal {
+                "APT identified an essential package removal; Orbis blocks this transaction."
+                    .to_owned()
+            } else {
+                format!("APT would remove {extra_removals} additional package(s).")
+            };
+            plan.warnings
+                .push(crate::transaction::PlanWarning { level: WarningLevel::Blocked, message });
+            RiskLevel::Blocked
+        } else {
+            base_risk(request.action, target.kind)
+        };
+        plan.warnings.push(crate::transaction::PlanWarning {
+            level: WarningLevel::Info,
+            message: "APT simulation is read-only; no package database or index was changed."
+                .into(),
+        });
+        Ok(plan)
+    }
+
+    fn provider_operation(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<ProviderOperation, TransactionError> {
+        validate_package_id(&plan.target.provider_id)?;
+        Ok(ProviderOperation::Apt {
+            action: plan.action,
+            package_id: plan.target.provider_id.clone(),
+        })
+    }
+
+    fn verify_transaction(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<VerificationResult, TransactionError> {
+        match self.info(&plan.target.provider_id) {
+            Ok(package) => {
+                let installed = package.installed == Some(true);
+                let expected = plan.action == OperationAction::Install;
+                Ok(if installed == expected {
+                    VerificationResult::Verified
+                } else {
+                    VerificationResult::Failed
+                })
+            }
+            Err(ProviderError::NotFound { .. }) if plan.action == OperationAction::Remove => {
+                Ok(VerificationResult::Verified)
+            }
+            Err(error) => Err(TransactionError::Verification(error.to_string())),
+        }
+    }
+}
+
+fn validate_package_id(package_id: &str) -> Result<(), TransactionError> {
+    if package_id.is_empty()
+        || package_id.starts_with('-')
+        || package_id.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, ';' | '&' | '|')
+        })
+    {
+        return Err(TransactionError::InvalidRequest(
+            "APT package IDs must be exact names without whitespace or option characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_simulation_changes(output: &str) -> Vec<crate::transaction::PlannedChange> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (kind, rest) = if let Some(rest) = line.trim().strip_prefix("Inst ") {
+                (ChangeKind::Install, rest)
+            } else if let Some(rest) = line.trim().strip_prefix("Remv ") {
+                (ChangeKind::Remove, rest)
+            } else if let Some(rest) = line.trim().strip_prefix("Purg ") {
+                (ChangeKind::Remove, rest)
+            } else {
+                (ChangeKind::Configure, line.trim().strip_prefix("Conf ")?)
+            };
+            let package_id = rest.split_whitespace().next()?.to_owned();
+            let version = rest
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .map(str::to_owned);
+            Some(crate::transaction::PlannedChange {
+                kind,
+                package_id,
+                name: None,
+                version,
+                reason: None,
+            })
+        })
+        .collect()
+}
+
+fn find_apt_size(output: &str, marker: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let rest = line.split_once(marker)?.1.trim();
+        let mut words = rest.split_whitespace();
+        let number = words.next()?;
+        let unit = words.next()?;
+        crate::transaction::parse_human_size(&format!("{number} {unit}"))
+    })
+}
+
+fn find_apt_disk_delta(output: &str) -> Option<i64> {
+    output.lines().find_map(|line| {
+        let rest = line.split_once("After this operation,")?.1.trim();
+        let sign = if rest.contains("freed") { -1 } else { 1 };
+        let mut words = rest.split_whitespace();
+        let number = words.next()?;
+        let unit = words.next()?;
+        crate::transaction::parse_human_size(&format!("{number} {unit}"))
+            .map(|size| sign * size as i64)
+    })
+}
+
 fn capabilities() -> ProviderCapabilities {
     ProviderCapabilities {
         search: true,
         info: true,
         installed_state: true,
         installed_list: true,
-        mutations: false,
+        mutations: true,
     }
 }
 
@@ -328,5 +532,16 @@ mod tests {
             classify("libssl-dev", Some("Secure Sockets Layer toolkit - development files"), None),
             Some(PackageKind::DevelopmentFiles)
         );
+    }
+
+    #[test]
+    fn normalizes_simulation_changes_and_sizes() {
+        let output = "Inst btop (1.4.6-2 Ubuntu:26.04/resolute [amd64])\nConf btop (1.4.6-2 Ubuntu:26.04/resolute [amd64])\nNeed to get 2.5 MB of archives.\nAfter this operation, 8.0 MB of additional disk space will be used.\n";
+        let changes = parse_simulation_changes(output);
+        assert_eq!(changes[0].kind, ChangeKind::Install);
+        assert_eq!(changes[0].package_id, "btop");
+        assert_eq!(changes[1].kind, ChangeKind::Configure);
+        assert_eq!(find_apt_size(output, "Need to get"), Some(2_500_000));
+        assert_eq!(find_apt_disk_delta(output), Some(8_000_000));
     }
 }

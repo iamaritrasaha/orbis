@@ -1,6 +1,7 @@
 //! Safe, shell-free process execution with an injectable test seam.
 
 use std::{
+    collections::BTreeMap,
     io::{self, Read},
     process::{Command, Stdio},
     sync::Arc,
@@ -20,6 +21,25 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     /// Optional upper bound for the process lifetime.
     pub timeout: Option<Duration>,
+    /// Environment variables set only for this invocation.
+    pub env: BTreeMap<String, String>,
+    /// Standard input handling.
+    pub stdin: StdioMode,
+    /// Standard output handling.
+    pub stdout: StdioMode,
+    /// Standard error handling.
+    pub stderr: StdioMode,
+}
+
+/// How a process stream is connected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioMode {
+    /// Do not provide or capture the stream.
+    Null,
+    /// Capture the stream in [`CommandOutput`].
+    Capture,
+    /// Inherit the stream from Orbis.
+    Inherit,
 }
 
 impl CommandSpec {
@@ -32,12 +52,35 @@ impl CommandSpec {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
             timeout: None,
+            env: BTreeMap::new(),
+            stdin: StdioMode::Null,
+            stdout: StdioMode::Capture,
+            stderr: StdioMode::Capture,
         }
     }
 
     /// Adds a timeout to this command.
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Adds or replaces an environment variable for this invocation only.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Configures standard input handling.
+    pub const fn with_stdin(mut self, mode: StdioMode) -> Self {
+        self.stdin = mode;
+        self
+    }
+
+    /// Configures standard output and standard error handling together.
+    pub const fn with_stdio(mut self, mode: StdioMode) -> Self {
+        self.stdout = mode;
+        self.stderr = mode;
         self
     }
 }
@@ -86,6 +129,19 @@ pub trait CommandRunner: Send + Sync {
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError>;
 }
 
+impl<T> CommandRunner for Arc<T>
+where
+    T: CommandRunner + ?Sized,
+{
+    fn is_available(&self, program: &str) -> bool {
+        self.as_ref().is_available(program)
+    }
+
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
+        self.as_ref().run(command)
+    }
+}
+
 /// The production command runner.
 #[derive(Clone, Default)]
 pub struct RealCommandRunner;
@@ -105,9 +161,10 @@ impl CommandRunner for RealCommandRunner {
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
         let mut child = Command::new(&command.program)
             .args(&command.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .envs(&command.env)
+            .stdin(to_stdio(command.stdin))
+            .stdout(to_stdio(command.stdout))
+            .stderr(to_stdio(command.stderr))
             .spawn()
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::NotFound {
@@ -120,10 +177,14 @@ impl CommandRunner for RealCommandRunner {
                 }
             })?;
 
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let stdout_reader = thread::spawn(move || read_pipe(stdout));
-        let stderr_reader = thread::spawn(move || read_pipe(stderr));
+        let stdout_reader = (command.stdout == StdioMode::Capture).then(|| {
+            let stdout = child.stdout.take().expect("stdout was piped");
+            thread::spawn(move || read_pipe(stdout))
+        });
+        let stderr_reader = (command.stderr == StdioMode::Capture).then(|| {
+            let stderr = child.stderr.take().expect("stderr was piped");
+            thread::spawn(move || read_pipe(stderr))
+        });
 
         let status = match command.timeout {
             Some(timeout) => match child.wait_timeout(timeout).map_err(|error| {
@@ -145,17 +206,34 @@ impl CommandRunner for RealCommandRunner {
             })?,
         };
 
-        let stdout = stdout_reader.join().map_err(|_| ProcessError::Capture {
-            program: command.program.clone(),
-            message: "stdout reader panicked".into(),
-        })??;
-        let stderr = stderr_reader.join().map_err(|_| ProcessError::Capture {
-            program: command.program.clone(),
-            message: "stderr reader panicked".into(),
-        })??;
+        let stdout = join_reader(stdout_reader, &command.program)?;
+        let stderr = join_reader(stderr_reader, &command.program)?;
 
         Ok(CommandOutput { stdout, stderr, status: status.code() })
     }
+}
+
+fn to_stdio(mode: StdioMode) -> Stdio {
+    match mode {
+        StdioMode::Null => Stdio::null(),
+        StdioMode::Capture => Stdio::piped(),
+        StdioMode::Inherit => Stdio::inherit(),
+    }
+}
+
+fn join_reader(
+    reader: Option<thread::JoinHandle<Result<String, ProcessError>>>,
+    program: &str,
+) -> Result<String, ProcessError> {
+    reader
+        .map(|reader| {
+            reader.join().map_err(|_| ProcessError::Capture {
+                program: program.into(),
+                message: "pipe reader panicked".into(),
+            })?
+        })
+        .transpose()
+        .map(|output| output.unwrap_or_default())
 }
 
 fn read_pipe(mut pipe: impl Read) -> Result<String, ProcessError> {

@@ -8,7 +8,7 @@ Read [docs/architecture.md](docs/architecture.md). In particular:
 
 - keep provider-specific parsing inside its provider module;
 - use the injected command runner instead of calling 'std::process::Command' from a provider;
-- keep package mutations out of Milestone 1;
+- keep package mutations behind the typed transaction and confirmation boundary;
 - represent unavailable or unknown metadata honestly; and
 - add fixture tests when a provider output shape changes.
 
@@ -22,7 +22,7 @@ cargo test --workspace
 git diff --check
 ~~~
 
-Provider integration checks should be read-only and clearly separated from fixture tests. Do not add a test that needs sudo, changes package databases, changes remotes, or depends on a graphical desktop.
+Provider integration checks should be read-only and clearly separated from fixture tests. Do not add a test that needs sudo, changes package databases, changes remotes, refreshes Snap, or depends on a graphical desktop. Transaction tests must use fake runners and fake operation executors.
 
 ## Pull requests
 

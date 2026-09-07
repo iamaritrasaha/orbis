@@ -12,6 +12,9 @@ use crate::{
     diagnostics::DiagnosticCheck,
     models::{Package, PackageSource, SourceInfo},
     process::{CommandOutput, CommandSpec, ProcessError, SharedRunner},
+    transaction::{
+        OperationPlan, OperationRequest, ProviderOperation, TransactionError, VerificationResult,
+    },
 };
 
 /// A provider's safe read-only interface for Milestone 1.
@@ -26,6 +29,26 @@ pub trait Provider: Send + Sync {
     fn info(&self, package_id: &str) -> Result<Package, ProviderError>;
     /// Run a bounded, safe health check.
     fn diagnostic(&self) -> DiagnosticCheck;
+}
+
+/// Mutation capability kept separate from the read-only provider contract.
+pub trait TransactionProvider: Provider {
+    /// Produces a provider-backed plan without mutating the machine.
+    fn plan_transaction(
+        &self,
+        request: &OperationRequest,
+        target: &Package,
+    ) -> Result<OperationPlan, TransactionError>;
+    /// Converts a completed plan into one exact typed provider operation.
+    fn provider_operation(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<ProviderOperation, TransactionError>;
+    /// Verifies the exact target state after an attempted operation.
+    fn verify_transaction(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<VerificationResult, TransactionError>;
 }
 
 /// Provider-level failures with both friendly and technical context.

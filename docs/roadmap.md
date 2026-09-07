@@ -2,7 +2,7 @@
 
 This roadmap is deliberately staged around safety and user understanding.
 
-## Milestone 1 — foundation and read-only discovery (current)
+## Milestone 1 — foundation and read-only discovery (complete)
 
 - Rust workspace and stable CLI foundation.
 - APT/Nala detection and read-only APT metadata.
@@ -11,14 +11,17 @@ This roadmap is deliberately staged around safety and user understanding.
 - Provider-neutral package models and source-qualified references.
 - Search aggregation, ambiguity handling, Orbis Brief explanations, JSON, diagnostics, tests, and CI.
 
-## Milestone 2 — safe package operations
+## Milestone 2 — safe package operations (current)
 
-- Typed operation planner.
-- Provider-specific install and remove plans.
-- Preview/dry-run where the provider supports it.
-- Explicit confirmation and clear impact summaries.
-- Narrow privilege handling with an audited boundary.
-- Operation records for the current invocation.
+- Typed operation planner and strict single-package resolution.
+- APT install/remove plans using `apt-get -s`.
+- Flatpak scoped install/uninstall plans with honest partial impact.
+- Snap install/remove plans with explicit channel and retained-data semantics.
+- `--plan`/`--dry-run`, explicit confirmation, `--yes`, and noninteractive refusal.
+- Narrow privilege handling with typed provider operations.
+- Post-operation verification and sanitized XDG transaction records.
+
+Not included in this milestone: upgrades, update-all, autoremove, cleanup, rollback, batch operations, or dependency-history intelligence.
 
 ## Milestone 3 — maintenance and safety intelligence
 

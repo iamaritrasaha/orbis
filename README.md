@@ -4,18 +4,20 @@ Your Linux software, in one place.
 
 Orbis is a Linux-first package-management experience built on top of the package managers people already trust. It brings APT, Flatpak, and Snap discovery into one calm, understandable terminal interface without reimplementing dependency resolution or inventing a new package format.
 
-## Milestone 1: read-only foundation
+## Milestone 2: careful single-package operations
 
-The current milestone is deliberately safe. Orbis can:
+The current milestone keeps discovery and mutation as separate paths. Orbis can:
 
 - detect APT/Nala, Flatpak, and Snap;
 - search available package sources and normalize the results;
 - show package metadata and installed state;
 - explain packages through deterministic, evidence-aware Orbis Briefs;
 - run safe diagnostics; and
-- emit JSON for scripts and automation.
+- emit JSON for scripts and automation;
+- build provider-specific install/remove plans; and
+- execute one exact install or remove only after a clear confirmation boundary.
 
-Orbis does not install, remove, upgrade, refresh, autoremove, clean, or otherwise mutate package state yet. No command in this milestone requires privilege escalation.
+Milestone 2 does not implement upgrades, refreshes, autoremove, cleanup, rollback, batch operations, or package-manager index changes as part of planning. Flatpak and Snap plans are explicitly marked partial where their CLIs do not provide an APT-style no-action simulation.
 
 ## Try it
 
@@ -37,7 +39,12 @@ orbis info apt:libssl-dev
 orbis explain ffmpeg
 orbis doctor
 orbis --json search btop
+orbis install btop --source apt --plan
+orbis remove snap:btop --plan
+orbis --json install apt:btop --dry-run
 ~~~
+
+Use --plan or --dry-run to inspect an operation without changing package state. Without --yes, an actual operation requires an interactive terminal and an explicit prompt. --yes skips only Orbis's prompt after the exact plan has been resolved; it does not bypass provider safeguards or administrator authorization.
 
 On a system without Flatpak or Snap, Orbis keeps working through the providers that are present and explains which sources are unavailable.
 
@@ -73,21 +80,23 @@ The long-term goal is to make questions such as these easy to answer:
 
 When Orbis cannot establish an answer, it represents the field as unknown or says that the explanation is based only on provider metadata. It does not call a hosted AI service and does not fabricate package descriptions.
 
-## Supported sources
+## Supported sources and operations
 
-| Source | Milestone 1 status | Read-only backend |
+| Source | Discovery | Milestone 2 operations |
 | --- | --- | --- |
-| APT | Supported | 'apt-cache' and 'dpkg-query'; Nala is detected as an optional frontend |
-| Flatpak | Supported when installed | Flatpak column-based output |
-| Snap | Supported when installed | 'snap find', 'snap list', and 'snap info' |
+| APT | Supported | apt-get -s plan, exact apt-get install/remove |
+| Flatpak | Supported when installed | scoped install/uninstall; partial remote metadata plan |
+| Snap | Supported when installed | install/remove; partial store metadata plan |
 
 Nala is presented as an APT frontend, not as a separate package ecosystem. Orbis owns its own terminal presentation rather than scraping Nala's interactive output.
 
 ## Safety boundary
 
-Milestone 1 is read-only. Providers are given explicit read methods and report capabilities rather than being forced to pretend every provider supports every operation. Process execution uses structured arguments and never invokes a shell for package queries. Tests use mocked command runners and do not require sudo or a package-manager database.
+Providers retain a read-only Provider interface and opt into the separate TransactionProvider interface. A transaction resolves one exact provider before any execution, creates a typed plan, rejects ambiguity and incomplete safety conditions, and shows the target, scope, changes, risk, privilege requirement, and provider limitations.
 
-The future mutation architecture is documented before it is implemented: operation planning, dry-runs, explicit confirmation, privilege boundaries, and operation records will be added only after the read-only foundation is proven.
+APT planning uses apt-get -s with a controlled per-command environment and blocks plans that report additional removals. Flatpak never uses --no-deploy for planning, and Snap never uses --purge for removal. System operations cross a narrow typed privilege boundary; Orbis does not expose a generic root command runner and does not handle passwords.
+
+Process execution uses structured arguments and never invokes a shell. Tests use mocked command runners and fake operation executors; they do not require sudo or alter a package-manager database. Every attempted execution is recorded under the XDG state directory without command output, credentials, or tokens.
 
 ## Building and testing
 
@@ -96,6 +105,7 @@ cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+git diff --check
 ~~~
 
 The test suite uses provider fixtures and an injectable process runner. It does not install packages, remove packages, refresh Snap, change Flatpak remotes, or require a graphical desktop.
@@ -104,19 +114,20 @@ The test suite uses provider fixtures and an injectable process runner. It does 
 
 ~~~text
 crates/
-  orbis-core/    models, process runner, providers, discovery, explanations, diagnostics
+  orbis-core/    models, process runner, providers, transactions, privilege, explanations, diagnostics
   orbis-cli/     clap command language and terminal presentation
 docs/
   architecture.md
   roadmap.md
+  transactions.md
 ~~~
 
 ## Roadmap
 
 See [docs/roadmap.md](docs/roadmap.md) for the scoped plan:
 
-1. Foundation and read-only discovery — current.
-2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records.
+1. Foundation and read-only discovery — complete.
+2. Safe operation planning, dry-runs, confirmation, privilege handling, and operation records — current.
 3. Updates, upgrades, cleanup, history, safety intelligence, and 'why'.
 4. Cargo, npm/pnpm, uv, and pipx.
 

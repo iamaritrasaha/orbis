@@ -1,0 +1,59 @@
+# Orbis transactions
+
+Milestone 2 deliberately limits mutation to one exact package and one provider per invocation. The transaction path is:
+
+~~~text
+CLI input
+  -> validated PackageRef
+  -> strict provider resolution
+  -> provider-owned OperationPlan (risk, confidence, completeness)
+  -> rendered plan and confirmation
+  -> typed ProviderOperation
+  -> narrow privilege executor
+  -> provider-scoped verification
+  -> sanitized XDG history record
+~~~
+
+## Planning guarantees
+
+`--plan` and `--dry-run` stop before the executor. They do not refresh indexes, add Flatpak remotes, refresh Snap metadata, or download/deploy a package.
+
+APT uses `apt-get -s` with `Debug::NoLocking=true`, `LC_ALL=C`, and a noninteractive frontend environment. Its documented `Inst`, `Remv`, and `Conf` lines are normalized into changes. If the simulation reports additional removals, the Orbis plan is blocked.
+
+Flatpak uses scoped installed listings and `remote-info --show-details`. Flatpak does not provide a complete no-action dependency simulation through this path, so runtime/extension impact is marked partial and any known runtime is shown as a provider-reported change. Orbis never uses `--no-deploy` as a substitute for a no-mutation plan.
+
+Snap uses `snap info` and exact installed-state inspection. Snap plans are partial because the CLI does not expose an equivalent zero-action impact simulation. An omitted channel means the provider's normal latest/stable selection. Removal intentionally omits `--purge`, so Snap's normal retained-data snapshot behavior remains intact.
+
+## Confirmation and privilege
+
+Ambiguous resolution, invalid identifiers, unknown Flatpak remotes, incomplete plans, and blocked APT impact never reach confirmation. Noninteractive execution without `--yes` is refused. `--yes` only skips the Orbis prompt for the already resolved plan; it does not turn off provider safety checks.
+
+System operations are represented by a closed `ProviderOperation` enum. The production executor authorizes with `sudo -v`, then invokes only the corresponding fixed provider executable with structured arguments and `sudo -n`. User-scoped Flatpak operations do not request administrator authorization. Orbis does not accept passwords, concatenate shell commands, or expose a generic root execution API.
+
+## Records
+
+After an attempted execution, Orbis writes one JSON file under:
+
+~~~text
+$XDG_STATE_HOME/orbis/transactions/
+~~~
+
+or, when `XDG_STATE_HOME` is not set:
+
+~~~text
+$HOME/.local/state/orbis/transactions/
+~~~
+
+Records contain the request, resolved plan, exit status, and verification status. They do not contain raw stdout/stderr, command-line dumps, passwords, or tokens. A temporary file and rename provide atomic replacement for each record.
+
+## Scope exclusions
+
+This milestone does not implement upgrades, update-all, autoremove, cleanup, rollback, batch transactions, history queries, or dependency graph intelligence. Those features need their own plan models and safety review rather than being folded into the single-package operation path.
+
+## Primary references
+
+- [Debian apt-get reference](https://manpages.debian.org/unstable/apt/apt-get.8.en.html)
+- [Flatpak command reference](https://docs.flatpak.org/en/latest/flatpak-command-reference.html)
+- [Snap getting started](https://snapcraft.io/docs/tutorials/get-started/)
+- [Snap channels and tracks](https://snapcraft.io/docs/explanation/how-snaps-work/channels-and-tracks/)
+- [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/0.8/)

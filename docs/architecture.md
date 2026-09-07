@@ -15,20 +15,23 @@ orbis-core
   diagnostics
   provider contract
   shell-free process runner
+  typed transaction plans
+  narrow privilege boundary
+  XDG transaction history
         |
   APT/Nala frontend | Flatpak | Snap
 ~~~
 
 ## Provider boundary
 
-The `Provider` trait exposes only the operations needed by the current milestone:
+The `Provider` trait exposes the safe read surface:
 
 - `source_info`;
 - `search`;
 - `info`; and
 - `diagnostic`.
 
-The normalized `ProviderCapabilities` model already has explicit fields for installed-state and future mutation support. Mutation is false for every provider today. A provider can later add an operation only when it can implement that operation safely; the UI does not assume that every ecosystem has identical capabilities.
+The separate `TransactionProvider` trait exposes only plan, typed-operation, and post-operation verification methods. A provider can implement those methods only when it can represent the operation safely; the UI does not assume that every ecosystem has identical capabilities. The current providers expose single-package install/remove capability, while future update, cleanup, and batch operations remain outside this interface.
 
 `ProviderRegistry` creates the supported providers, selects one source when requested, or queries all providers when no source is specified. A failure from one provider becomes a structured issue and does not discard results from the others.
 
@@ -54,7 +57,11 @@ Providers receive a `CommandRunner`. The production implementation uses `std::pr
 
 The test seam accepts a fake runner, allowing parser, aggregation, and unavailable-provider tests to run without executing any package manager. The process module also captures non-zero status and retains technical detail for JSON or debugging without exposing it in normal prose.
 
-The future privileged-operation seam should be separate from this read-only runner. It must not grow into a general sudo string builder. A future operation planner should produce a typed provider operation, show a provider-owned dry-run/preview where available, require explicit user confirmation, and delegate escalation to a narrow audited mechanism.
+The transaction planner produces a typed `ProviderOperation`, never an arbitrary program and argument string. The production privilege boundary performs a narrow `sudo -v` authorization followed by an exact non-interactive typed command. It does not accept shell input, handle passwords, or expose `run_as_root(program, args)`.
+
+APT planning invokes `apt-get -s -o Debug::NoLocking=true` with `LC_ALL=C` and `DEBIAN_FRONTEND=noninteractive` scoped to that process. The parser normalizes install/remove/configure lines and blocks plans that report additional removals. Flatpak planning uses read-only `remote-info` and scoped installed listings; it is marked partial because runtimes and extensions may be resolved at commit. Snap planning uses `snap info`, defaults to latest/stable when no channel is supplied, and is marked partial because Snap has no equivalent no-action impact simulation.
+
+Provider execution is followed by a scoped installed-state check. Results distinguish succeeded, partially verified, and failed. The CLI writes sanitized JSON transaction records atomically under `$XDG_STATE_HOME/orbis/transactions`, falling back to `$HOME/.local/state/orbis/transactions`.
 
 ## Orbis Brief
 
@@ -76,8 +83,8 @@ The evidence structure leaves room for richer local metadata sources later witho
 
 The core never emits ANSI or terminal decoration. The CLI renderer owns color, Unicode fallback, wrapping, and spacing. ANSI is enabled only for a TTY and is disabled by `NO_COLOR` or `--no-color`. Piped output remains plain, and the renderer uses simple ASCII markers when `TERM=dumb`.
 
-`--json` changes the stdout contract to structured data for `sources`, `search`, `info`, `explain`, `doctor`, and the home view. Decorative messages are not mixed into JSON stdout. Human-readable provider issues remain available as structured fields.
+`--json` changes the stdout contract to structured data for the home view, `sources`, `search`, `info`, `explain`, `doctor`, and transaction plans/results. Decorative messages are not mixed into JSON stdout. Human-readable provider issues remain available as structured fields. Mutation commands refuse non-interactive execution unless `--yes` is supplied; `--plan` and `--dry-run` never cross the execution boundary.
 
 ## Safety scope
 
-There is no install, remove, update, upgrade, autoremove, cleanup, rollback, history database, daemon, telemetry, or background service in Milestone 1. Diagnostics are also read-only. This scope is intentional: the first release proves provider isolation, normalization, explanation, and trustworthy presentation before machine-altering behavior is designed.
+Milestone 2 adds only single-package install/remove for APT, Flatpak, and Snap. There is no update, upgrade, autoremove, cleanup, rollback, batch operation, daemon, telemetry, or background service. Flatpak remote configuration, Snap refresh, package indexes, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact plan is confirmed.

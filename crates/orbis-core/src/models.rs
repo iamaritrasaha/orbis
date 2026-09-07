@@ -2,10 +2,10 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A supported package ecosystem.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PackageSource {
     /// Debian/Ubuntu packages, queried through APT tools.
@@ -44,7 +44,7 @@ impl fmt::Display for PackageSource {
 }
 
 /// A provider-neutral package classification, when confidently inferred.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageKind {
     /// A desktop or end-user application.
@@ -79,7 +79,7 @@ impl PackageKind {
 }
 
 /// A normalized package record.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Package {
     /// Ecosystem that supplied this record.
     pub source: PackageSource,
@@ -142,7 +142,7 @@ pub struct ProviderCapabilities {
     pub installed_state: bool,
     /// Installed package listing is supported.
     pub installed_list: bool,
-    /// Mutation is deliberately false in Milestone 1.
+    /// Provider exposes the scoped install/remove transaction capability.
     pub mutations: bool,
 }
 

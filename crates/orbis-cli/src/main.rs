@@ -10,6 +10,11 @@ use orbis_core::{
     explain::build_brief,
     models::{Package, PackageSource, SourceInfo},
     parse_package_ref,
+    privilege::RealOperationExecutor,
+    transaction::{
+        InstallScope, OperationAction, OperationPlan, OperationRequest, PackageRefJson,
+        TransactionError, TransactionResult,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -17,7 +22,7 @@ use orbis_core::{
     name = "orbis",
     version,
     about = "Your Linux software, in one place.",
-    long_about = "A calm, provider-neutral view of software available to your Linux system. Milestone 1 is read-only."
+    long_about = "A calm, provider-neutral view of software available to your Linux system. Read-only discovery and carefully confirmed single-package operations."
 )]
 struct Cli {
     /// Emit structured JSON instead of terminal presentation.
@@ -60,6 +65,43 @@ enum Command {
     },
     /// Run safe provider and environment diagnostics.
     Doctor,
+    /// Plan and, after confirmation, install one exact package.
+    Install {
+        /// Package ID, friendly name, or source-qualified reference.
+        package: String,
+        /// Restrict resolution to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// Flatpak scope; defaults to system for new installs.
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+        /// Optional Snap channel.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Show the plan without executing it. Alias: --dry-run.
+        #[arg(long, alias = "dry-run")]
+        plan: bool,
+        /// Skip Orbis's confirmation prompt for this exact displayed plan.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Plan and, after confirmation, remove one exact package without purge/autoremove.
+    Remove {
+        /// Package ID, friendly name, or source-qualified reference.
+        package: String,
+        /// Restrict resolution to one provider.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// Flatpak scope; required when installed in both scopes.
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+        /// Show the plan without executing it. Alias: --dry-run.
+        #[arg(long, alias = "dry-run")]
+        plan: bool,
+        /// Skip Orbis's confirmation prompt for this exact displayed plan.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -67,6 +109,21 @@ enum SourceArg {
     Apt,
     Flatpak,
     Snap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ScopeArg {
+    System,
+    User,
+}
+
+impl From<ScopeArg> for InstallScope {
+    fn from(scope: ScopeArg) -> Self {
+        match scope {
+            ScopeArg::System => Self::System,
+            ScopeArg::User => Self::User,
+        }
+    }
 }
 
 impl From<SourceArg> for PackageSource {
@@ -104,7 +161,8 @@ fn run() -> Result<(), String> {
                     "version": env!("CARGO_PKG_VERSION"),
                     "tagline": "Your Linux software, in one place.",
                     "sources": registry.sources(),
-                    "read_only": true
+                    "planning_read_only": true,
+                    "supported_mutations": ["install", "remove"]
                 });
                 print_json(&payload)
             } else {
@@ -196,6 +254,204 @@ fn run() -> Result<(), String> {
                 Ok(())
             }
         }
+        Some(Command::Install { package, source, scope, channel, plan, yes }) => run_transaction(
+            &registry,
+            &renderer,
+            cli.json,
+            TransactionOptions {
+                action: OperationAction::Install,
+                package,
+                source: source.map(Into::into),
+                scope: scope.map(Into::into),
+                channel,
+                plan_only: plan,
+                yes,
+            },
+        ),
+        Some(Command::Remove { package, source, scope, plan, yes }) => run_transaction(
+            &registry,
+            &renderer,
+            cli.json,
+            TransactionOptions {
+                action: OperationAction::Remove,
+                package,
+                source: source.map(Into::into),
+                scope: scope.map(Into::into),
+                channel: None,
+                plan_only: plan,
+                yes,
+            },
+        ),
+    }
+}
+
+struct TransactionOptions {
+    action: OperationAction,
+    package: String,
+    source: Option<PackageSource>,
+    scope: Option<InstallScope>,
+    channel: Option<String>,
+    plan_only: bool,
+    yes: bool,
+}
+
+fn run_transaction(
+    registry: &ProviderRegistry,
+    renderer: &Renderer,
+    json: bool,
+    options: TransactionOptions,
+) -> Result<(), String> {
+    let package_ref = parse_transaction_ref(&options.package, options.source)?;
+    let request = OperationRequest {
+        action: options.action,
+        package: PackageRefJson::from(&package_ref),
+        scope: options.scope,
+        channel: options.channel,
+    };
+    let plan = match registry.plan_transaction(&request) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if json {
+                print_json(&serde_json::json!({
+                    "status": "error",
+                    "message": error.to_string()
+                }))?;
+            }
+            return Err(error.to_string());
+        }
+    };
+
+    if options.plan_only {
+        if json {
+            print_json(&plan)
+        } else {
+            print!("{}", renderer.transaction_plan(&plan));
+            Ok(())
+        }
+    } else {
+        if !plan.executable() {
+            let error = TransactionError::Blocked(
+                "this plan is incomplete or contains a blocked safety condition; nothing was executed".into(),
+            );
+            if json {
+                print_json(&serde_json::json!({
+                    "status": "blocked",
+                    "plan": plan,
+                    "message": error.to_string()
+                }))?;
+            }
+            return Err(error.to_string());
+        }
+        if !options.yes {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                let error = "confirmation is required: use an interactive terminal or pass --yes after reviewing the plan";
+                if json {
+                    print_json(&serde_json::json!({
+                        "status": "confirmation_required",
+                        "plan": plan,
+                        "message": error
+                    }))?;
+                }
+                return Err(error.into());
+            }
+            if !json {
+                print!("{}", renderer.transaction_plan(&plan));
+            }
+            if !confirm(&plan)? {
+                return Err("operation cancelled; no package state was changed".into());
+            }
+        } else if !json {
+            print!("{}", renderer.transaction_plan(&plan));
+        }
+
+        let executor = RealOperationExecutor::new(registry.runner());
+        let result = match registry.execute_transaction(plan.clone(), &executor) {
+            Ok(result) => result,
+            Err(error) => {
+                let failed = TransactionResult {
+                    plan: plan.clone(),
+                    execution: orbis_core::transaction::ExecutionSummary {
+                        exit_status: None,
+                        process_succeeded: false,
+                        message: Some(error.to_string()),
+                    },
+                    verification: orbis_core::transaction::VerificationResult::Failed,
+                    status: orbis_core::transaction::TransactionStatus::Failed,
+                };
+                let history_error = record_transaction(&request, &failed).err();
+                if json {
+                    print_json(&failed)?;
+                }
+                if let Some(history_error) = history_error {
+                    return Err(history_error);
+                }
+                return Err(error.to_string());
+            }
+        };
+        let history_error = record_transaction(&request, &result).err();
+        if json {
+            print_json(&result)?;
+        }
+        if let Some(history_error) = history_error {
+            return Err(history_error);
+        }
+        if json {
+            Ok(())
+        } else {
+            print!("{}", renderer.transaction_result(&result));
+            Ok(())
+        }
+    }
+}
+
+fn record_transaction(
+    request: &OperationRequest,
+    result: &TransactionResult,
+) -> Result<(), String> {
+    let store = orbis_core::transaction::history::HistoryStore::default_location()
+        .map_err(|error| format!("transaction completed but history was not written: {error}"))?;
+    let mut persisted = result.clone();
+    persisted.execution.message = None;
+    store
+        .write(
+            &orbis_core::transaction::history::TransactionRecord::new(request.clone(), persisted),
+            &result.plan.operation_id,
+        )
+        .map_err(|error| format!("transaction completed but history was not written: {error}"))?;
+    Ok(())
+}
+
+fn parse_transaction_ref(
+    input: &str,
+    source: Option<PackageSource>,
+) -> Result<orbis_core::models::PackageRef, String> {
+    if let Some((prefix, _)) = input.split_once(':') {
+        if let Some(qualified) = PackageSource::parse(prefix) {
+            if source.is_some_and(|explicit| explicit != qualified) {
+                return Err(format!(
+                    "package reference selects {qualified}, which conflicts with --source"
+                ));
+            }
+        }
+    }
+    let package_ref = parse_package_ref(input, source);
+    if package_ref.query.is_empty() {
+        return Err("package reference cannot be empty".into());
+    }
+    Ok(package_ref)
+}
+
+fn confirm(plan: &OperationPlan) -> Result<bool, String> {
+    if plan.risk >= orbis_core::transaction::RiskLevel::HighImpact {
+        eprint!("This is a high-impact removal. Type YES to continue: ");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+        Ok(answer.trim() == "YES")
+    } else {
+        eprint!("Continue with this operation? [Y/n] ");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+        Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
     }
 }
 
@@ -276,12 +532,13 @@ impl Renderer {
             }
             output.push_str(&capabilities.join(", "));
             output.push('\n');
+            output.push_str("  Mutations     install, remove (single package)\n");
             for note in &source.notes {
                 output.push_str(&format!("  Note          {note}\n"));
             }
         }
         output.push_str(
-            "\n  Mutating package operations are intentionally unavailable in Milestone 1.\n",
+            "\n  Plans are read-only; execution always requires confirmation or --yes.\n",
         );
         output
     }
@@ -386,6 +643,121 @@ impl Renderer {
                 .join(", "),
         );
         output.push('\n');
+        output
+    }
+
+    fn transaction_plan(&self, plan: &OperationPlan) -> String {
+        let mut output = self.heading(
+            "Transaction plan",
+            &format!("{} {} through {}", plan.action.label(), plan.target.name, plan.target.source),
+        );
+        self.field(&mut output, "Target", &plan.target.provider_id);
+        self.field(&mut output, "Source", &plan.target.source.to_string());
+        self.field(&mut output, "Scope", plan.scope.label());
+        self.field(&mut output, "Installed", installed_label(plan.target.installed));
+        self.field(&mut output, "Risk", plan.risk.label());
+        self.field(
+            &mut output,
+            "Plan quality",
+            match plan.completeness {
+                orbis_core::transaction::PlanCompleteness::Complete => "complete",
+                orbis_core::transaction::PlanCompleteness::Partial => "partial",
+                orbis_core::transaction::PlanCompleteness::Unknown => "unknown",
+            },
+        );
+        self.field(
+            &mut output,
+            "Confidence",
+            match plan.confidence {
+                orbis_core::transaction::PlanConfidence::High => "high",
+                orbis_core::transaction::PlanConfidence::Medium => "medium",
+                orbis_core::transaction::PlanConfidence::Low => "low",
+            },
+        );
+        self.field(
+            &mut output,
+            "Privilege",
+            match plan.privilege {
+                orbis_core::transaction::PrivilegeRequirement::None => "user scope",
+                orbis_core::transaction::PrivilegeRequirement::Administrator => "administrator",
+            },
+        );
+        if let Some(size) = plan.download_size_bytes {
+            self.field(&mut output, "Download", &human_size(size));
+        }
+        if let Some(delta) = plan.disk_delta_bytes {
+            self.field(&mut output, "Disk change", &format_disk_delta(delta));
+        }
+        output.push_str("\n  Changes\n");
+        for change in &plan.changes {
+            let marker = match change.kind {
+                orbis_core::transaction::ChangeKind::Install => "+",
+                orbis_core::transaction::ChangeKind::Remove => "-",
+                orbis_core::transaction::ChangeKind::Configure => "~",
+            };
+            let version =
+                change.version.as_deref().map(|version| format!("  {version}")).unwrap_or_default();
+            let reason =
+                change.reason.as_deref().map(|reason| format!("  ({reason})")).unwrap_or_default();
+            output.push_str(&format!("  {marker} {}{version}{reason}\n", change.package_id));
+        }
+        if !plan.warnings.is_empty() {
+            output.push_str("\n  Notes\n");
+            for warning in &plan.warnings {
+                let marker = match warning.level {
+                    orbis_core::transaction::WarningLevel::Info => "·",
+                    orbis_core::transaction::WarningLevel::Caution => "!",
+                    orbis_core::transaction::WarningLevel::Blocked => "×",
+                };
+                output.push_str(&format!("  {marker} {}\n", warning.message));
+            }
+        }
+        output.push_str(&format!("\n  Plan ID       {}\n", plan.operation_id));
+        output.push_str("  No package state has been changed by planning.\n");
+        output
+    }
+
+    fn transaction_result(&self, result: &TransactionResult) -> String {
+        let title = match result.status {
+            orbis_core::transaction::TransactionStatus::Succeeded => "Completed",
+            orbis_core::transaction::TransactionStatus::PartiallyVerified => {
+                "Completed with verification limits"
+            }
+            orbis_core::transaction::TransactionStatus::Failed => "Failed",
+        };
+        let tone = match result.status {
+            orbis_core::transaction::TransactionStatus::Succeeded => Tone::Good,
+            orbis_core::transaction::TransactionStatus::PartiallyVerified => Tone::Warning,
+            orbis_core::transaction::TransactionStatus::Failed => Tone::Warning,
+        };
+        let mut output = self.heading(
+            title,
+            &format!("{} {}", result.plan.action.label(), result.plan.target.provider_id),
+        );
+        output.push_str(&format!(
+            "\n  Process         {}\n",
+            if result.execution.process_succeeded {
+                self.paint("succeeded", tone)
+            } else {
+                self.paint("failed", tone)
+            }
+        ));
+        output.push_str(&format!(
+            "  Verification    {}\n",
+            match result.verification {
+                orbis_core::transaction::VerificationResult::Verified =>
+                    self.paint("verified", Tone::Good),
+                orbis_core::transaction::VerificationResult::PartiallyVerified => {
+                    self.paint("partially verified", Tone::Warning)
+                }
+                orbis_core::transaction::VerificationResult::Failed =>
+                    self.paint("failed", Tone::Warning),
+            }
+        ));
+        if let Some(message) = &result.execution.message {
+            output.push_str(&format!("  Detail          {message}\n"));
+        }
+        output.push_str(&format!("  Transaction ID  {}\n", result.plan.operation_id));
         output
     }
 
@@ -507,6 +879,12 @@ fn human_size(size: u64) -> String {
     }
 }
 
+fn format_disk_delta(delta: i64) -> String {
+    let magnitude = delta.unsigned_abs();
+    let prefix = if delta < 0 { "-" } else { "+" };
+    format!("{prefix}{}", human_size(magnitude))
+}
+
 fn wrap(text: &str, width: usize) -> String {
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
@@ -554,5 +932,23 @@ mod tests {
     fn cli_json_flag_is_global() {
         let cli = Cli::try_parse_from(["orbis", "search", "btop", "--json"]).expect("valid args");
         assert!(cli.json);
+    }
+
+    #[test]
+    fn mutation_arguments_keep_plan_and_scope_explicit() {
+        let cli = Cli::try_parse_from([
+            "orbis",
+            "install",
+            "flatpak:org.example.App",
+            "--scope",
+            "user",
+            "--plan",
+            "--yes",
+        ])
+        .expect("valid mutation args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Install { plan: true, yes: true, scope: Some(ScopeArg::User), .. })
+        ));
     }
 }

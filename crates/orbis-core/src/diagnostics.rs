@@ -49,7 +49,7 @@ impl DiagnosticCheck {
 pub struct DoctorReport {
     /// Provider checks.
     pub checks: Vec<DiagnosticCheck>,
-    /// Always true for this milestone; included to make the safety boundary explicit.
+    /// Always true because diagnostics never execute package mutations.
     pub read_only: bool,
 }
 
@@ -89,7 +89,7 @@ pub fn environment_checks() -> Vec<DiagnosticCheck> {
         DiagnosticCheck::environment(
             true,
             "Safety boundary",
-            "Milestone 1 exposes read-only discovery and diagnostics only.",
+            "Plans are read-only; package execution requires an explicit confirmation boundary.",
         ),
     ]
 }

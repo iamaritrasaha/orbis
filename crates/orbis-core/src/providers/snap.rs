@@ -6,12 +6,147 @@ use crate::{
     diagnostics::DiagnosticCheck,
     models::{Package, PackageKind, PackageSource, ProviderCapabilities, SourceInfo},
     process::{CommandRunner, CommandSpec, SharedRunner},
-    providers::{Provider, ProviderError, execute, expect_success, short_timeout},
+    providers::{
+        Provider, ProviderError, TransactionProvider, execute, expect_success, short_timeout,
+    },
+    transaction::{
+        InstallScope, OperationAction, OperationPlan, OperationRequest, PlanCompleteness,
+        PlanConfidence, PrivilegeRequirement, ProviderOperation, TransactionError,
+        VerificationResult, WarningLevel, base_risk, target_change,
+    },
 };
 
 /// Snap provider.
 pub struct SnapProvider {
     runner: SharedRunner,
+}
+
+impl TransactionProvider for SnapProvider {
+    fn plan_transaction(
+        &self,
+        request: &OperationRequest,
+        target: &Package,
+    ) -> Result<OperationPlan, TransactionError> {
+        if request.scope == Some(InstallScope::User) {
+            return Err(TransactionError::InvalidRequest(
+                "Snap packages use the system scope; omit `--scope user`".into(),
+            ));
+        }
+        validate_package_id(&target.provider_id)?;
+        let installed = target.installed == Some(true);
+        match (request.action, installed) {
+            (OperationAction::Install, true) => {
+                return Err(TransactionError::Planning(format!(
+                    "Snap `{}` is already installed",
+                    target.provider_id
+                )));
+            }
+            (OperationAction::Remove, false) => {
+                return Err(TransactionError::Planning(format!(
+                    "Snap `{}` is not installed",
+                    target.provider_id
+                )));
+            }
+            _ => {}
+        }
+        let record = self.info_record(&target.provider_id)?;
+        let installed_map = self.installed().unwrap_or_default();
+        let mut resolved_target =
+            package_from_record(record.clone(), Some(&installed_map), &target.provider_id)
+                .map_err(|error| TransactionError::Planning(error.to_string()))?;
+        resolved_target.installed = Some(installed);
+        if let Some(channel) = &request.channel {
+            validate_channel(channel)?;
+            if let Some(version) = channel_version_for(record.get("channels"), channel) {
+                resolved_target.version = Some(version.to_owned());
+            }
+            resolved_target.metadata.insert("requested_channel".into(), channel.clone());
+        }
+        let mut plan = OperationPlan::new(request.action, resolved_target, InstallScope::System);
+        plan.privilege = PrivilegeRequirement::Administrator;
+        plan.completeness = PlanCompleteness::Partial;
+        plan.confidence = PlanConfidence::Medium;
+        plan.authoritative_simulation = false;
+        plan.changes.push(target_change(&plan));
+        plan.risk = base_risk(request.action, target.kind);
+        if request.action == OperationAction::Install {
+            plan.warnings.push(crate::transaction::PlanWarning {
+                level: WarningLevel::Caution,
+                message: "Snap resolves store metadata and confinement details at commit time; this provider has no zero-action dependency simulation.".into(),
+            });
+            if request.channel.is_none() {
+                plan.warnings.push(crate::transaction::PlanWarning {
+                    level: WarningLevel::Info,
+                    message: "No channel was specified; Snap's normal latest/stable channel will be used.".into(),
+                });
+            }
+        } else {
+            plan.warnings.push(crate::transaction::PlanWarning {
+                level: WarningLevel::Caution,
+                message:
+                    "Snap normally retains a removable data snapshot; Orbis does not use `--purge`."
+                        .into(),
+            });
+        }
+        Ok(plan)
+    }
+
+    fn provider_operation(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<ProviderOperation, TransactionError> {
+        validate_package_id(&plan.target.provider_id)?;
+        Ok(ProviderOperation::Snap {
+            action: plan.action,
+            package_id: plan.target.provider_id.clone(),
+            channel: plan.target.metadata.get("requested_channel").cloned(),
+        })
+    }
+
+    fn verify_transaction(
+        &self,
+        plan: &OperationPlan,
+    ) -> Result<VerificationResult, TransactionError> {
+        let installed = self.installed()?.contains_key(&plan.target.provider_id);
+        let expected = plan.action == OperationAction::Install;
+        Ok(if installed == expected {
+            VerificationResult::Verified
+        } else {
+            VerificationResult::Failed
+        })
+    }
+}
+
+fn validate_package_id(package_id: &str) -> Result<(), TransactionError> {
+    if package_id.is_empty()
+        || package_id.starts_with('-')
+        || package_id.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, ';' | '&' | '|')
+        })
+    {
+        return Err(TransactionError::InvalidRequest(
+            "Snap names must be exact names without whitespace or option characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_channel(channel: &str) -> Result<(), TransactionError> {
+    if channel.is_empty()
+        || channel.starts_with('-')
+        || channel.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, ';' | '&' | '|')
+        })
+    {
+        return Err(TransactionError::InvalidRequest(
+            "Snap channels must be names without whitespace or option characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl SnapProvider {
@@ -161,7 +296,7 @@ fn capabilities() -> ProviderCapabilities {
         info: true,
         installed_state: true,
         installed_list: true,
-        mutations: false,
+        mutations: true,
     }
 }
 
@@ -256,6 +391,15 @@ fn channel_version(channels: Option<&String>) -> Option<&str> {
     channels?.lines().find_map(|line| {
         let value = line.strip_prefix("latest/stable:")?.split_whitespace().next()?;
         (!value.is_empty() && value != "^").then_some(value)
+    })
+}
+
+fn channel_version_for<'a>(channels: Option<&'a String>, requested: &str) -> Option<&'a str> {
+    let channels = channels?;
+    channels.lines().find_map(|line| {
+        let (channel, rest) = line.split_once(':')?;
+        let version = rest.split_whitespace().next()?;
+        (channel.trim() == requested && !version.is_empty() && version != "^").then_some(version)
     })
 }
 
