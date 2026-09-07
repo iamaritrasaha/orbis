@@ -9,6 +9,7 @@ pub mod maintenance;
 pub mod models;
 pub mod privilege;
 pub mod process;
+pub mod progress;
 pub mod providers;
 pub mod transaction;
 
@@ -189,6 +190,16 @@ impl ProviderRegistry {
         plan: OperationPlan,
         executor: &dyn OperationExecutor,
     ) -> Result<TransactionResult, TransactionError> {
+        self.execute_transaction_with_observer(plan, executor, &progress::SilentObserver)
+    }
+
+    /// Executes a previously displayed and confirmed plan through the typed executor with progress observation.
+    pub fn execute_transaction_with_observer(
+        &self,
+        plan: OperationPlan,
+        executor: &dyn OperationExecutor,
+        observer: &dyn progress::ProgressObserver,
+    ) -> Result<TransactionResult, TransactionError> {
         if !plan.executable() {
             return Err(TransactionError::Blocked(
                 "the plan is incomplete or was classified as blocked".into(),
@@ -200,7 +211,18 @@ impl ProviderRegistry {
             .find(|provider| provider.source() == plan.target.source)
             .ok_or_else(|| TransactionError::Planning("resolved provider is unavailable".into()))?;
         let operation = provider.provider_operation(&plan)?;
-        let output = executor.execute(&operation, plan.privilege)?;
+
+        if plan.privilege == transaction::PrivilegeRequirement::Administrator {
+            observer.on_event(&progress::OperationEvent::StageChanged {
+                stage: progress::ExecutionStage::Authenticating,
+            });
+        }
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::Executing,
+        });
+
+        let output = executor.execute_with_observer(&operation, plan.privilege, observer)?;
         let execution = ExecutionSummary {
             exit_status: output.status,
             process_succeeded: output.success(),
@@ -216,6 +238,11 @@ impl ProviderRegistry {
                 status: TransactionStatus::Failed,
             });
         }
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::Verifying,
+        });
+
         let verification = provider.verify_transaction(&plan)?;
         let status = match verification {
             VerificationResult::Verified => TransactionStatus::Succeeded,
@@ -234,12 +261,42 @@ impl ProviderRegistry {
         executor: &dyn OperationExecutor,
         history: &transaction::history::HistoryStore,
     ) -> Result<TransactionResult, TransactionError> {
+        self.execute_transaction_with_progress(
+            request,
+            plan,
+            executor,
+            history,
+            &progress::SilentObserver,
+        )
+    }
+
+    /// Writes an executing record before invoking a typed mutation, emits progress events at each stage,
+    /// then atomically replaces it with the verified outcome.
+    pub fn execute_transaction_with_progress(
+        &self,
+        request: &OperationRequest,
+        plan: OperationPlan,
+        executor: &dyn OperationExecutor,
+        history: &transaction::history::HistoryStore,
+        observer: &dyn progress::ProgressObserver,
+    ) -> Result<TransactionResult, TransactionError> {
         if !plan.executable() {
-            return Err(TransactionError::Blocked(
+            let err = TransactionError::Blocked(
                 "the plan is incomplete or was classified as blocked".into(),
-            ));
+            );
+            observer.on_event(&progress::OperationEvent::Finished {
+                stage: progress::ExecutionStage::Failed,
+                message: Some(err.to_string()),
+                operation_id: plan.operation_id.clone(),
+            });
+            return Err(err);
         }
         let operation_id = plan.operation_id.clone();
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::RecordingHistory,
+        });
+
         history
             .write(
                 &transaction::history::TransactionRecord::execution_started(
@@ -250,8 +307,11 @@ impl ProviderRegistry {
             )
             .map_err(TransactionError::History)?;
 
-        match self.execute_transaction(plan.clone(), executor) {
+        match self.execute_transaction_with_observer(plan.clone(), executor, observer) {
             Ok(result) => {
+                observer.on_event(&progress::OperationEvent::StageChanged {
+                    stage: progress::ExecutionStage::RecordingHistory,
+                });
                 history
                     .write(
                         &transaction::history::TransactionRecord::completed(
@@ -261,6 +321,17 @@ impl ProviderRegistry {
                         &operation_id,
                     )
                     .map_err(TransactionError::History)?;
+
+                let final_stage = if result.status == TransactionStatus::Failed {
+                    progress::ExecutionStage::Failed
+                } else {
+                    progress::ExecutionStage::Completed
+                };
+                observer.on_event(&progress::OperationEvent::Finished {
+                    stage: final_stage,
+                    message: result.execution.message.clone(),
+                    operation_id,
+                });
                 Ok(result)
             }
             Err(error) => {
@@ -274,15 +345,15 @@ impl ProviderRegistry {
                     verification: VerificationResult::Failed,
                     status: TransactionStatus::Failed,
                 };
-                history
-                    .write(
-                        &transaction::history::TransactionRecord::completed(
-                            request.clone(),
-                            failed,
-                        ),
-                        &operation_id,
-                    )
-                    .map_err(TransactionError::History)?;
+                let _ = history.write(
+                    &transaction::history::TransactionRecord::completed(request.clone(), failed),
+                    &operation_id,
+                );
+                observer.on_event(&progress::OperationEvent::Finished {
+                    stage: progress::ExecutionStage::Failed,
+                    message: Some(error.to_string()),
+                    operation_id,
+                });
                 Err(error)
             }
         }
@@ -439,6 +510,16 @@ impl ProviderRegistry {
         plan: &ProviderMaintenancePlan,
         executor: &dyn OperationExecutor,
     ) -> Result<MaintenanceResult, String> {
+        self.execute_maintenance_with_progress(plan, executor, &progress::SilentObserver)
+    }
+
+    /// Executes one provider plan through the existing typed privilege boundary with progress observation.
+    pub fn execute_maintenance_with_progress(
+        &self,
+        plan: &ProviderMaintenancePlan,
+        executor: &dyn OperationExecutor,
+        observer: &dyn progress::ProgressObserver,
+    ) -> Result<MaintenanceResult, String> {
         if !plan.executable() {
             return Err(format!("{} maintenance plan is blocked or unsupported", plan.source));
         }
@@ -452,10 +533,25 @@ impl ProviderRegistry {
             transaction::ProviderOperation::Maintenance { operation } => operation,
             _ => return Err("provider returned a non-maintenance operation".into()),
         };
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::Executing,
+        });
+
         let output = executor
-            .execute(&transaction::ProviderOperation::Maintenance { operation }, plan.privilege)
+            .execute_with_observer(
+                &transaction::ProviderOperation::Maintenance { operation },
+                plan.privilege,
+                observer,
+            )
             .map_err(|error| error.to_string())?;
         if !output.success() {
+            let msg = transaction::safe_process_message(&output);
+            observer.on_event(&progress::OperationEvent::Finished {
+                stage: progress::ExecutionStage::Failed,
+                message: msg.clone(),
+                operation_id: plan.operation_id.clone(),
+            });
             return Ok(MaintenanceResult {
                 operation_id: plan.operation_id.clone(),
                 action: plan.action,
@@ -466,10 +562,15 @@ impl ProviderRegistry {
                     status: maintenance::MaintenanceProviderStatus::Failed,
                     candidate_count: plan.candidates.len().max(plan.cleanup_candidates.len()),
                     verification: Some(transaction::VerificationResult::Failed),
-                    message: transaction::safe_process_message(&output),
+                    message: msg,
                 }],
             });
         }
+
+        observer.on_event(&progress::OperationEvent::StageChanged {
+            stage: progress::ExecutionStage::Verifying,
+        });
+
         let verification = provider.verify_maintenance(plan).map_err(|error| error.to_string())?;
         let provider_status = match verification {
             transaction::VerificationResult::Verified => {
@@ -491,6 +592,18 @@ impl ProviderRegistry {
             }
             _ => maintenance::MaintenanceStatus::Failed,
         };
+
+        let final_stage = if status == maintenance::MaintenanceStatus::Failed {
+            progress::ExecutionStage::Failed
+        } else {
+            progress::ExecutionStage::Completed
+        };
+        observer.on_event(&progress::OperationEvent::Finished {
+            stage: final_stage,
+            message: None,
+            operation_id: plan.operation_id.clone(),
+        });
+
         Ok(MaintenanceResult {
             operation_id: plan.operation_id.clone(),
             action: plan.action,

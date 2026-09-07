@@ -127,6 +127,24 @@ pub trait CommandRunner: Send + Sync {
     fn is_available(&self, program: &str) -> bool;
     /// Runs a structured command.
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError>;
+
+    /// Executes a command and delivers output lines to a callback as they arrive.
+    ///
+    /// The default implementation falls back to `run()` and replays captured output.
+    fn run_streaming(
+        &self,
+        command: &CommandSpec,
+        on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+    ) -> Result<CommandOutput, ProcessError> {
+        let output = self.run(command)?;
+        for line in output.stdout.lines() {
+            on_line(line, crate::progress::OutputStream::Stdout);
+        }
+        for line in output.stderr.lines() {
+            on_line(line, crate::progress::OutputStream::Stderr);
+        }
+        Ok(output)
+    }
 }
 
 impl<T> CommandRunner for Arc<T>
@@ -139,6 +157,14 @@ where
 
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
         self.as_ref().run(command)
+    }
+
+    fn run_streaming(
+        &self,
+        command: &CommandSpec,
+        on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+    ) -> Result<CommandOutput, ProcessError> {
+        self.as_ref().run_streaming(command, on_line)
     }
 }
 
@@ -210,6 +236,105 @@ impl CommandRunner for RealCommandRunner {
         let stderr = join_reader(stderr_reader, &command.program)?;
 
         Ok(CommandOutput { stdout, stderr, status: status.code() })
+    }
+
+    fn run_streaming(
+        &self,
+        command: &CommandSpec,
+        on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+    ) -> Result<CommandOutput, ProcessError> {
+        use std::io::BufRead;
+
+        let mut child = Command::new(&command.program)
+            .args(&command.args)
+            .envs(&command.env)
+            .stdin(to_stdio(command.stdin))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    ProcessError::NotFound { program: command.program.clone() }
+                } else {
+                    ProcessError::Io {
+                        program: command.program.clone(),
+                        message: error.to_string(),
+                    }
+                }
+            })?;
+
+        let stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+        let mut stdout_output = String::new();
+        let mut stderr_output = String::new();
+
+        thread::scope(|s| {
+            let stdout_thread = s.spawn(|| {
+                let mut reader = std::io::BufReader::new(stdout_pipe);
+                let mut output = String::new();
+                let mut line = String::new();
+                while let Ok(bytes) = reader.read_line(&mut line) {
+                    if bytes == 0 {
+                        break;
+                    }
+                    let trimmed = if line.ends_with('\n') {
+                        line[..line.len() - 1].strip_suffix('\r').unwrap_or(&line[..line.len() - 1])
+                    } else {
+                        &line
+                    };
+                    on_line(trimmed, crate::progress::OutputStream::Stdout);
+                    output.push_str(&line);
+                    line.clear();
+                }
+                output
+            });
+
+            let stderr_thread = s.spawn(|| {
+                let mut reader = std::io::BufReader::new(stderr_pipe);
+                let mut output = String::new();
+                let mut line = String::new();
+                while let Ok(bytes) = reader.read_line(&mut line) {
+                    if bytes == 0 {
+                        break;
+                    }
+                    let trimmed = if line.ends_with('\n') {
+                        line[..line.len() - 1].strip_suffix('\r').unwrap_or(&line[..line.len() - 1])
+                    } else {
+                        &line
+                    };
+                    on_line(trimmed, crate::progress::OutputStream::Stderr);
+                    output.push_str(&line);
+                    line.clear();
+                }
+                output
+            });
+
+            stdout_output = stdout_thread.join().unwrap_or_default();
+            stderr_output = stderr_thread.join().unwrap_or_default();
+        });
+
+        let status = match command.timeout {
+            Some(timeout) => match child.wait_timeout(timeout).map_err(|error| {
+                ProcessError::Io { program: command.program.clone(), message: error.to_string() }
+            })? {
+                Some(status) => status,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProcessError::Timeout {
+                        program: command.program.clone(),
+                        timeout_ms: timeout.as_millis(),
+                    });
+                }
+            },
+            None => child.wait().map_err(|error| ProcessError::Io {
+                program: command.program.clone(),
+                message: error.to_string(),
+            })?,
+        };
+
+        Ok(CommandOutput { stdout: stdout_output, stderr: stderr_output, status: status.code() })
     }
 }
 

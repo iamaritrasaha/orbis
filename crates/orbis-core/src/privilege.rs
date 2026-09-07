@@ -63,6 +63,34 @@ impl RealOperationExecutor {
         self.administrator_authorized.store(true, Ordering::Release);
         Ok(())
     }
+
+    /// Executes a provider operation with streaming output forwarded to an observer.
+    ///
+    /// This method uses the same privilege escalation and command construction as
+    /// the standard `execute()`, but streams output lines to the provided observer
+    /// as they arrive from the provider process.
+    pub fn execute_streaming(
+        &self,
+        operation: &ProviderOperation,
+        requirement: PrivilegeRequirement,
+        observer: &dyn crate::progress::ProgressObserver,
+    ) -> Result<CommandOutput, PrivilegeError> {
+        if requirement == PrivilegeRequirement::Administrator {
+            self.ensure_authorized()?;
+        }
+        let command =
+            provider_command(operation, requirement == PrivilegeRequirement::Administrator);
+        let source = operation.source();
+        let output = self
+            .runner
+            .run_streaming(&command, &|line, stream| {
+                observer.on_event(&crate::progress::OperationEvent::ProviderOutput(
+                    crate::progress::OutputLine { stream, content: line.to_owned() },
+                ));
+            })
+            .map_err(|error| PrivilegeError::Execution(source, error.to_string()))?;
+        Ok(output)
+    }
 }
 
 impl OperationExecutor for RealOperationExecutor {
@@ -83,6 +111,15 @@ impl OperationExecutor for RealOperationExecutor {
             .run(&command)
             .map_err(|error| PrivilegeError::Execution(source, error.to_string()))?;
         Ok(output)
+    }
+
+    fn execute_with_observer(
+        &self,
+        operation: &ProviderOperation,
+        requirement: PrivilegeRequirement,
+        observer: &dyn crate::progress::ProgressObserver,
+    ) -> Result<CommandOutput, PrivilegeError> {
+        self.execute_streaming(operation, requirement, observer)
     }
 }
 

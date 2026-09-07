@@ -563,6 +563,16 @@ pub trait OperationExecutor: Send + Sync {
         operation: &ProviderOperation,
         requirement: PrivilegeRequirement,
     ) -> Result<CommandOutput, crate::privilege::PrivilegeError>;
+
+    /// Executes the validated typed provider operation, streaming output events to the observer.
+    fn execute_with_observer(
+        &self,
+        operation: &ProviderOperation,
+        requirement: PrivilegeRequirement,
+        _observer: &dyn crate::progress::ProgressObserver,
+    ) -> Result<CommandOutput, crate::privilege::PrivilegeError> {
+        self.execute(operation, requirement)
+    }
 }
 
 /// Produces a unique local operation identifier without a dependency on wall-clock formatting.

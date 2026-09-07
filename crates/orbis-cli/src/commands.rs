@@ -160,14 +160,12 @@ pub(crate) fn dispatch(
     }
 }
 
-/// Executes a previously generated, already-confirmed plan.
-///
-/// This is intentionally the only mutation entry point exposed to the TUI.
-/// The TUI must generate and render an executable plan before calling it.
-pub(crate) fn execute_confirmed_transaction(
+/// Executes a previously generated, already-confirmed plan with live progress observation.
+pub(crate) fn execute_confirmed_transaction_with_observer(
     registry: &ProviderRegistry,
     request: &OperationRequest,
     plan: OperationPlan,
+    observer: &dyn orbis_core::progress::ProgressObserver,
 ) -> Result<TransactionResult, String> {
     if !plan.executable() {
         return Err("this plan is blocked or incomplete; no package state was changed".into());
@@ -176,8 +174,26 @@ pub(crate) fn execute_confirmed_transaction(
         .map_err(|error| format!("could not start transaction: {error}"))?;
     let executor = RealOperationExecutor::new(registry.runner());
     registry
-        .execute_transaction_with_history(request, plan, &executor, &history)
+        .execute_transaction_with_progress(request, plan, &executor, &history, observer)
         .map_err(|error| error.to_string())
+}
+
+/// Executes a previously generated, already-confirmed plan.
+///
+/// This is intentionally the only mutation entry point exposed to the TUI.
+/// The TUI must generate and render an executable plan before calling it.
+#[allow(dead_code)]
+pub(crate) fn execute_confirmed_transaction(
+    registry: &ProviderRegistry,
+    request: &OperationRequest,
+    plan: OperationPlan,
+) -> Result<TransactionResult, String> {
+    execute_confirmed_transaction_with_observer(
+        registry,
+        request,
+        plan,
+        &orbis_core::progress::SilentObserver,
+    )
 }
 
 fn run_info(
@@ -306,9 +322,31 @@ fn run_transaction(
         let history = orbis_core::transaction::history::HistoryStore::default_location()
             .map_err(|e| format!("could not start transaction: {e}"))?;
         let executor = RealOperationExecutor::new(registry.runner());
-        let result = registry
-            .execute_transaction_with_history(&request, plan, &executor, &history)
-            .map_err(|e| e.to_string())?;
+        let result = if json {
+            registry
+                .execute_transaction_with_history(&request, plan, &executor, &history)
+                .map_err(|e| e.to_string())?
+        } else {
+            let header = orbis_core::progress::OperationHeader {
+                title: format!("{} {}", plan.action.label(), plan.target.name),
+                target: plan.target.name.clone(),
+                source: plan.target.source,
+                scope: plan.scope.label().to_string(),
+                privileged: plan.privilege
+                    == orbis_core::transaction::PrivilegeRequirement::Administrator,
+            };
+            let progress = crate::render::progress::PlainProgressRenderer::new(
+                renderer.theme,
+                header,
+                orbis_core::progress::ExecutionStage::transaction_stages(),
+                io::stderr().is_terminal(),
+                8,
+            );
+            progress.print_header();
+            registry
+                .execute_transaction_with_progress(&request, plan, &executor, &history, &progress)
+                .map_err(|e| e.to_string())?
+        };
         if json {
             print_json(&result)
         } else {
@@ -389,7 +427,33 @@ fn run_maintenance(
             providers.push(skipped_provider(provider_plan));
             continue;
         }
-        match registry.execute_maintenance(provider_plan, &executor) {
+        let exec_res = if json {
+            registry.execute_maintenance(provider_plan, &executor)
+        } else {
+            let candidate_count =
+                provider_plan.candidates.len().max(provider_plan.cleanup_candidates.len());
+            let header = orbis_core::progress::OperationHeader {
+                title: format!("{} {}", provider_plan.action.label(), provider_plan.source.label()),
+                target: format!("{candidate_count} candidate(s)"),
+                source: provider_plan.source,
+                scope: provider_plan
+                    .scope
+                    .map(|s| s.label().to_string())
+                    .unwrap_or_else(|| "provider scope".into()),
+                privileged: provider_plan.privilege
+                    == orbis_core::transaction::PrivilegeRequirement::Administrator,
+            };
+            let progress = crate::render::progress::PlainProgressRenderer::new(
+                renderer.theme,
+                header,
+                orbis_core::progress::ExecutionStage::maintenance_stages(),
+                io::stderr().is_terminal(),
+                8,
+            );
+            progress.print_header();
+            registry.execute_maintenance_with_progress(provider_plan, &executor, &progress)
+        };
+        match exec_res {
             Ok(result) => providers.extend(result.providers),
             Err(error) => providers.push(MaintenanceProviderResult {
                 source: provider_plan.source,

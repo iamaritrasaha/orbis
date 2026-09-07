@@ -20,10 +20,14 @@ impl Renderer {
     }
 
     pub(crate) fn home(&self, sources: &[SourceInfo]) -> String {
-        let mut output = self.heading(
-            &format!("{} ORBIS", self.theme.mark(Token::Primary)),
-            "Your Linux software, in one place.",
-        );
+        let mut output = String::new();
+        for line in self.theme.brand_full() {
+            output.push_str(&self.theme.paint(line, Token::Primary));
+            output.push('\n');
+        }
+        output
+            .push_str(&self.theme.paint(&format!("  {}\n", Theme::brand_tagline()), Token::Muted));
+        output.push('\n');
         output.push_str("Sources\n");
         for source in sources {
             let token = state_token(&source.state);
@@ -34,7 +38,10 @@ impl Renderer {
                 self.theme.paint(&source.state, token)
             ));
         }
-        output.push_str("\nTry\n  orbis search <package>\n  orbis updates\n  orbis upgrade --plan\n  orbis explain <package>\n  orbis doctor\n");
+        output.push_str(
+            "\nTry\n  orbis search <package>\n  orbis updates\n  orbis upgrade --plan\n  \
+             orbis explain <package>\n  orbis doctor\n",
+        );
         output
     }
 
@@ -612,7 +619,7 @@ mod tests {
             notes: Vec::new(),
         };
         assert!(renderer.home(std::slice::from_ref(&source)).contains("Your Linux software"));
-        assert!(renderer.home(std::slice::from_ref(&source)).contains("@ ORBIS"));
+        assert!(renderer.home(std::slice::from_ref(&source)).contains("ORBIS"));
         assert!(renderer.sources(&[source]).contains("SYSTEM & DESKTOP"));
         let report = SearchReport {
             results: vec![package(PackageSource::Cargo, "bat", Some(true))],

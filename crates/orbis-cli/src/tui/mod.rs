@@ -5,6 +5,7 @@
 //! boundary as the ordinary CLI.
 
 use std::{
+    collections::VecDeque,
     io::{self, IsTerminal},
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
@@ -30,7 +31,7 @@ use ratatui::{
 use crate::{
     cli::Command,
     commands,
-    render::theme::{Theme, Token},
+    render::theme::{StageState, Theme, Token},
 };
 
 const MIN_WIDTH: u16 = 70;
@@ -49,6 +50,8 @@ enum Screen {
     Help,
     Confirm,
     MaintenanceReview,
+    Progress,
+    Result,
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +67,10 @@ enum WorkerMessage {
     Plan(Box<Result<(OperationRequest, OperationPlan), String>>),
     Maintenance(Result<MaintenancePlan, String>),
     Why(Box<Result<WhyReport, String>>),
+    Progress(orbis_core::progress::OperationEvent),
+    TransactionComplete(Box<Result<orbis_core::transaction::TransactionResult, String>>),
+    #[allow(dead_code)]
+    MaintenanceComplete(Box<Result<orbis_core::maintenance::MaintenanceResult, String>>),
 }
 
 pub(crate) fn should_launch(command: Option<&Command>, json: bool, plain: bool) -> bool {
@@ -102,7 +109,7 @@ fn terminal_capable() -> bool {
 }
 
 struct App<'a> {
-    registry: &'a ProviderRegistry,
+    _registry: &'a ProviderRegistry,
     theme: Theme,
     tx: Sender<WorkerMessage>,
     rx: Receiver<WorkerMessage>,
@@ -126,6 +133,13 @@ struct App<'a> {
     loading_plan: bool,
     error: Option<String>,
     quit: bool,
+    // Progress screen state
+    progress_stage: orbis_core::progress::ExecutionStage,
+    progress_title: String,
+    progress_output: VecDeque<String>,
+    progress_scroll: usize,
+    transaction_result: Option<orbis_core::transaction::TransactionResult>,
+    maintenance_result: Option<orbis_core::maintenance::MaintenanceResult>,
 }
 
 impl<'a> App<'a> {
@@ -136,7 +150,7 @@ impl<'a> App<'a> {
         rx: Receiver<WorkerMessage>,
     ) -> Self {
         Self {
-            registry,
+            _registry: registry,
             theme,
             tx,
             rx,
@@ -160,6 +174,12 @@ impl<'a> App<'a> {
             loading_plan: false,
             error: None,
             quit: false,
+            progress_stage: orbis_core::progress::ExecutionStage::Planning,
+            progress_title: String::new(),
+            progress_output: VecDeque::new(),
+            progress_scroll: 0,
+            transaction_result: None,
+            maintenance_result: None,
         }
     }
 
@@ -226,6 +246,52 @@ impl<'a> App<'a> {
                     Err(error) => self.error = Some(error),
                 }
             }
+            WorkerMessage::Progress(event) => {
+                use orbis_core::progress::OperationEvent;
+                match &event {
+                    OperationEvent::StageChanged { stage } => {
+                        self.progress_stage = *stage;
+                    }
+                    OperationEvent::ProviderOutput(line) => {
+                        self.progress_output.push_back(line.content.clone());
+                        if self.progress_output.len() > 200 {
+                            self.progress_output.pop_front();
+                        }
+                    }
+                    OperationEvent::Warning { message } => {
+                        self.progress_output.push_back(format!("! {message}"));
+                    }
+                    OperationEvent::Finished { stage, .. } => {
+                        self.progress_stage = *stage;
+                    }
+                }
+            }
+            WorkerMessage::TransactionComplete(result) => match *result {
+                Ok(result) => {
+                    self.progress_stage = orbis_core::progress::ExecutionStage::Completed;
+                    self.transaction_result = Some(result);
+                    self.screen = Screen::Result;
+                    self.refresh();
+                }
+                Err(error) => {
+                    self.progress_stage = orbis_core::progress::ExecutionStage::Failed;
+                    self.error = Some(error);
+                    self.screen = Screen::Result;
+                }
+            },
+            WorkerMessage::MaintenanceComplete(result) => match *result {
+                Ok(result) => {
+                    self.progress_stage = orbis_core::progress::ExecutionStage::Completed;
+                    self.maintenance_result = Some(result);
+                    self.screen = Screen::Result;
+                    self.refresh();
+                }
+                Err(error) => {
+                    self.progress_stage = orbis_core::progress::ExecutionStage::Failed;
+                    self.error = Some(error);
+                    self.screen = Screen::Result;
+                }
+            },
         }
     }
 
@@ -306,6 +372,32 @@ impl<'a> App<'a> {
                     self.maintenance = None;
                 }
             }
+            Screen::Progress => self.handle_progress(key),
+            Screen::Result => self.handle_result(key),
+        }
+    }
+
+    fn handle_progress(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.progress_scroll = self.progress_scroll.saturating_add(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.progress_scroll = self.progress_scroll.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_result(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                self.screen = Screen::Package;
+                self.transaction_result = None;
+                self.maintenance_result = None;
+            }
+            KeyCode::Char('q') => self.quit = true,
+            _ => {}
         }
     }
 
@@ -479,15 +571,28 @@ impl<'a> App<'a> {
                     Some("This plan is blocked or incomplete and cannot be confirmed.".into());
                 return;
             }
-            match commands::execute_confirmed_transaction(self.registry, &request, plan) {
-                Ok(result) => {
-                    self.error =
-                        Some(format!("Transaction completed · {}", result.plan.operation_id));
-                    self.screen = Screen::Package;
-                    self.refresh();
+            self.progress_stage = orbis_core::progress::ExecutionStage::Planning;
+            self.progress_title = format!("{} {}", plan.action.label(), plan.target.name);
+            self.progress_output.clear();
+            self.progress_scroll = 0;
+            self.transaction_result = None;
+            self.open(Screen::Progress);
+
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                struct TuiObserver(Sender<WorkerMessage>);
+                impl orbis_core::progress::ProgressObserver for TuiObserver {
+                    fn on_event(&self, event: &orbis_core::progress::OperationEvent) {
+                        let _ = self.0.send(WorkerMessage::Progress(event.clone()));
+                    }
                 }
-                Err(error) => self.error = Some(error),
-            }
+                let observer = TuiObserver(tx.clone());
+                let registry = ProviderRegistry::system();
+                let result = commands::execute_confirmed_transaction_with_observer(
+                    &registry, &request, plan, &observer,
+                );
+                let _ = tx.send(WorkerMessage::TransactionComplete(Box::new(result)));
+            });
         }
     }
 
@@ -527,6 +632,11 @@ impl<'a> App<'a> {
                 self.draw_updates(frame, area);
                 self.draw_maintenance(frame, area);
             }
+            Screen::Progress => self.draw_progress(frame, area),
+            Screen::Result => {
+                self.draw_package(frame, area);
+                self.draw_result(frame, area);
+            }
         }
     }
 
@@ -555,16 +665,10 @@ impl<'a> App<'a> {
             .constraints([Constraint::Length(4), Constraint::Min(1), Constraint::Length(2)])
             .split(area);
         let header = Paragraph::new(Text::from(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", self.theme.mark(Token::Primary)),
-                    self.theme.style(Token::Primary),
-                ),
-                Span::styled(
-                    "ORBIS",
-                    self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(Span::styled(
+                self.theme.brand_compact(),
+                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+            )),
             Line::from(Span::styled(
                 format!("  {title} · {subtitle}"),
                 self.theme.style(Token::Muted),
@@ -585,25 +689,23 @@ impl<'a> App<'a> {
     }
 
     fn draw_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
-        let chunks =
-            Layout::vertical([Constraint::Length(4), Constraint::Min(1), Constraint::Length(3)])
-                .split(area);
-        let header = Paragraph::new(Text::from(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", self.theme.mark(Token::Primary)),
-                    self.theme.style(Token::Primary),
-                ),
-                Span::styled(
-                    "ORBIS",
-                    self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                "  Your Linux software, in one place.",
-                self.theme.style(Token::Muted),
-            )),
-        ]));
+        let brand_lines = self.theme.brand_full();
+        let header_height = (brand_lines.len() as u16) + 2;
+        let chunks = Layout::vertical([
+            Constraint::Length(header_height),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+        let mut header_lines: Vec<Line<'static>> = brand_lines
+            .iter()
+            .map(|line| Line::from(Span::styled(*line, self.theme.style(Token::Primary))))
+            .collect();
+        header_lines.push(Line::from(Span::styled(
+            format!("  {}", Theme::brand_tagline()),
+            self.theme.style(Token::Muted),
+        )));
+        let header = Paragraph::new(Text::from(header_lines));
         frame.render_widget(header, chunks[0]);
         match layout_class(area.width) {
             LayoutClass::Compact => {
@@ -1077,6 +1179,208 @@ impl<'a> App<'a> {
             popup,
         );
     }
+
+    fn draw_progress(&self, frame: &mut Frame<'_>, area: Rect) {
+        let chunks = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(8),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+        let header = Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                self.theme.brand_compact(),
+                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", self.progress_title),
+                self.theme.style(Token::Foreground).add_modifier(Modifier::BOLD),
+            )),
+        ]));
+        frame.render_widget(header, chunks[0]);
+
+        let stages = orbis_core::progress::ExecutionStage::transaction_stages();
+        let mut stage_lines =
+            vec![Line::from(Span::styled("STAGES", self.theme.style(Token::Section)))];
+        let current = self.progress_stage;
+        let mut found_current = false;
+        for &stage in stages {
+            let is_current = stage == current;
+            if is_current {
+                found_current = true;
+            }
+            let is_past = !found_current;
+            let state = if is_current {
+                if stage.is_terminal() { StageState::Done } else { StageState::Active }
+            } else if is_past {
+                StageState::Done
+            } else {
+                StageState::Pending
+            };
+
+            let token = match state {
+                StageState::Done => Token::Positive,
+                StageState::Active => Token::Caution,
+                StageState::Pending => Token::Muted,
+            };
+            let style = if is_current {
+                self.theme.style(Token::Foreground).add_modifier(Modifier::BOLD)
+            } else if is_past {
+                self.theme.style(Token::Foreground)
+            } else {
+                self.theme.style(Token::Muted)
+            };
+
+            stage_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", self.theme.stage_mark(state)),
+                    self.theme.style(token),
+                ),
+                Span::styled(
+                    if is_current && !stage.is_terminal() {
+                        format!("{} …", stage.label())
+                    } else {
+                        stage.label().to_string()
+                    },
+                    style,
+                ),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(Text::from(stage_lines)), chunks[1]);
+
+        let output_lines: Vec<Line<'static>> = self
+            .progress_output
+            .iter()
+            .map(|line| Line::from(Span::styled(line.clone(), self.theme.style(Token::Muted))))
+            .collect();
+
+        let visible_height = chunks[2].height.saturating_sub(2) as usize;
+        let total_lines = output_lines.len();
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let scroll_offset = if self.progress_scroll == 0 {
+            max_scroll as u16
+        } else {
+            max_scroll.saturating_sub(self.progress_scroll) as u16
+        };
+
+        let output_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.style(Token::Divider))
+            .title(Span::styled(" PROVIDER OUTPUT ", self.theme.style(Token::Section)));
+
+        let output_paragraph =
+            Paragraph::new(Text::from(output_lines)).block(output_block).scroll((scroll_offset, 0));
+        frame.render_widget(output_paragraph, chunks[2]);
+
+        let footer = Line::from(Span::styled(
+            "  ↑/↓ or j/k scroll log output",
+            self.theme.style(Token::Muted),
+        ));
+        frame.render_widget(Paragraph::new(footer), chunks[3]);
+    }
+
+    fn draw_result(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let popup = centered(area, 72, 18);
+        frame.render_widget(Clear, popup);
+
+        let mut lines = Vec::new();
+
+        if let Some(result) = &self.transaction_result {
+            let (status_text, token) = match result.status {
+                orbis_core::transaction::TransactionStatus::Succeeded => {
+                    ("Completed", Token::Positive)
+                }
+                orbis_core::transaction::TransactionStatus::PartiallyVerified => {
+                    ("Completed with limited verification", Token::Caution)
+                }
+                orbis_core::transaction::TransactionStatus::Failed => {
+                    ("Failed", Token::Destructive)
+                }
+            };
+
+            lines.push(Line::from(Span::styled(
+                format!("{} {}", result.plan.action.label(), result.plan.target.name),
+                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Status          ", self.theme.style(Token::Muted)),
+                Span::styled(status_text, self.theme.style(token).add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Source          ", self.theme.style(Token::Muted)),
+                Span::styled(result.plan.target.source.label(), self.theme.style(Token::Provider)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Verification    ", self.theme.style(Token::Muted)),
+                Span::styled(
+                    match result.verification {
+                        orbis_core::transaction::VerificationResult::Verified => "verified",
+                        orbis_core::transaction::VerificationResult::PartiallyVerified => {
+                            "partially verified"
+                        }
+                        orbis_core::transaction::VerificationResult::Failed => "failed",
+                    },
+                    self.theme.style(Token::Foreground),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Transaction ID  ", self.theme.style(Token::Muted)),
+                Span::styled(&result.plan.operation_id, self.theme.style(Token::Foreground)),
+            ]));
+            if let Some(msg) = &result.execution.message {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  Detail          ", self.theme.style(Token::Muted)),
+                    Span::styled(msg.clone(), self.theme.style(Token::Caution)),
+                ]));
+            }
+        } else if let Some(error) = &self.error {
+            lines.push(Line::from(Span::styled(
+                "Operation Failed",
+                self.theme.style(Token::Destructive).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Error: ", self.theme.style(Token::Destructive)),
+                Span::styled(error.clone(), self.theme.style(Token::Foreground)),
+            ]));
+        } else if let Some(result) = &self.maintenance_result {
+            lines.push(Line::from(Span::styled(
+                format!("Maintenance {}", result.action.label()),
+                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Status          ", self.theme.style(Token::Muted)),
+                Span::styled(format!("{:?}", result.status), self.theme.style(Token::Positive)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Operation ID    ", self.theme.style(Token::Muted)),
+                Span::styled(&result.operation_id, self.theme.style(Token::Foreground)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Enter / Esc return to package",
+            self.theme.style(Token::Muted),
+        )));
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(self.theme.style(Token::Primary))
+                        .style(self.theme.style(Token::Surface)),
+                )
+                .wrap(Wrap { trim: false }),
+            popup,
+        );
+    }
 }
 
 fn state_style(theme: Theme, state: &str) -> ratatui::style::Style {
@@ -1180,5 +1484,76 @@ mod tests {
         let content = render_at(48, 12);
         assert!(content.contains("needs a little more room"));
         assert!(content.contains("Minimum recommended"));
+    }
+
+    #[test]
+    fn progress_screen_renders_stages_and_output() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(registry, Theme::test(80), tx, rx);
+        app.screen = Screen::Progress;
+        app.progress_title = "Installing btop".into();
+        app.progress_stage = orbis_core::progress::ExecutionStage::Executing;
+        app.progress_output.push_back("Reading package lists...".into());
+        app.progress_output.push_back("Unpacking btop...".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw progress");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Installing btop"));
+        assert!(content.contains("STAGES"));
+        assert!(content.contains("Executing"));
+        assert!(content.contains("PROVIDER OUTPUT"));
+        assert!(content.contains("Reading package lists..."));
+    }
+
+    #[test]
+    fn result_screen_renders_summary() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(registry, Theme::test(80), tx, rx);
+        app.screen = Screen::Result;
+        let target = orbis_core::models::Package {
+            source: orbis_core::models::PackageSource::Apt,
+            provider_id: "btop".into(),
+            name: "btop".into(),
+            version: Some("1.0.0".into()),
+            summary: Some("Monitor".into()),
+            description: None,
+            installed: Some(false),
+            kind: None,
+            origin: None,
+            architecture: None,
+            homepage: None,
+            license: None,
+            size_bytes: None,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let mut plan = orbis_core::transaction::OperationPlan::new(
+            orbis_core::transaction::OperationAction::Install,
+            target,
+            orbis_core::transaction::InstallScope::System,
+        );
+        plan.operation_id = "tx-test-123".into();
+        app.transaction_result = Some(orbis_core::transaction::TransactionResult {
+            plan,
+            execution: orbis_core::transaction::ExecutionSummary {
+                exit_status: Some(0),
+                process_succeeded: true,
+                message: None,
+            },
+            verification: orbis_core::transaction::VerificationResult::Verified,
+            status: orbis_core::transaction::TransactionStatus::Succeeded,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw result");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Install btop"));
+        assert!(content.contains("Completed"));
+        assert!(content.contains("verified"));
+        assert!(content.contains("tx-test-123"));
     }
 }
