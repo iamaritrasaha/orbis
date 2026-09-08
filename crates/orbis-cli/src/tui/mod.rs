@@ -5,7 +5,7 @@
 //! boundary as the ordinary CLI.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, IsTerminal},
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
@@ -22,7 +22,7 @@ use orbis_core::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -118,10 +118,9 @@ pub(crate) struct StartupAnimation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AnimationStep {
-    Dot,
-    SmallDiamond,
-    LargeDiamond,
-    Wordmark,
+    Diamond,
+    Reveal,
+    Settled,
     Finished,
 }
 
@@ -187,10 +186,9 @@ impl StartupAnimation {
             return AnimationStep::Finished;
         }
         match elapsed_ms {
-            0..=120 => AnimationStep::Dot,
-            121..=240 => AnimationStep::SmallDiamond,
-            241..=360 => AnimationStep::LargeDiamond,
-            361..=500 => AnimationStep::Wordmark,
+            0..=140 => AnimationStep::Diamond,
+            141..=440 => AnimationStep::Reveal,
+            441..=600 => AnimationStep::Settled,
             _ => {
                 self.completed = true;
                 AnimationStep::Finished
@@ -207,6 +205,10 @@ impl StartupAnimation {
             return AnimationStep::Finished;
         };
         self.step_at(start.elapsed().as_millis())
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.start.map_or(0, |start| start.elapsed().as_millis())
     }
 }
 
@@ -805,103 +807,37 @@ impl<'a> App<'a> {
         if area.height < 20 || area.width < 70 {
             self.animation.finish();
         }
-        let step = self.animation.step();
-        let brand_lines = self.theme.brand_full();
-        let header_height = (brand_lines.len() as u16) + 2;
-        let chunks = Layout::vertical([
-            Constraint::Length(header_height),
-            Constraint::Min(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-        let header_lines: Vec<Line<'static>> = match step {
-            AnimationStep::Dot => vec![
-                Line::from(Span::styled(" ·", self.theme.style(Token::Primary))),
-                Line::from(""),
-                Line::from(""),
-                Line::from(""),
-            ],
-            AnimationStep::SmallDiamond => vec![
-                Line::from(Span::styled(" ◇", self.theme.style(Token::Primary))),
-                Line::from(""),
-                Line::from(""),
-                Line::from(""),
-            ],
-            AnimationStep::LargeDiamond => vec![
-                Line::from(Span::styled(" ◈", self.theme.style(Token::Primary))),
-                Line::from(""),
-                Line::from(""),
-                Line::from(""),
-            ],
-            AnimationStep::Wordmark => vec![
-                Line::from(Span::styled(
-                    format!(" {}", self.theme.brand_compact()),
-                    self.theme.style(Token::Primary),
-                )),
-                Line::from(""),
-                Line::from(""),
-                Line::from(""),
-            ],
-            AnimationStep::Finished => {
-                let mut lines: Vec<Line<'static>> = brand_lines
-                    .iter()
-                    .map(|line| Line::from(Span::styled(*line, self.theme.style(Token::Primary))))
-                    .collect();
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", Theme::brand_tagline()),
-                    self.theme.style(Token::Muted),
-                )));
-                lines
-            }
+        let compact = matches!(layout_class(area.width), LayoutClass::Compact);
+        let margin = if compact { 2 } else { 3 };
+        let content = Rect {
+            x: area.x + margin,
+            y: area.y,
+            width: area.width.saturating_sub(margin * 2),
+            height: area.height,
         };
-        let header = Paragraph::new(Text::from(header_lines));
-        frame.render_widget(header, chunks[0]);
-        match layout_class(area.width) {
-            LayoutClass::Compact => {
-                let mut lines = self.provider_lines(true);
-                lines.push(Line::from(""));
-                lines.extend(self.provider_lines(false));
-                frame.render_widget(
-                    Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-                    chunks[1],
-                );
-            }
-            LayoutClass::Normal | LayoutClass::Wide => {
-                let columns = if matches!(layout_class(area.width), LayoutClass::Wide) {
-                    Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
-                        .split(chunks[1])
-                } else {
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(chunks[1])
-                };
-                frame.render_widget(
-                    Paragraph::new(Text::from(self.provider_lines(true)))
-                        .wrap(Wrap { trim: false }),
-                    columns[0],
-                );
-                frame.render_widget(
-                    Paragraph::new(Text::from(self.provider_lines(false)))
-                        .wrap(Wrap { trim: false }),
-                    columns[1],
-                );
-            }
+
+        if compact && area.height < 24 {
+            self.draw_tight_dashboard(frame, content);
+            return;
         }
-        let update_line = match &self.updates {
-            None if self.snapshot_loading => "Updates   checking…".to_owned(),
-            None => "Updates   waiting for provider state".to_owned(),
-            Some(report) if report.candidates.is_empty() => "Updates   none confirmed".to_owned(),
-            Some(report) => {
-                format!("Updates   {} candidate(s) across available providers", report.total())
-            }
-        };
-        let footer = Text::from(vec![
-            Line::from(Span::styled(update_line, self.theme.style(Token::Secondary))),
-            Line::from(Span::styled(
-                "  r refreshes local/provider state · no catalog mutation",
-                self.theme.style(Token::Muted),
-            )),
-        ]);
-        frame.render_widget(Paragraph::new(footer), chunks[2]);
+
+        let brand_height = if compact { 3 } else { 7 };
+        let provider_height = if compact { 12 } else { 8 };
+        let chunks = Layout::vertical([
+            Constraint::Length(brand_height),
+            Constraint::Length(1),
+            Constraint::Min(provider_height),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ])
+        .split(content);
+
+        self.draw_brand(frame, chunks[0], compact);
+        self.draw_provider_panel(frame, chunks[2], compact);
+        self.draw_update_panel(frame, chunks[4]);
+        self.draw_footer(frame, chunks[6]);
     }
 
     fn provider_lines(&self, system: bool) -> Vec<Line<'static>> {
@@ -923,9 +859,9 @@ impl<'a> App<'a> {
                 Span::styled(format!("  {} ", self.theme.mark(token)), self.theme.style(token)),
                 Span::styled(
                     format!("{:<10}", source.source.label()),
-                    self.theme.style(Token::Provider),
+                    self.theme.style(Token::Foreground),
                 ),
-                Span::styled(source.state.clone(), self.theme.style(token)),
+                Span::styled(state_label(&source.state), self.theme.style(token)),
             ]));
         }
         if sources.is_empty() {
@@ -935,6 +871,178 @@ impl<'a> App<'a> {
             )));
         }
         lines
+    }
+
+    fn draw_brand(&mut self, frame: &mut Frame<'_>, area: Rect, compact: bool) {
+        let step = self.animation.step();
+        let lines = if compact {
+            let mark = match step {
+                AnimationStep::Diamond => "◈",
+                AnimationStep::Reveal | AnimationStep::Settled | AnimationStep::Finished => {
+                    self.theme.brand_compact()
+                }
+            };
+            vec![
+                Line::from(Span::styled(
+                    mark,
+                    self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(Theme::brand_tagline(), self.theme.style(Token::Muted))),
+            ]
+        } else {
+            let brand = self.theme.brand_full();
+            match step {
+                AnimationStep::Diamond => vec![Line::from(Span::styled(
+                    "◈",
+                    self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+                ))],
+                AnimationStep::Reveal => {
+                    let rows = ((self.animation.elapsed_ms().saturating_sub(140) / 60) as usize)
+                        .clamp(1, brand.len());
+                    brand
+                        .iter()
+                        .enumerate()
+                        .map(|(index, line)| {
+                            if index < rows {
+                                Line::from(Span::styled(*line, self.theme.style(Token::Primary)))
+                            } else {
+                                Line::from("")
+                            }
+                        })
+                        .collect()
+                }
+                AnimationStep::Settled | AnimationStep::Finished => brand
+                    .iter()
+                    .map(|line| Line::from(Span::styled(*line, self.theme.style(Token::Primary))))
+                    .chain(std::iter::once(Line::from(Span::styled(
+                        Theme::brand_tagline(),
+                        self.theme.style(Token::Muted),
+                    ))))
+                    .collect(),
+            }
+        };
+        frame.render_widget(Paragraph::new(Text::from(lines)).alignment(Alignment::Center), area);
+    }
+
+    fn draw_provider_panel(&self, frame: &mut Frame<'_>, area: Rect, compact: bool) {
+        let panel = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.style(Token::Divider))
+            .title(Span::styled(" SOFTWARE SOURCES ", self.theme.style(Token::Section)));
+        let inner = panel.inner(area);
+        frame.render_widget(panel, area);
+        if compact {
+            let mut lines = self.provider_lines(true);
+            lines.extend(self.provider_lines(false));
+            frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+            return;
+        }
+
+        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(Text::from(self.provider_lines(true))), columns[0]);
+        frame.render_widget(
+            Paragraph::new(Text::from(self.provider_lines(false))).block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(self.theme.style(Token::Divider)),
+            ),
+            columns[1],
+        );
+    }
+
+    fn draw_update_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let panel = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.style(Token::Divider))
+            .title(Span::styled(" UPDATES ", self.theme.style(Token::Section)));
+        let inner = panel.inner(area);
+        frame.render_widget(panel, area);
+
+        let (summary, breakdown) = match &self.updates {
+            None if self.snapshot_loading => (
+                "Checking available providers…".to_owned(),
+                "Read-only status refresh in progress".to_owned(),
+            ),
+            None => (
+                "Waiting for provider status".to_owned(),
+                "Read-only status refresh has not returned yet".to_owned(),
+            ),
+            Some(report) if report.candidates.is_empty() => (
+                "You're up to date".to_owned(),
+                "No available updates across the ready providers".to_owned(),
+            ),
+            Some(report) => (
+                format!(
+                    "{} update{} available",
+                    report.total(),
+                    if report.total() == 1 { "" } else { "s" }
+                ),
+                update_breakdown(report),
+            ),
+        };
+
+        let action = "[U] Review";
+        let width = inner.width as usize;
+        let summary_width = width.saturating_sub(action.chars().count() + 1);
+        let first = if summary.chars().count() + action.chars().count() < width {
+            let summary_len = summary.chars().count();
+            Line::from(vec![
+                Span::styled(summary, self.theme.style(Token::Foreground)),
+                Span::raw(" ".repeat(summary_width.saturating_sub(summary_len))),
+                Span::styled(action, self.theme.style(Token::Primary)),
+            ])
+        } else {
+            Line::from(Span::styled(summary, self.theme.style(Token::Foreground)))
+        };
+        let second = Line::from(Span::styled(breakdown, self.theme.style(Token::Muted)));
+        frame.render_widget(Paragraph::new(Text::from(vec![first, second])), inner);
+    }
+
+    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let footer =
+            Block::default().borders(Borders::TOP).border_style(self.theme.style(Token::Divider));
+        let inner = footer.inner(area);
+        frame.render_widget(footer, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "/ Search   U Updates   S Sources   H History   ? Help   Q Quit",
+                self.theme.style(Token::Muted),
+            ))),
+            inner,
+        );
+    }
+
+    fn draw_tight_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
+        let chunks =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(2)])
+                .split(area);
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    self.theme.brand_compact(),
+                    self.theme.style(Token::Primary),
+                )),
+                Line::from(Span::styled(Theme::brand_tagline(), self.theme.style(Token::Muted))),
+            ])),
+            chunks[0],
+        );
+        let mut lines = self.provider_lines(true);
+        lines.extend(self.provider_lines(false));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("UPDATES", self.theme.style(Token::Section))));
+        lines.push(Line::from(Span::styled(
+            update_summary(self.updates.as_ref(), self.snapshot_loading),
+            self.theme.style(Token::Foreground),
+        )));
+        frame.render_widget(Paragraph::new(Text::from(lines)), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "/ Search  U Updates  S Sources  H History  ? Help  Q Quit",
+                self.theme.style(Token::Muted),
+            ))),
+            chunks[2],
+        );
     }
 
     fn draw_search(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1043,8 +1151,9 @@ impl<'a> App<'a> {
             }
             Some(report) => {
                 body.push(Line::from(format!(
-                    "{} candidate(s) across provider sources",
-                    report.total()
+                    "{} update{} available",
+                    report.total(),
+                    if report.total() == 1 { "" } else { "s" }
                 )));
                 let mut previous_source = None;
                 for candidate in &report.candidates {
@@ -1300,15 +1409,17 @@ impl<'a> App<'a> {
             vec![Line::from(Span::styled("Upgrade plan review", self.theme.style(Token::Primary)))];
         if let Some(plan) = &self.maintenance {
             lines.push(Line::from(format!(
-                "{} provider plan(s) · risk {}",
+                "{} provider plan{} · risk {}",
                 plan.providers.len(),
+                if plan.providers.len() == 1 { "" } else { "s" },
                 plan.risk.label()
             )));
             lines.extend(plan.providers.iter().map(|provider| {
                 Line::from(format!(
-                    "  {:<9} {} candidate(s) · {}",
+                    "  {:<9} {} update{} · {}",
                     provider.source.label(),
                     provider.candidates.len(),
+                    if provider.candidates.len() == 1 { "" } else { "s" },
                     if provider.executable() { "executable" } else { "not executable" }
                 ))
             }));
@@ -1540,6 +1651,43 @@ fn state_style(theme: Theme, state: &str) -> ratatui::style::Style {
     })
 }
 
+fn state_label(state: &str) -> String {
+    match state {
+        "ready" => "Ready".into(),
+        "unavailable" => "Unavailable".into(),
+        "restricted" => "Restricted".into(),
+        "checking" => "Checking".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn update_summary(report: Option<&UpdateInventoryReport>, loading: bool) -> String {
+    match report {
+        None if loading => "Checking available providers…".into(),
+        None => "Waiting for provider status".into(),
+        Some(report) if report.candidates.is_empty() => "You're up to date".into(),
+        Some(report) => format!(
+            "{} update{} available",
+            report.total(),
+            if report.total() == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+fn update_breakdown(report: &UpdateInventoryReport) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for candidate in &report.candidates {
+        *counts.entry(candidate.source.label().to_owned()).or_default() += 1;
+    }
+    let details =
+        counts.into_iter().map(|(source, count)| format!("{source} {count}")).collect::<Vec<_>>();
+    if details.is_empty() {
+        "No available updates across the ready providers".into()
+    } else {
+        details.join(" · ")
+    }
+}
+
 fn capability_summary(source: &SourceInfo) -> String {
     let mut capabilities = Vec::new();
     if source.capabilities.search || source.capabilities.info {
@@ -1607,6 +1755,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orbis_core::maintenance::UpdateCandidate;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render_at(width: u16, height: u16) -> String {
@@ -1618,14 +1767,110 @@ mod tests {
         terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
     }
 
+    fn render_lines(width: u16, height: u16, unicode: bool) -> Vec<String> {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(width as usize);
+        theme.unicode = unicode;
+        let mut app = App::new(registry, theme, tx, rx);
+        app.sources = Some(registry.sources());
+        app.snapshot_loading = false;
+        app.updates = Some(UpdateInventoryReport {
+            inventories: Vec::new(),
+            candidates: Vec::new(),
+            issues: Vec::new(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw dashboard");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
     #[test]
     fn dashboard_renders_at_reference_sizes() {
-        for (width, height) in [(80, 24), (100, 30), (140, 40)] {
+        for (width, height) in [(121, 24), (80, 24), (100, 30), (140, 40)] {
             let content = render_at(width, height);
+            let lines = render_lines(width, height, true);
             assert!(content.contains("ORBIS"));
             assert!(content.contains("SYSTEM & DESKTOP"));
             assert!(content.contains("DEVELOPER TOOLS"));
+            assert!(content.contains("SOFTWARE SOURCES"));
+            assert!(content.contains("UPDATES"));
+            assert!(content.contains("/ Search"));
+            assert_eq!(lines.len(), height as usize);
+            assert!(lines.last().is_some_and(|line| line.contains("/ Search")));
+            assert!(!lines.iter().any(|line| line.contains("candidate(s)")));
         }
+    }
+
+    #[test]
+    fn dashboard_121x24_has_a_deliberate_full_height_composition() {
+        let lines = render_lines(121, 24, true);
+        let mut brand_theme = Theme::test(121);
+        brand_theme.unicode = true;
+        let brand = brand_theme.brand_full();
+
+        for intended_line in brand {
+            assert!(
+                lines.iter().any(|line| line.contains(intended_line.trim_end())),
+                "missing intended wordmark row: {intended_line:?}"
+            );
+        }
+        assert!(lines[8].contains("SOFTWARE SOURCES"));
+        assert!(lines[9].contains("SYSTEM & DESKTOP"));
+        assert!(lines[9].contains("DEVELOPER TOOLS"));
+        assert!(lines[17].contains("UPDATES"));
+        assert!(
+            lines[17..21].iter().any(|line| {
+                line.contains("available")
+                    || line.contains("up to date")
+                    || line.contains("Checking")
+            }),
+            "update panel was not rendered:\n{}",
+            lines.join("\n")
+        );
+        assert!(lines[23].contains("/ Search"));
+        assert!(!lines[17..23].iter().all(|line| line.trim().is_empty()));
+    }
+
+    #[test]
+    fn compact_80x24_uses_the_small_brand_and_keeps_footer_visible() {
+        let lines = render_lines(80, 24, false);
+        assert!(lines[0].contains("@ ORBIS"));
+        assert!(lines.iter().any(|line| line.contains("SYSTEM & DESKTOP")));
+        assert!(lines.iter().any(|line| line.contains("DEVELOPER TOOLS")));
+        assert!(lines[23].contains("/ Search"));
+        assert_eq!(lines.len(), 24);
+    }
+
+    #[test]
+    fn update_summary_uses_product_language() {
+        let report = UpdateInventoryReport {
+            inventories: Vec::new(),
+            candidates: vec![UpdateCandidate {
+                source: PackageSource::Apt,
+                provider_id: "btop".into(),
+                name: "btop".into(),
+                current_version: Some("1.0".into()),
+                available_version: Some("1.1".into()),
+                architecture: None,
+                scope: None,
+                channel: None,
+                held: None,
+                security_relevance: None,
+                notes: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
+            }],
+            issues: Vec::new(),
+        };
+        assert_eq!(update_summary(Some(&report), false), "1 update available");
+        assert_eq!(update_breakdown(&report), "APT 1");
+        assert!(!update_summary(Some(&report), false).contains("candidate"));
     }
 
     #[test]
@@ -1710,17 +1955,15 @@ mod tests {
     fn startup_animation_steps_progress_correctly() {
         let mut anim = StartupAnimation::for_testing(true);
         assert!(anim.is_active());
-        assert_eq!(anim.step_at(50), AnimationStep::Dot);
-        assert_eq!(anim.step_at(120), AnimationStep::Dot);
-        assert_eq!(anim.step_at(180), AnimationStep::SmallDiamond);
-        assert_eq!(anim.step_at(240), AnimationStep::SmallDiamond);
-        assert_eq!(anim.step_at(300), AnimationStep::LargeDiamond);
-        assert_eq!(anim.step_at(360), AnimationStep::LargeDiamond);
-        assert_eq!(anim.step_at(420), AnimationStep::Wordmark);
-        assert_eq!(anim.step_at(500), AnimationStep::Wordmark);
-        assert_eq!(anim.step_at(550), AnimationStep::Finished);
+        assert_eq!(anim.step_at(50), AnimationStep::Diamond);
+        assert_eq!(anim.step_at(140), AnimationStep::Diamond);
+        assert_eq!(anim.step_at(180), AnimationStep::Reveal);
+        assert_eq!(anim.step_at(440), AnimationStep::Reveal);
+        assert_eq!(anim.step_at(500), AnimationStep::Settled);
+        assert_eq!(anim.step_at(600), AnimationStep::Settled);
+        assert_eq!(anim.step_at(650), AnimationStep::Finished);
         assert!(!anim.is_active());
-        assert_eq!(anim.step_at(600), AnimationStep::Finished);
+        assert_eq!(anim.step_at(700), AnimationStep::Finished);
     }
 
     #[test]
@@ -1745,25 +1988,25 @@ mod tests {
     fn startup_animation_frame_rendering() {
         let registry = Box::leak(Box::new(ProviderRegistry::system()));
         let (tx, rx) = mpsc::channel();
-        let mut theme = Theme::test(80);
+        let mut theme = Theme::test(121);
         theme.unicode = true;
         theme.color = true;
         let mut app = App::new(registry, theme, tx, rx);
         app.animation = StartupAnimation::for_testing(true);
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame 0");
         let content0: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content0.contains('·'));
+        assert!(content0.contains('◈'));
 
-        app.animation.set_elapsed_ms(400);
+        app.animation.set_elapsed_ms(300);
         terminal.draw(|frame| app.draw(frame)).expect("draw wordmark");
         let content_wm: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content_wm.contains("ORBIS"));
+        assert!(content_wm.contains(" ███  ████"));
 
-        app.animation.set_elapsed_ms(600);
+        app.animation.set_elapsed_ms(650);
         terminal.draw(|frame| app.draw(frame)).expect("draw finished");
         let content_fin: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();

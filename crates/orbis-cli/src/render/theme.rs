@@ -4,7 +4,6 @@ use ratatui::style::{Color, Modifier, Style};
 pub(crate) enum Token {
     Primary,
     Foreground,
-    Secondary,
     Muted,
     Positive,
     Caution,
@@ -131,7 +130,13 @@ impl Theme {
     /// Returns the multi-line Orbis wordmark for dashboard and home screens.
     pub(crate) fn brand_full(self) -> &'static [&'static str] {
         if self.unicode {
-            &[" ◈  ┌─┐ ┬─┐ ┬─┐ ╶┬╴ ┌─╴", "    │ │ ├─┘ ├─┘  │  ╰─┐", "    └─┘ ╵   ┴─┘ ╶┴╴ ╶─┘"]
+            &[
+                " ███  ████  ████  █████  ████ ",
+                "█   █ █   █ █   █    █   █    ",
+                "█   █ ████  ████     █    ███ ",
+                "█   █ █ █   █   █     █      █",
+                " ███  █  ██ ████   █████ ████ ",
+            ]
         } else {
             &[" @  ORBIS"]
         }
@@ -169,7 +174,8 @@ fn basic_code(token: Token) -> u16 {
     match token {
         Token::Primary | Token::Section => 36,
         Token::Foreground | Token::Selected | Token::Surface => 37,
-        Token::Secondary | Token::Caution | Token::Provider => 33,
+        Token::Caution => 33,
+        Token::Provider => 37,
         Token::Muted | Token::Divider | Token::Unavailable => 90,
         Token::Positive => 32,
         Token::Destructive => 31,
@@ -180,7 +186,8 @@ fn basic_color(token: Token) -> Color {
     match token {
         Token::Primary | Token::Section => Color::Cyan,
         Token::Foreground | Token::Selected | Token::Surface => Color::White,
-        Token::Secondary | Token::Caution | Token::Provider => Color::Yellow,
+        Token::Caution => Color::Yellow,
+        Token::Provider => Color::White,
         Token::Muted | Token::Divider | Token::Unavailable => Color::DarkGray,
         Token::Positive => Color::Green,
         Token::Destructive => Color::Red,
@@ -191,7 +198,8 @@ fn ansi256_code(token: Token) -> u8 {
     match token {
         Token::Primary | Token::Section => 81,
         Token::Foreground | Token::Selected | Token::Surface => 255,
-        Token::Secondary | Token::Caution | Token::Provider => 221,
+        Token::Caution => 221,
+        Token::Provider => 255,
         Token::Muted | Token::Divider | Token::Unavailable => 245,
         Token::Positive => 78,
         Token::Destructive => 203,
@@ -202,10 +210,10 @@ fn rgb(token: Token) -> (u8, u8, u8) {
     match token {
         Token::Primary | Token::Section => (94, 201, 213),
         Token::Foreground | Token::Selected | Token::Surface => (232, 238, 244),
-        Token::Secondary => (236, 196, 118),
         Token::Muted | Token::Divider | Token::Unavailable => (122, 136, 151),
         Token::Positive => (109, 201, 151),
-        Token::Caution | Token::Provider => (236, 196, 118),
+        Token::Caution => (236, 196, 118),
+        Token::Provider => (232, 238, 244),
         Token::Destructive => (235, 117, 117),
     }
 }
@@ -215,11 +223,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unicode_theme_provides_geometric_wordmark_and_marks() {
+    fn unicode_theme_provides_the_intended_legible_orbis_wordmark() {
         let theme = Theme { color: true, unicode: true, width: 80, mode: ColorMode::TrueColor };
         let brand = theme.brand_full();
-        assert_eq!(brand.len(), 3);
-        assert!(brand[0].contains('◈'));
+        assert_eq!(
+            brand,
+            &[
+                " ███  ████  ████  █████  ████ ",
+                "█   █ █   █ █   █    █   █    ",
+                "█   █ ████  ████     █    ███ ",
+                "█   █ █ █   █   █     █      █",
+                " ███  █  ██ ████   █████ ████ ",
+            ]
+        );
+        assert_eq!(brand.len(), 5);
+        assert!(brand.iter().all(|line| line.chars().count() == 30));
         assert_eq!(theme.brand_compact(), "◈ ORBIS");
         assert_eq!(Theme::brand_tagline(), "Your Linux software, in one place.");
         assert_eq!(theme.stage_mark(StageState::Done), "●");
@@ -237,5 +255,11 @@ mod tests {
         assert_eq!(theme.stage_mark(StageState::Done), "*");
         assert_eq!(theme.stage_mark(StageState::Active), ">");
         assert_eq!(theme.stage_mark(StageState::Pending), ".");
+    }
+
+    #[test]
+    fn provider_token_is_neutral_foreground() {
+        let theme = Theme { color: true, unicode: true, width: 80, mode: ColorMode::TrueColor };
+        assert_eq!(theme.style(Token::Provider), theme.style(Token::Foreground));
     }
 }
