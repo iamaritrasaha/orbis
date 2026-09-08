@@ -106,7 +106,7 @@ pub(crate) enum Command {
     },
     /// Show installed software with updates available. Read-only.
     Updates {
-        /// Restrict the inventory to one provider.
+        /// Show status for only one provider.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },

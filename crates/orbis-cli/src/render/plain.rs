@@ -238,8 +238,7 @@ impl Renderer {
     }
 
     pub(crate) fn updates(&self, report: &UpdateInventoryReport) -> String {
-        let mut output =
-            self.heading("Updates", "Installed software with confirmed provider candidates.");
+        let mut output = self.heading("Updates", "Confirmed updates from available sources.");
         if report.candidates.is_empty() {
             output.push_str("\nYou're up to date.\n\nNo confirmed updates were found across the available sources.\n");
         } else {
@@ -273,19 +272,19 @@ impl Renderer {
         for issue in &report.issues {
             output.push_str(&format!("\n  {}: {}\n", issue.source, issue.message));
         }
-        output.push_str("\n  Read-only inventory; package state and indexes were not changed.\n");
+        output.push_str("\n  Read-only status; package state and indexes were not changed.\n");
         output
     }
 
     pub(crate) fn maintenance_plan(&self, plan: &MaintenancePlan) -> String {
         let mut output = self.heading(
             &format!("{} plan", plan.action.label()),
-            "Provider plans are coordinated for review, not atomic.",
+            "Changes are coordinated across sources for review.",
         );
         let total: usize =
             plan.providers.iter().map(|p| p.candidates.len().max(p.cleanup_candidates.len())).sum();
         output.push_str(&format!(
-            "\n  {total} candidate{} across {} provider plan{}\n",
+            "\n  {total} planned change{} across {} provider plan{}\n",
             if total == 1 { "" } else { "s" },
             plan.providers.len(),
             if plan.providers.len() == 1 { "" } else { "s" }
@@ -294,7 +293,7 @@ impl Renderer {
             output.push_str(&format!(
                 "\n{}  {}\n",
                 self.theme.paint(provider.source.label(), Token::Provider),
-                provider.scope.map(|s| s.label()).unwrap_or("provider scope")
+                provider.scope.map(|s| s.label()).unwrap_or("scope not reported")
             ));
             for candidate in &provider.candidates {
                 output.push_str(&format!(
@@ -342,10 +341,11 @@ impl Renderer {
                 MaintenanceProviderStatus::Blocked => "blocked",
             };
             output.push_str(&format!(
-                "  {:<10} {:<22} {} candidate(s)\n",
+                "  {:<10} {:<22} {} change{}\n",
                 provider.source.label(),
                 status,
-                provider.candidate_count
+                provider.candidate_count,
+                if provider.candidate_count == 1 { "" } else { "s" }
             ));
             if let Some(message) = &provider.message {
                 output.push_str(&format!("    {message}\n"));
@@ -389,16 +389,16 @@ impl Renderer {
 
     pub(crate) fn why(&self, report: &WhyReport) -> String {
         let mut output = self.heading("Why", &report.package.name);
-        output.push_str(&format!("\n{}\n", report.installed_as));
+        output.push_str(&format!("\nREQUIRED\n{}\n", report.installed_as));
         self.field(&mut output, "Source", &report.package.source.to_string());
         if !report.used_by.is_empty() {
-            output.push_str("\nUsed by\n");
+            output.push_str("\nUSED BY\n");
             for consumer in &report.used_by {
                 output.push_str(&format!("  {} · {}\n", consumer.name, consumer.relationship));
             }
         }
         output.push_str(&format!(
-            "\nRemoval advice\n{}\n",
+            "\nREMOVAL CONTEXT\n{}\n",
             wrap(&report.removal_advice, self.theme.width)
         ));
         for evidence in &report.evidence {
@@ -411,13 +411,30 @@ impl Renderer {
     }
 
     pub(crate) fn doctor(&self, report: &DoctorReport) -> String {
-        let mut output = self.heading("Doctor", "Safe checks only; no package state was changed.");
+        let mut output = self.heading("Doctor", "Provider health and safe remediation checks.");
+        output.push_str("SYSTEM\n");
         for check in &report.checks {
+            if check.area == "Environment" {
+                continue;
+            }
             let token = if check.passed { Token::Positive } else { Token::Caution };
             output.push_str(&format!(
                 "\n  {} {:<12} {}\n  {}\n",
                 self.theme.paint(self.theme.mark(token), token),
                 check.area,
+                check.title,
+                wrap(&check.message, self.theme.width.saturating_sub(4))
+            ));
+        }
+        let environment = report.checks.iter().filter(|check| check.area == "Environment");
+        if environment.clone().next().is_some() {
+            output.push_str("\nENVIRONMENT\n");
+        }
+        for check in environment {
+            let token = if check.passed { Token::Positive } else { Token::Caution };
+            output.push_str(&format!(
+                "  {} {}\n  {}\n",
+                self.theme.paint(self.theme.mark(token), token),
                 check.title,
                 wrap(&check.message, self.theme.width.saturating_sub(4))
             ));
@@ -458,7 +475,8 @@ impl Renderer {
 
     fn heading(&self, title: &str, subtitle: &str) -> String {
         format!(
-            "{}\n{}\n\n",
+            "{}  /  {}\n{}\n\n",
+            self.theme.paint(self.theme.brand_compact(), Token::Primary),
             self.theme.paint(title, Token::Primary),
             self.theme.paint(subtitle, Token::Muted)
         )
@@ -533,9 +551,11 @@ fn status(installed: Option<bool>) -> &'static str {
 
 fn completeness_label(value: orbis_core::transaction::PlanCompleteness) -> &'static str {
     match value {
-        orbis_core::transaction::PlanCompleteness::Complete => "complete",
-        orbis_core::transaction::PlanCompleteness::Partial => "partial",
-        orbis_core::transaction::PlanCompleteness::Unknown => "unknown",
+        orbis_core::transaction::PlanCompleteness::Complete => "all changes described",
+        orbis_core::transaction::PlanCompleteness::Partial => {
+            "some changes confirmed during install"
+        }
+        orbis_core::transaction::PlanCompleteness::Unknown => "impact not yet known",
     }
 }
 

@@ -434,12 +434,15 @@ fn run_maintenance(
                 provider_plan.candidates.len().max(provider_plan.cleanup_candidates.len());
             let header = orbis_core::progress::OperationHeader {
                 title: format!("{} {}", provider_plan.action.label(), provider_plan.source.label()),
-                target: format!("{candidate_count} candidate(s)"),
+                target: format!(
+                    "{candidate_count} planned change{}",
+                    if candidate_count == 1 { "" } else { "s" }
+                ),
                 source: provider_plan.source,
                 scope: provider_plan
                     .scope
                     .map(|s| s.label().to_string())
-                    .unwrap_or_else(|| "provider scope".into()),
+                    .unwrap_or_else(|| "scope not reported".into()),
                 privileged: provider_plan.privilege
                     == orbis_core::transaction::PrivilegeRequirement::Administrator,
             };

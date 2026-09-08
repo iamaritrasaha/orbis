@@ -15,14 +15,16 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use orbis_core::{
     ProviderRegistry,
     explain::build_brief,
-    maintenance::{MaintenanceAction, MaintenancePlan, UpdateInventoryReport, WhyReport},
+    maintenance::{
+        MaintenanceAction, MaintenancePlan, UpdateCandidate, UpdateInventoryReport, WhyReport,
+    },
     models::{Package, PackageSource, SourceInfo},
     transaction::{OperationAction, OperationPlan, OperationRequest, PackageRefJson},
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::Modifier,
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -34,6 +36,9 @@ use crate::{
     render::theme::{StageState, Theme, Token},
 };
 
+mod components;
+use components as ui;
+
 const MIN_WIDTH: u16 = 70;
 const MIN_HEIGHT: u16 = 18;
 
@@ -44,6 +49,7 @@ enum Screen {
     Package,
     Updates,
     Sources,
+    Doctor,
     History,
     HistoryDetail,
     Why,
@@ -62,7 +68,7 @@ enum LayoutClass {
 }
 
 enum WorkerMessage {
-    Snapshot(Vec<SourceInfo>, UpdateInventoryReport),
+    Snapshot(Vec<SourceInfo>, UpdateInventoryReport, orbis_core::diagnostics::DoctorReport),
     Search(String, orbis_core::SearchReport),
     Plan(Box<Result<(OperationRequest, OperationPlan), String>>),
     Maintenance(Result<MaintenancePlan, String>),
@@ -230,10 +236,14 @@ struct App<'a> {
     why: Option<WhyReport>,
     history: Vec<orbis_core::transaction::history::HistoryEntry>,
     history_selected: usize,
+    navigation_scroll: usize,
     history_detail: Option<serde_json::Value>,
     plan: Option<(OperationRequest, OperationPlan)>,
     maintenance: Option<MaintenancePlan>,
+    maintenance_action: MaintenanceAction,
+    doctor: Option<orbis_core::diagnostics::DoctorReport>,
     why_loading: bool,
+    doctor_loading: bool,
     loading_plan: bool,
     error: Option<String>,
     quit: bool,
@@ -241,6 +251,7 @@ struct App<'a> {
     // Progress screen state
     progress_stage: orbis_core::progress::ExecutionStage,
     progress_title: String,
+    progress_context: String,
     progress_output: VecDeque<String>,
     progress_scroll: usize,
     transaction_result: Option<orbis_core::transaction::TransactionResult>,
@@ -272,16 +283,21 @@ impl<'a> App<'a> {
             why: None,
             history: Vec::new(),
             history_selected: 0,
+            navigation_scroll: 0,
             history_detail: None,
             plan: None,
             maintenance: None,
+            maintenance_action: MaintenanceAction::Upgrade,
+            doctor: None,
             why_loading: false,
+            doctor_loading: false,
             loading_plan: false,
             error: None,
             quit: false,
             animation: StartupAnimation::new(&theme),
             progress_stage: orbis_core::progress::ExecutionStage::Preparing,
             progress_title: String::new(),
+            progress_context: String::new(),
             progress_output: VecDeque::new(),
             progress_scroll: 0,
             transaction_result: None,
@@ -326,10 +342,12 @@ impl<'a> App<'a> {
 
     fn accept(&mut self, message: WorkerMessage) {
         match message {
-            WorkerMessage::Snapshot(sources, updates) => {
+            WorkerMessage::Snapshot(sources, updates, doctor) => {
                 self.sources = Some(sources);
                 self.updates = Some(updates);
+                self.doctor = Some(doctor);
                 self.snapshot_loading = false;
+                self.doctor_loading = false;
             }
             WorkerMessage::Search(query, report) if query == self.search_query => {
                 self.search_results = report.results;
@@ -410,12 +428,14 @@ impl<'a> App<'a> {
             return;
         }
         self.snapshot_loading = true;
+        self.doctor_loading = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let registry = ProviderRegistry::system();
             let sources = registry.sources();
             let updates = registry.updates(None);
-            let _ = tx.send(WorkerMessage::Snapshot(sources, updates));
+            let doctor = registry.diagnostics(None).with_environment();
+            let _ = tx.send(WorkerMessage::Snapshot(sources, updates, doctor));
         });
     }
 
@@ -439,6 +459,9 @@ impl<'a> App<'a> {
         self.previous = self.screen;
         self.screen = screen;
         self.error = None;
+        if matches!(screen, Screen::Sources | Screen::Doctor) {
+            self.navigation_scroll = 0;
+        }
         if screen == Screen::History
             && let Ok(history) = orbis_core::transaction::history::HistoryStore::default_location()
         {
@@ -458,6 +481,7 @@ impl<'a> App<'a> {
             Screen::Package => self.handle_package(key),
             Screen::Updates => self.handle_updates(key),
             Screen::Sources => self.handle_navigation(key),
+            Screen::Doctor => self.handle_navigation(key),
             Screen::History => self.handle_history(key),
             Screen::HistoryDetail => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
@@ -507,6 +531,7 @@ impl<'a> App<'a> {
                 self.transaction_result = None;
                 self.maintenance_result = None;
             }
+            KeyCode::Char('h' | 'H') => self.open(Screen::History),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -520,10 +545,12 @@ impl<'a> App<'a> {
                 self.search_query.clear();
                 self.open(Screen::Search);
             }
-            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('r' | 'R') => self.refresh(),
             KeyCode::Char('u' | 'U') => self.open(Screen::Updates),
             KeyCode::Char('s' | 'S') => self.open(Screen::Sources),
             KeyCode::Char('h' | 'H') => self.open(Screen::History),
+            KeyCode::Char('d' | 'D') => self.open(Screen::Doctor),
+            KeyCode::Char('c' | 'C') => self.request_maintenance(MaintenanceAction::Cleanup),
             _ => {}
         }
     }
@@ -533,7 +560,13 @@ impl<'a> App<'a> {
             KeyCode::Esc => self.screen = Screen::Dashboard,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.open(Screen::Help),
-            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('r' | 'R') => self.refresh(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.navigation_scroll = self.navigation_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.navigation_scroll = self.navigation_scroll.saturating_add(1)
+            }
             _ => {}
         }
     }
@@ -586,8 +619,8 @@ impl<'a> App<'a> {
             KeyCode::Esc => self.screen = Screen::Dashboard,
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.open(Screen::Help),
-            KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('u' | 'U') => self.request_maintenance(),
+            KeyCode::Char('r' | 'R') => self.refresh(),
+            KeyCode::Char('u' | 'U') => self.request_maintenance(MaintenanceAction::Upgrade),
             _ => {}
         }
     }
@@ -645,12 +678,12 @@ impl<'a> App<'a> {
         });
     }
 
-    fn request_maintenance(&mut self) {
+    fn request_maintenance(&mut self, action: MaintenanceAction) {
+        self.maintenance_action = action;
         self.maintenance = None;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result =
-                ProviderRegistry::system().maintenance_plan(MaintenanceAction::Upgrade, None);
+            let result = ProviderRegistry::system().maintenance_plan(action, None);
             let _ = tx.send(WorkerMessage::Maintenance(result));
         });
         self.open(Screen::MaintenanceReview);
@@ -684,6 +717,16 @@ impl<'a> App<'a> {
             }
             self.progress_stage = orbis_core::progress::ExecutionStage::Preparing;
             self.progress_title = format!("{} {}", plan.action.label(), plan.target.name);
+            self.progress_context = format!(
+                "{} · {} · {} access",
+                plan.target.source,
+                plan.scope.label(),
+                if plan.privilege == orbis_core::transaction::PrivilegeRequirement::None {
+                    "User"
+                } else {
+                    "Administrator"
+                }
+            );
             self.progress_output.clear();
             self.progress_scroll = 0;
             self.transaction_result = None;
@@ -709,6 +752,9 @@ impl<'a> App<'a> {
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        // Each frame owns the complete terminal surface. Clearing first prevents
+        // shorter secondary pages from leaving dashboard content behind.
+        frame.render_widget(Clear, area);
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
             let lines = vec![
                 Line::from(Span::styled(
@@ -731,6 +777,7 @@ impl<'a> App<'a> {
             Screen::Package => self.draw_package(frame, area),
             Screen::Updates => self.draw_updates(frame, area),
             Screen::Sources => self.draw_sources(frame, area),
+            Screen::Doctor => self.draw_doctor(frame, area),
             Screen::History => self.draw_history(frame, area),
             Screen::HistoryDetail => self.draw_history_detail(frame, area),
             Screen::Why => self.draw_why(frame, area),
@@ -744,29 +791,15 @@ impl<'a> App<'a> {
                 self.draw_confirm(frame, area);
             }
             Screen::MaintenanceReview => {
-                self.draw_updates(frame, area);
                 self.draw_maintenance(frame, area);
             }
             Screen::Progress => self.draw_progress(frame, area),
-            Screen::Result => {
-                self.draw_package(frame, area);
-                self.draw_result(frame, area);
-            }
+            Screen::Result => self.draw_result(frame, area),
         }
     }
 
-    fn shell(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        title: &str,
-        subtitle: &str,
-        body: Vec<Line<'static>>,
-    ) {
-        self.shell_scrolled(frame, area, title, subtitle, body, 0);
-    }
-
-    fn shell_scrolled(
+    #[allow(clippy::too_many_arguments)]
+    fn shell_scrolled_actions(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
@@ -774,33 +807,23 @@ impl<'a> App<'a> {
         subtitle: &str,
         body: Vec<Line<'static>>,
         scroll: u16,
+        actions: &str,
     ) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Min(1), Constraint::Length(2)])
-            .split(area);
-        let header = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                self.theme.brand_compact(),
-                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("  {title} · {subtitle}"),
-                self.theme.style(Token::Muted),
-            )),
-        ]));
-        frame.render_widget(header, chunks[0]);
-        frame.render_widget(
-            Paragraph::new(Text::from(body)).scroll((scroll, 0)).wrap(Wrap { trim: false }),
-            chunks[1],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "/ Search   U Updates   S Sources   H History   ? Help   Q Quit",
-                self.theme.style(Token::Muted),
-            ))),
-            chunks[2],
-        );
+        self.shell_actions(frame, area, title, subtitle, body, scroll, actions);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shell_actions(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        subtitle: &str,
+        body: Vec<Line<'static>>,
+        scroll: u16,
+        actions: &str,
+    ) {
+        ui::page(frame, area, self.theme, title, subtitle, body, scroll, actions);
     }
 
     fn draw_dashboard(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -866,7 +889,7 @@ impl<'a> App<'a> {
         }
         if sources.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  checking provider state…",
+                format!("  {} Checking providers…", self.theme.mark(Token::Caution)),
                 self.theme.style(Token::Muted),
             )));
         }
@@ -1004,11 +1027,13 @@ impl<'a> App<'a> {
             Block::default().borders(Borders::TOP).border_style(self.theme.style(Token::Divider));
         let inner = footer.inner(area);
         frame.render_widget(footer, area);
+        let actions = if area.width < 90 {
+            "/ Search   U Updates   S Sources   H History   ? Help   Q Quit"
+        } else {
+            "/ Search   U Updates   S Sources   H History   D Doctor   C Clean   ? Help   Q Quit"
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "/ Search   U Updates   S Sources   H History   ? Help   Q Quit",
-                self.theme.style(Token::Muted),
-            ))),
+            Paragraph::new(Line::from(Span::styled(actions, self.theme.style(Token::Muted)))),
             inner,
         );
     }
@@ -1046,24 +1071,46 @@ impl<'a> App<'a> {
     }
 
     fn draw_search(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut body = vec![
-            Line::from(vec![
-                Span::styled("SEARCH  ", self.theme.style(Token::Section)),
-                Span::styled(
-                    format!("{}▌", self.search_query),
-                    self.theme.style(Token::Foreground),
-                ),
-            ]),
-            Line::from(""),
-        ];
+        let [header, body_area, footer] = ui::page_chunks(area);
+        ui::page_header(
+            frame,
+            header,
+            self.theme,
+            "Search",
+            "Find software across the available sources",
+        );
+        let body_chunks =
+            Layout::vertical([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+                .split(body_area);
+        let input = ui::panel(self.theme, " SEARCH PACKAGES ");
+        let input_inner = input.inner(body_chunks[0]);
+        frame.render_widget(input, body_chunks[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{}▌", self.search_query),
+                self.theme.style(Token::Foreground),
+            ))),
+            input_inner,
+        );
+
+        let count = if self.search_loading {
+            "Searching…".to_owned()
+        } else {
+            let count = self.search_results.len();
+            format!("{count} result{}", if count == 1 { "" } else { "s" })
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(count, self.theme.style(Token::Muted))),
+            body_chunks[1],
+        );
+
+        let mut results = Vec::new();
         if self.search_loading {
-            body.push(Line::from(Span::styled(
-                "checking providers…",
-                self.theme.style(Token::Muted),
-            )));
+            results.push(ui::loading(self.theme, "Checking providers…"));
         } else if self.search_results.is_empty() && !self.search_query.is_empty() {
-            body.push(Line::from(
-                "No matches. Try a broader query or a provider-qualified CLI command.",
+            results.push(ui::empty(
+                self.theme,
+                "No matches. Try a broader search or a provider-qualified command.",
             ));
         }
         for (index, package) in self.search_results.iter().enumerate() {
@@ -1074,38 +1121,39 @@ impl<'a> App<'a> {
                 None => "state unknown",
             };
             let name = truncate(&package.name, 27, self.theme.unicode);
-            body.push(Line::from(vec![
-                Span::styled(
-                    format!("{} {name:<28}", if selected { ">" } else { " " }),
-                    if selected {
-                        self.theme.style(Token::Selected)
-                    } else {
-                        self.theme.style(Token::Foreground)
-                    },
-                ),
-                Span::styled(
-                    format!(" {:<8} {status}", package.source.label()),
-                    self.theme.style(Token::Provider),
-                ),
-            ]));
+            results.extend(ui::selectable_row(
+                self.theme,
+                selected,
+                &name,
+                &format!("{} · {status}", package.source.label()),
+            ));
             if let Some(summary) = &package.summary {
-                body.push(Line::from(Span::styled(
-                    format!("    {summary}"),
+                results.push(Line::from(Span::styled(
+                    format!("      {summary}"),
                     self.theme.style(Token::Muted),
                 )));
             }
+            results.push(Line::from(""));
         }
-        self.shell(frame, area, "Search", "type to search · Enter opens details", body);
+        frame.render_widget(
+            Paragraph::new(Text::from(results))
+                .scroll((self.selected.saturating_sub(2) as u16 * 3, 0))
+                .wrap(Wrap { trim: false }),
+            body_chunks[2],
+        );
+        ui::page_footer(frame, footer, self.theme, "↑↓ Navigate   Enter Open   Esc Back   ? Help");
     }
 
     fn draw_package(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(package) = &self.selected_package else {
-            self.shell(
+            self.shell_actions(
                 frame,
                 area,
                 "Package",
-                "nothing selected",
-                vec![Line::from("Select a package from Search.")],
+                "No package selected",
+                vec![ui::empty(self.theme, "Select a package from Search to see its Orbis Brief.")],
+                0,
+                "Esc Back   / Search   ? Help",
             );
             return;
         };
@@ -1115,209 +1163,358 @@ impl<'a> App<'a> {
             Line::from(format!(
                 "{} · {} · {}",
                 package.source,
+                installed_label(package.installed),
                 package.version.as_deref().unwrap_or("version unknown"),
-                package.installed.map_or("state unknown", |value| if value {
-                    "installed"
-                } else {
-                    "available"
-                })
+            )),
+            Line::from(Span::styled(
+                brief.headline.clone(),
+                self.theme.style(Token::Foreground).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(Span::styled("What it does", self.theme.style(Token::Section))),
+            ui::section_title(self.theme, "WHAT IT DOES"),
         ];
         body.extend(brief.paragraphs.into_iter().map(Line::from));
-        if let Some(caution) = brief.caution {
-            body.push(Line::from(Span::styled(
-                format!("Context  {caution}"),
-                self.theme.style(Token::Caution),
-            )));
+        if !brief.examples.is_empty() {
+            body.extend([Line::from(""), ui::section_title(self.theme, "WHY YOU MIGHT WANT IT")]);
+            body.extend(brief.examples.into_iter().map(|example| {
+                Line::from(format!("  {} {example}", self.theme.mark(Token::Primary)))
+            }));
         }
         body.extend([
             Line::from(""),
-            Line::from("I Install / Update    R Remove    W Why    Esc Back"),
+            ui::section_title(self.theme, "DETAILS"),
+            ui::info_row(self.theme, "Source", package.source.to_string()),
+            ui::info_row(
+                self.theme,
+                "Type",
+                package.kind.map_or("Not classified", |kind| kind.label()),
+            ),
+            ui::info_row(self.theme, "Scope", package_scope_label(package.source)),
+            ui::info_row(self.theme, "Installed", installed_label(package.installed)),
+            Line::from(""),
+            ui::section_title(self.theme, "EVIDENCE"),
+            ui::info_row(self.theme, "Confidence", brief.confidence.clone()),
         ]);
-        self.shell(frame, area, "Orbis Brief", "provider-aware package detail", body);
+        for evidence in brief.evidence {
+            body.push(Line::from(Span::styled(
+                format!("  · {}", evidence.detail),
+                self.theme.style(Token::Muted),
+            )));
+        }
+        if let Some(caution) = brief.caution {
+            body.extend([Line::from(""), ui::warning(self.theme, &caution)]);
+        }
+        self.shell_actions(
+            frame,
+            area,
+            "Orbis Brief",
+            &package.name,
+            body,
+            0,
+            "I Install/Update   R Remove   W Why   Esc Back   ? Help",
+        );
     }
 
     fn draw_updates(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut body = vec![Line::from(Span::styled("UPDATES", self.theme.style(Token::Section)))];
+        let mut body = Vec::new();
         match &self.updates {
-            None => body.push(Line::from(Span::styled(
-                "checking provider inventories…",
-                self.theme.style(Token::Muted),
-            ))),
+            None => body.push(ui::loading(self.theme, "Checking providers…")),
             Some(report) if report.candidates.is_empty() => {
-                body.push(Line::from("No confirmed updates were found."))
+                body.push(ui::empty(self.theme, "No updates available."));
+                for inventory in &report.inventories {
+                    if !inventory.available
+                        || inventory.metadata_state.as_deref().is_some_and(|state| {
+                            state.contains("incomplete") || state.contains("unknown")
+                        })
+                    {
+                        body.push(Line::from(Span::styled(
+                            format!("  {:<10} Update status unavailable", inventory.source),
+                            self.theme.style(Token::Caution),
+                        )));
+                    }
+                }
             }
             Some(report) => {
-                body.push(Line::from(format!(
-                    "{} update{} available",
-                    report.total(),
-                    if report.total() == 1 { "" } else { "s" }
-                )));
-                let mut previous_source = None;
-                for candidate in &report.candidates {
-                    if previous_source != Some(candidate.source) {
-                        body.push(Line::from(Span::styled(
-                            candidate.source.label(),
-                            self.theme.style(Token::Provider),
-                        )));
-                        previous_source = Some(candidate.source);
-                    }
-                    body.push(Line::from(format!(
-                        "  {:<26} {} → {}  {}",
-                        truncate(&candidate.name, 26, self.theme.unicode),
-                        candidate.current_version.as_deref().unwrap_or("current"),
-                        candidate.available_version.as_deref().unwrap_or("latest"),
-                        candidate.source
-                    )));
-                }
+                body.extend(update_group_lines(self.theme, report, true));
+                body.extend([Line::from(""), ui::section_title(self.theme, "DEVELOPER TOOLS")]);
+                body.extend(update_group_lines(self.theme, report, false));
             }
         }
-        if let Some(report) = &self.updates {
-            for inventory in &report.inventories {
-                if inventory
-                    .metadata_state
-                    .as_deref()
-                    .is_some_and(|state| state.contains("incomplete") || state.contains("unknown"))
-                {
-                    body.push(Line::from(Span::styled(
-                        format!(
-                            "  {} update status incomplete; unknown is not zero",
-                            inventory.source
-                        ),
-                        self.theme.style(Token::Caution),
-                    )));
-                }
-            }
-        }
-        body.extend([
-            Line::from(""),
-            Line::from("U Review upgrade plan    r Refresh view    Esc Back"),
-        ]);
-        self.shell(frame, area, "Updates", "unified read-only inventory", body);
+        self.shell_actions(
+            frame,
+            area,
+            "Updates",
+            &update_summary(self.updates.as_ref(), self.snapshot_loading),
+            body,
+            0,
+            "U Review plan   R Refresh   Esc Back   ? Help",
+        );
     }
 
     fn draw_sources(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut body =
-            vec![Line::from(Span::styled("PROVIDERS", self.theme.style(Token::Section)))];
+        let mut body = Vec::new();
         if let Some(sources) = &self.sources {
+            body.push(ui::section_title(self.theme, "SYSTEM & DESKTOP"));
+            let mut developer_heading = false;
+            // `info_row` reserves fifteen cells for its label, so bound the
+            // detail itself to the remaining page width and keep every source
+            // on exactly two compact rows.
+            let detail_width = ui::inset(area).width.saturating_sub(16) as usize;
             for source in sources {
-                body.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<10}", source.source.label()),
-                        self.theme.style(Token::Provider),
+                let system = matches!(
+                    source.source,
+                    PackageSource::Apt | PackageSource::Flatpak | PackageSource::Snap
+                );
+                if !system && !developer_heading {
+                    body.push(ui::section_title(self.theme, "DEVELOPER TOOLS"));
+                    developer_heading = true;
+                }
+                let token = state_token(&source.state);
+                body.push(ui::provider_row(
+                    self.theme,
+                    self.theme.mark(token),
+                    source.source.label(),
+                    &state_label(&source.state),
+                    token,
+                ));
+                body.push(ui::info_row(
+                    self.theme,
+                    "Backend",
+                    truncate(
+                        &format!(
+                            "{} · {}{}",
+                            source.backend.as_deref().unwrap_or("Not detected"),
+                            capability_summary(source),
+                            source
+                                .notes
+                                .first()
+                                .map(|note| format!(" · {note}"))
+                                .unwrap_or_default()
+                        ),
+                        detail_width,
+                        self.theme.unicode,
                     ),
-                    Span::styled(
-                        format!("{:<13}", source.state),
-                        state_style(self.theme, &source.state),
-                    ),
-                    Span::styled(
-                        source.backend.clone().unwrap_or_default(),
-                        self.theme.style(Token::Muted),
-                    ),
-                ]));
-                body.push(Line::from(Span::styled(
-                    format!("      Supports  {}", capability_summary(source)),
-                    self.theme.style(Token::Muted),
-                )));
-                if let Some(note) = source.notes.first() {
+                ));
+            }
+        } else {
+            body.push(ui::loading(self.theme, "Checking providers…"));
+        }
+        self.shell_actions(
+            frame,
+            area,
+            "Sources",
+            "Provider health, scope, and capabilities",
+            body,
+            self.navigation_scroll as u16,
+            "↑↓ Navigate   R Refresh   Esc Back   ? Help",
+        );
+    }
+
+    fn draw_doctor(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut body = Vec::new();
+        if self.doctor_loading && self.doctor.is_none() {
+            body.push(ui::loading(self.theme, "Checking providers and environment…"));
+        } else if let Some(report) = &self.doctor {
+            body.push(ui::section_title(self.theme, "SYSTEM & DESKTOP"));
+            for check in report
+                .checks
+                .iter()
+                .filter(|check| check.area != "Environment" && is_system_area(&check.area))
+            {
+                let token = if check.passed { Token::Positive } else { Token::Caution };
+                body.push(ui::provider_row(
+                    self.theme,
+                    self.theme.mark(token),
+                    &check.area,
+                    &check.title,
+                    token,
+                ));
+            }
+            body.extend([Line::from(""), ui::section_title(self.theme, "DEVELOPER TOOLS")]);
+            for check in report
+                .checks
+                .iter()
+                .filter(|check| check.area != "Environment" && !is_system_area(&check.area))
+            {
+                let token = if check.passed { Token::Positive } else { Token::Caution };
+                body.push(ui::provider_row(
+                    self.theme,
+                    self.theme.mark(token),
+                    &check.area,
+                    &check.title,
+                    token,
+                ));
+            }
+            let issues = report.checks.iter().filter(|check| !check.passed);
+            if issues.clone().next().is_some() {
+                body.extend([Line::from(""), ui::section_title(self.theme, "ISSUES")]);
+                for issue in issues {
                     body.push(Line::from(Span::styled(
-                        format!("      {note}"),
+                        format!("{}  {}", issue.area, issue.title),
+                        self.theme.style(Token::Caution),
+                    )));
+                    body.push(Line::from(Span::styled(
+                        format!("  {}", issue.message),
                         self.theme.style(Token::Muted),
                     )));
                 }
             }
+            body.extend([Line::from(""), ui::section_title(self.theme, "ENVIRONMENT")]);
+            for check in report.checks.iter().filter(|check| check.area == "Environment") {
+                let token = if check.passed { Token::Positive } else { Token::Caution };
+                body.push(ui::status_chip(self.theme, self.theme.mark(token), &check.title, token));
+            }
         } else {
-            body.push(Line::from("  checking provider state…"));
+            body.push(ui::empty(self.theme, "No diagnostic report is available."));
         }
-        self.shell(frame, area, "Sources", "capabilities and limitations", body);
+        self.shell_actions(
+            frame,
+            area,
+            "Doctor",
+            "Provider health and safe remediation checks",
+            body,
+            self.navigation_scroll as u16,
+            "↑↓ Navigate   R Recheck   Esc Back   ? Help",
+        );
     }
 
     fn draw_history(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut body = vec![Line::from(Span::styled("TIMELINE", self.theme.style(Token::Section)))];
+        let mut body = Vec::new();
         if self.history.is_empty() {
-            body.push(Line::from("No Orbis operations recorded yet."));
+            body.push(ui::empty(self.theme, "No Orbis operations recorded yet."));
         }
+        let mut previous_day = None;
         for (index, entry) in self.history.iter().enumerate() {
+            let day = history_day_label(entry.recorded_at_unix_ms);
+            if previous_day != Some(day) {
+                if previous_day.is_some() {
+                    body.push(Line::from(""));
+                }
+                body.push(ui::section_title(self.theme, day));
+                previous_day = Some(day);
+            }
             let selected = index == self.history_selected;
-            let line = format!(
-                "{} {:<16} {:<10} {}{}",
-                if selected { ">" } else { " " },
-                entry.operation_id,
-                entry.status,
-                entry.source.map_or("Orbis", |source| source.label()),
-                entry.package.as_deref().map_or(String::new(), |package| format!(" · {package}")),
+            let token = history_token(&entry.status);
+            let source = entry.source.map_or("Orbis", |source| source.label());
+            let target = entry.package.as_deref().unwrap_or("Coordinated provider update");
+            let title = format!(
+                "{} {} {}",
+                history_time(entry.recorded_at_unix_ms),
+                if selected { ">" } else { "·" },
+                entry.action
             );
+            body.push(Line::from(vec![
+                Span::styled(
+                    title,
+                    if selected {
+                        self.theme.style(Token::Selected).add_modifier(Modifier::BOLD)
+                    } else {
+                        self.theme.style(token)
+                    },
+                ),
+                Span::styled(format!("  {}", status_label(&entry.status)), self.theme.style(token)),
+            ]));
             body.push(Line::from(Span::styled(
-                line,
+                format!("    {source}:{target}"),
                 if selected {
                     self.theme.style(Token::Selected)
                 } else {
                     self.theme.style(Token::Foreground)
                 },
             )));
+            body.push(Line::from(Span::styled(
+                format!("    {}", entry.operation_id),
+                self.theme.style(Token::Muted),
+            )));
         }
-        body.extend([Line::from(""), Line::from("Enter Details    ↑/↓ or j/k Move    Esc Back")]);
-        self.shell_scrolled(
+        body.push(ui::action_hint(self.theme, "Enter opens details"));
+        self.shell_scrolled_actions(
             frame,
             area,
             "History",
-            "sanitized local records",
+            "A timeline of confirmed Orbis operations",
             body,
             self.history_selected.saturating_sub(8) as u16,
+            "↑↓ Navigate   Enter Details   Esc Back   ? Help",
         );
     }
 
     fn draw_history_detail(&self, frame: &mut Frame<'_>, area: Rect) {
-        let value = self.history_detail.as_ref().map_or_else(
-            || "No history record selected.".to_owned(),
-            |value| serde_json::to_string_pretty(value).unwrap_or_default(),
-        );
-        self.shell(
+        let mut body = vec![ui::section_title(self.theme, "OPERATION DETAILS")];
+        if let Some(serde_json::Value::Object(fields)) = &self.history_detail {
+            for (key, value) in fields {
+                let label = key.replace('_', " ");
+                let label = title_case(&label);
+                let value = match value {
+                    serde_json::Value::String(value) => value.clone(),
+                    _ => value.to_string(),
+                };
+                body.push(ui::info_row(self.theme, &label, value));
+            }
+        } else {
+            body.push(ui::empty(self.theme, "No history record selected."));
+        }
+        self.shell_actions(
             frame,
             area,
             "History detail",
-            "sanitized record",
-            value.lines().map(str::to_owned).map(Line::from).collect(),
+            "A sanitized record with execution context",
+            body,
+            0,
+            "Esc Back   ? Help",
         );
     }
 
     fn draw_why(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut body = Vec::new();
         if self.why_loading {
-            body.push(Line::from(Span::styled(
-                "checking provider explanation…",
-                self.theme.style(Token::Muted),
-            )));
+            body.push(ui::loading(self.theme, "Checking provider explanation…"));
         } else if let Some(report) = &self.why {
             body.extend([
-                Line::from(Span::styled(
-                    report.package.name.clone(),
-                    self.theme.style(Token::Primary),
-                )),
-                Line::from(""),
-                Line::from("Why is this installed?"),
+                ui::section_title(self.theme, "REQUIRED"),
                 Line::from(report.installed_as.clone()),
             ]);
             if !report.used_by.is_empty() {
-                body.extend([
-                    Line::from(""),
-                    Line::from(Span::styled("Used by", self.theme.style(Token::Section))),
-                ]);
+                body.extend([Line::from(""), ui::section_title(self.theme, "USED BY")]);
                 body.extend(report.used_by.iter().map(|consumer| {
-                    Line::from(format!("  {} · {}", consumer.name, consumer.relationship))
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {}", consumer.name),
+                            self.theme.style(Token::Foreground),
+                        ),
+                        Span::styled(
+                            format!(" · {}", consumer.relationship),
+                            self.theme.style(Token::Muted),
+                        ),
+                    ])
                 }));
             }
             body.extend([
                 Line::from(""),
-                Line::from(Span::styled("Removal context", self.theme.style(Token::Section))),
+                ui::section_title(self.theme, "REMOVAL CONTEXT"),
                 Line::from(report.removal_advice.clone()),
             ]);
+            if !report.evidence.is_empty() {
+                body.extend([Line::from(""), ui::section_title(self.theme, "EVIDENCE")]);
+                body.extend(report.evidence.iter().map(|evidence| {
+                    Line::from(Span::styled(
+                        format!("  · {evidence}"),
+                        self.theme.style(Token::Muted),
+                    ))
+                }));
+            }
+            for note in &report.notes {
+                body.push(ui::warning(self.theme, note));
+            }
         } else {
-            body.push(Line::from("No explanation is available."));
+            body.push(ui::empty(self.theme, "No explanation is available."));
         }
-        self.shell(frame, area, "Why", "evidence-aware explanation", body);
+        let title = self
+            .why
+            .as_ref()
+            .map(|report| format!("Why is {} installed?", report.package.name))
+            .unwrap_or_else(|| "Why is this installed?".into());
+        self.shell_actions(frame, area, "Why", &title, body, 0, "Esc Back   ? Help");
     }
 
     fn draw_help(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1351,49 +1548,55 @@ impl<'a> App<'a> {
     fn draw_confirm(&self, frame: &mut Frame<'_>, area: Rect) {
         let popup = centered(area, 68, 16);
         frame.render_widget(Clear, popup);
-        let mut lines = vec![Line::from(Span::styled(
-            "Review before changing package state",
-            self.theme.style(Token::Primary),
-        ))];
+        let title = self.plan.as_ref().map_or_else(
+            || " REVIEW PACKAGE CHANGE ".to_owned(),
+            |(_, plan)| format!(" {} {}? ", plan.action.label(), plan.target.name),
+        );
+        let mut lines = Vec::new();
         if self.loading_plan {
-            lines.push(Line::from("Building provider plan…"));
+            lines.push(ui::loading(self.theme, "Building provider plan…"));
         } else if let Some((_, plan)) = &self.plan {
             lines.extend([
-                Line::from(format!("{} {}", plan.action.label(), plan.target.name)),
-                Line::from(format!("Source       {}", plan.target.source)),
-                Line::from(format!("Scope        {}", plan.scope.label())),
-                Line::from(format!(
-                    "Plan         {} · {}",
-                    completeness_label(plan.completeness),
-                    confidence_label(plan.confidence)
-                )),
-                Line::from(format!(
-                    "Privilege    {}",
-                    if plan.privilege == orbis_core::transaction::PrivilegeRequirement::None {
-                        "none"
-                    } else {
-                        "administrator"
-                    }
-                )),
+                ui::info_row(self.theme, "Source", plan.target.source.to_string()),
+                ui::info_row(
+                    self.theme,
+                    "Version",
+                    plan.target.version.as_deref().unwrap_or("Not confirmed"),
+                ),
+                ui::info_row(self.theme, "Scope", plan.scope.label()),
+                ui::info_row(self.theme, "Risk", plan.risk.label()),
+                ui::info_row(self.theme, "Privilege", privilege_label(plan.privilege)),
+                ui::info_row(self.theme, "Confidence", confidence_label(plan.confidence)),
             ]);
-            lines.extend(plan.warnings.iter().map(|warning| {
-                Line::from(Span::styled(
-                    format!("! {}", warning.message),
-                    self.theme.style(Token::Caution),
-                ))
-            }));
+            if !plan.changes.is_empty() {
+                lines.extend([Line::from(""), ui::section_title(self.theme, "CHANGES")]);
+                lines.extend(plan.changes.iter().map(|change| {
+                    Line::from(Span::styled(
+                        format!(
+                            "  {}{}",
+                            self.theme.mark(Token::Primary),
+                            change.name.as_deref().unwrap_or(&change.package_id)
+                        ),
+                        self.theme.style(Token::Foreground),
+                    ))
+                }));
+            }
+            lines.extend(
+                plan.warnings.iter().map(|warning| ui::warning(self.theme, &warning.message)),
+            );
             lines.push(Line::from(""));
             lines.push(Line::from(if plan.executable() {
-                "Enter / Y Confirm     Esc Cancel"
+                "Enter Install     Esc Cancel"
             } else {
-                "Blocked plan          Esc Back"
+                "Blocked plan     Esc Back"
             }));
+        } else {
+            lines.push(ui::empty(self.theme, "No provider plan is available."));
         }
         frame.render_widget(
             Paragraph::new(Text::from(lines))
                 .block(
-                    Block::default()
-                        .borders(Borders::ALL)
+                    ui::detail_panel(self.theme, &title)
                         .border_style(self.theme.style(Token::Primary))
                         .style(self.theme.style(Token::Surface)),
                 )
@@ -1403,67 +1606,103 @@ impl<'a> App<'a> {
     }
 
     fn draw_maintenance(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 76, 18);
-        frame.render_widget(Clear, popup);
-        let mut lines =
-            vec![Line::from(Span::styled("Upgrade plan review", self.theme.style(Token::Primary)))];
+        let mut lines = Vec::new();
+        let item_label = match self.maintenance_action {
+            MaintenanceAction::Upgrade => "update",
+            MaintenanceAction::Cleanup => "cleanup item",
+            MaintenanceAction::Refresh => "refresh item",
+        };
         if let Some(plan) = &self.maintenance {
+            let total: usize = plan
+                .providers
+                .iter()
+                .map(|provider| provider.candidates.len().max(provider.cleanup_candidates.len()))
+                .sum();
             lines.push(Line::from(format!(
-                "{} provider plan{} · risk {}",
+                "{} {}{} across {} provider{}",
+                total,
+                item_label,
+                if total == 1 { "" } else { "s" },
                 plan.providers.len(),
-                if plan.providers.len() == 1 { "" } else { "s" },
-                plan.risk.label()
+                if plan.providers.len() == 1 { "" } else { "s" }
             )));
-            lines.extend(plan.providers.iter().map(|provider| {
-                Line::from(format!(
-                    "  {:<9} {} update{} · {}",
-                    provider.source.label(),
-                    provider.candidates.len(),
-                    if provider.candidates.len() == 1 { "" } else { "s" },
-                    if provider.executable() { "executable" } else { "not executable" }
-                ))
-            }));
-            lines.extend([Line::from(""), Line::from("This review is read-only. Esc closes it.")]);
+            for provider in &plan.providers {
+                let count = provider.candidates.len().max(provider.cleanup_candidates.len());
+                lines.extend([
+                    Line::from(""),
+                    ui::section_title(self.theme, provider.source.label()),
+                    ui::info_row(
+                        self.theme,
+                        "Items",
+                        format!("{count} item{}", if count == 1 { "" } else { "s" }),
+                    ),
+                    ui::info_row(
+                        self.theme,
+                        "Plan status",
+                        if provider.executable() { "Ready to review" } else { "Blocked" },
+                    ),
+                ]);
+                for warning in &provider.warnings {
+                    lines.push(ui::warning(self.theme, &warning.message));
+                }
+            }
+            lines.extend([
+                Line::from(""),
+                ui::section_title(self.theme, "RISK"),
+                ui::info_row(self.theme, "Level", plan.risk.label()),
+                ui::section_title(self.theme, "ACCESS"),
+                ui::info_row(
+                    self.theme,
+                    "Administrator",
+                    if plan.providers.iter().any(|provider| {
+                        provider.privilege != orbis_core::transaction::PrivilegeRequirement::None
+                    }) {
+                        "Required for some providers"
+                    } else {
+                        "Not required"
+                    },
+                ),
+                Line::from(""),
+                ui::empty(self.theme, "This review is read-only. No package state has changed."),
+            ]);
         } else {
-            lines.push(Line::from("Building coordinated plan…"));
+            lines.push(ui::loading(
+                self.theme,
+                &format!(
+                    "Building coordinated {} plan…",
+                    self.maintenance_action.label().to_ascii_lowercase()
+                ),
+            ));
         }
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(self.theme.style(Token::Primary))
-                        .style(self.theme.style(Token::Surface)),
-                )
-                .wrap(Wrap { trim: false }),
-            popup,
+        let title = format!("{} plan", self.maintenance_action.label());
+        self.shell_actions(
+            frame,
+            area,
+            &title,
+            "Review coordinated provider changes before execution",
+            lines,
+            0,
+            "Esc Back   ? Help",
         );
     }
 
     fn draw_progress(&self, frame: &mut Frame<'_>, area: Rect) {
-        let chunks = Layout::vertical([
-            Constraint::Length(4),
-            Constraint::Length(8),
-            Constraint::Min(6),
-            Constraint::Length(2),
-        ])
-        .split(area);
-
-        let header = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                self.theme.brand_compact(),
-                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("  {}", self.progress_title),
-                self.theme.style(Token::Foreground).add_modifier(Modifier::BOLD),
-            )),
-        ]));
-        frame.render_widget(header, chunks[0]);
+        let [header, body_area, footer] = ui::page_chunks(area);
+        ui::page_header(
+            frame,
+            header,
+            self.theme,
+            &self.progress_title,
+            if self.progress_context.is_empty() {
+                "Operation in progress"
+            } else {
+                &self.progress_context
+            },
+        );
+        let chunks = Layout::vertical([Constraint::Length(7), Constraint::Min(5)]).split(body_area);
 
         let stages = orbis_core::progress::ExecutionStage::transaction_stages();
-        let mut stage_lines =
-            vec![Line::from(Span::styled("STAGES", self.theme.style(Token::Section)))];
+        let mut stage_lines = vec![ui::section_title(self.theme, "PROGRESS")];
         let current = self.progress_stage;
         let mut found_current = false;
         for &stage in stages {
@@ -1485,30 +1724,19 @@ impl<'a> App<'a> {
                 StageState::Active => Token::Caution,
                 StageState::Pending => Token::Muted,
             };
-            let style = if is_current {
-                self.theme.style(Token::Foreground).add_modifier(Modifier::BOLD)
-            } else if is_past {
-                self.theme.style(Token::Foreground)
+            let label = if is_current && !stage.is_terminal() {
+                format!("{} …", stage.label())
             } else {
-                self.theme.style(Token::Muted)
+                stage.label().to_string()
             };
-
-            stage_lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} ", self.theme.stage_mark(state)),
-                    self.theme.style(token),
-                ),
-                Span::styled(
-                    if is_current && !stage.is_terminal() {
-                        format!("{} …", stage.label())
-                    } else {
-                        stage.label().to_string()
-                    },
-                    style,
-                ),
-            ]));
+            stage_lines.push(ui::progress_stage(
+                self.theme,
+                self.theme.stage_mark(state),
+                &label,
+                if is_current { Token::Foreground } else { token },
+            ));
         }
-        frame.render_widget(Paragraph::new(Text::from(stage_lines)), chunks[1]);
+        frame.render_widget(Paragraph::new(Text::from(stage_lines)), chunks[0]);
 
         let output_lines: Vec<Line<'static>> = self
             .progress_output
@@ -1516,7 +1744,7 @@ impl<'a> App<'a> {
             .map(|line| Line::from(Span::styled(line.clone(), self.theme.style(Token::Muted))))
             .collect();
 
-        let visible_height = chunks[2].height.saturating_sub(2) as usize;
+        let visible_height = chunks[1].height.saturating_sub(2) as usize;
         let total_lines = output_lines.len();
         let max_scroll = total_lines.saturating_sub(visible_height);
         let scroll_offset = if self.progress_scroll == 0 {
@@ -1532,123 +1760,116 @@ impl<'a> App<'a> {
 
         let output_paragraph =
             Paragraph::new(Text::from(output_lines)).block(output_block).scroll((scroll_offset, 0));
-        frame.render_widget(output_paragraph, chunks[2]);
+        frame.render_widget(output_paragraph, chunks[1]);
 
-        let footer = Line::from(Span::styled(
-            "  ↑/↓ or j/k scroll log output",
-            self.theme.style(Token::Muted),
-        ));
-        frame.render_widget(Paragraph::new(footer), chunks[3]);
-    }
-
-    fn draw_result(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered(area, 72, 18);
-        frame.render_widget(Clear, popup);
-
-        let mut lines = Vec::new();
-
-        if let Some(result) = &self.transaction_result {
-            let (status_text, token) = match result.status {
-                orbis_core::transaction::TransactionStatus::Succeeded => {
-                    ("Completed", Token::Positive)
-                }
-                orbis_core::transaction::TransactionStatus::PartiallyVerified => {
-                    ("Completed with limited verification", Token::Caution)
-                }
-                orbis_core::transaction::TransactionStatus::Failed => {
-                    ("Failed", Token::Destructive)
-                }
-            };
-
-            lines.push(Line::from(Span::styled(
-                format!("{} {}", result.plan.action.label(), result.plan.target.name),
-                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("  Status          ", self.theme.style(Token::Muted)),
-                Span::styled(status_text, self.theme.style(token).add_modifier(Modifier::BOLD)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  Source          ", self.theme.style(Token::Muted)),
-                Span::styled(result.plan.target.source.label(), self.theme.style(Token::Provider)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  Verification    ", self.theme.style(Token::Muted)),
-                Span::styled(
-                    match result.verification {
-                        orbis_core::transaction::VerificationResult::Verified => "verified",
-                        orbis_core::transaction::VerificationResult::PartiallyVerified => {
-                            "partially verified"
-                        }
-                        orbis_core::transaction::VerificationResult::Failed => "failed",
-                    },
-                    self.theme.style(Token::Foreground),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  Transaction ID  ", self.theme.style(Token::Muted)),
-                Span::styled(&result.plan.operation_id, self.theme.style(Token::Foreground)),
-            ]));
-            if let Some(msg) = &result.execution.message {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("  Detail          ", self.theme.style(Token::Muted)),
-                    Span::styled(msg.clone(), self.theme.style(Token::Caution)),
-                ]));
-            }
-        } else if let Some(error) = &self.error {
-            lines.push(Line::from(Span::styled(
-                "Operation Failed",
-                self.theme.style(Token::Destructive).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("  Error: ", self.theme.style(Token::Destructive)),
-                Span::styled(error.clone(), self.theme.style(Token::Foreground)),
-            ]));
-        } else if let Some(result) = &self.maintenance_result {
-            lines.push(Line::from(Span::styled(
-                format!("Maintenance {}", result.action.label()),
-                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("  Status          ", self.theme.style(Token::Muted)),
-                Span::styled(format!("{:?}", result.status), self.theme.style(Token::Positive)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  Operation ID    ", self.theme.style(Token::Muted)),
-                Span::styled(&result.operation_id, self.theme.style(Token::Foreground)),
-            ]));
-        }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Enter / Esc return to package",
-            self.theme.style(Token::Muted),
-        )));
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(self.theme.style(Token::Primary))
-                        .style(self.theme.style(Token::Surface)),
-                )
-                .wrap(Wrap { trim: false }),
-            popup,
+        ui::page_footer(
+            frame,
+            footer,
+            self.theme,
+            "↑↓ Scroll output   Esc unavailable while active   ? Help",
         );
     }
-}
 
-fn state_style(theme: Theme, state: &str) -> ratatui::style::Style {
-    theme.style(match state {
-        "ready" => Token::Positive,
-        "unavailable" => Token::Unavailable,
-        _ => Token::Caution,
-    })
+    fn draw_result(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (title, subtitle, lines) = if let Some(result) = &self.transaction_result {
+            let (title, token, subtitle) = match result.status {
+                orbis_core::transaction::TransactionStatus::Succeeded => (
+                    "Completed",
+                    Token::Positive,
+                    format!("{} installed successfully", result.plan.target.name),
+                ),
+                orbis_core::transaction::TransactionStatus::PartiallyVerified => (
+                    "Completed with limited verification",
+                    Token::Caution,
+                    format!(
+                        "{} changed, but some verification remains limited",
+                        result.plan.target.name
+                    ),
+                ),
+                orbis_core::transaction::TransactionStatus::Failed => (
+                    "Installation failed",
+                    Token::Destructive,
+                    format!("{} could not complete the operation", result.plan.target.source),
+                ),
+            };
+            let mut body =
+                vec![ui::result_summary(self.theme, self.theme.mark(token), &subtitle, token)];
+            if matches!(result.status, orbis_core::transaction::TransactionStatus::Failed) {
+                body.extend([
+                    Line::from(""),
+                    ui::section_title(self.theme, "WHAT HAPPENED"),
+                    ui::error(self.theme, result.execution.message.as_deref().unwrap_or("The provider did not complete the requested operation.")),
+                    Line::from(""),
+                    ui::section_title(self.theme, "NEXT STEP"),
+                    ui::empty(self.theme, "Review the provider output or try again after resolving the reported issue."),
+                ]);
+            }
+            body.extend([
+                Line::from(""),
+                ui::section_title(self.theme, "DETAILS"),
+                ui::info_row(self.theme, "Source", result.plan.target.source.to_string()),
+                ui::info_row(self.theme, "Verification", verification_label(result.verification)),
+                ui::info_row(self.theme, "Operation ID", result.plan.operation_id.clone()),
+            ]);
+            (title.to_owned(), subtitle, body)
+        } else if let Some(result) = &self.maintenance_result {
+            let (title, token) = match result.status {
+                orbis_core::maintenance::MaintenanceStatus::Succeeded => {
+                    ("Completed", Token::Positive)
+                }
+                orbis_core::maintenance::MaintenanceStatus::PartiallySucceeded => {
+                    ("Partially completed", Token::Caution)
+                }
+                orbis_core::maintenance::MaintenanceStatus::Failed => {
+                    ("Maintenance failed", Token::Destructive)
+                }
+                orbis_core::maintenance::MaintenanceStatus::Cancelled => {
+                    ("Maintenance cancelled", Token::Caution)
+                }
+                orbis_core::maintenance::MaintenanceStatus::Blocked => {
+                    ("Maintenance blocked", Token::Destructive)
+                }
+            };
+            let subtitle = format!("{} provider maintenance", result.action.label());
+            let body = vec![
+                ui::status_chip(
+                    self.theme,
+                    self.theme.mark(token),
+                    maintenance_status_label(&result.status),
+                    token,
+                ),
+                Line::from(""),
+                ui::section_title(self.theme, "DETAILS"),
+                ui::info_row(self.theme, "Operation ID", result.operation_id.clone()),
+            ];
+            (title.to_owned(), subtitle, body)
+        } else {
+            let error = self.error.as_deref().unwrap_or("No result is available.");
+            (
+                "Operation failed".to_owned(),
+                "Orbis could not complete the operation".to_owned(),
+                vec![
+                    ui::error(self.theme, error),
+                    Line::from(""),
+                    ui::section_title(self.theme, "NEXT STEP"),
+                    ui::empty(
+                        self.theme,
+                        "Review the details and try again when the provider is ready.",
+                    ),
+                ],
+            )
+        };
+
+        self.shell_actions(
+            frame,
+            area,
+            &title,
+            &subtitle,
+            lines,
+            0,
+            "Enter / Esc Return   H History   ? Help",
+        );
+    }
 }
 
 fn state_label(state: &str) -> String {
@@ -1658,6 +1879,37 @@ fn state_label(state: &str) -> String {
         "restricted" => "Restricted".into(),
         "checking" => "Checking".into(),
         other => other.to_owned(),
+    }
+}
+
+fn state_token(state: &str) -> Token {
+    match state {
+        "ready" => Token::Positive,
+        "unavailable" => Token::Unavailable,
+        _ => Token::Caution,
+    }
+}
+
+fn is_system_area(area: &str) -> bool {
+    matches!(area, "APT" | "Flatpak" | "Snap")
+}
+
+fn installed_label(installed: Option<bool>) -> &'static str {
+    match installed {
+        Some(true) => "Installed",
+        Some(false) => "Available",
+        None => "State unknown",
+    }
+}
+
+fn package_scope_label(source: PackageSource) -> &'static str {
+    match source {
+        PackageSource::Apt | PackageSource::Flatpak | PackageSource::Snap => "System",
+        PackageSource::Cargo
+        | PackageSource::Npm
+        | PackageSource::Pnpm
+        | PackageSource::Uv
+        | PackageSource::Pipx => "User",
     }
 }
 
@@ -1686,6 +1938,75 @@ fn update_breakdown(report: &UpdateInventoryReport) -> String {
     } else {
         details.join(" · ")
     }
+}
+
+fn update_group_lines(
+    theme: Theme,
+    report: &UpdateInventoryReport,
+    system: bool,
+) -> Vec<Line<'static>> {
+    let mut groups = BTreeMap::<PackageSource, Vec<&UpdateCandidate>>::new();
+    for candidate in &report.candidates {
+        let candidate_is_system = matches!(
+            candidate.source,
+            PackageSource::Apt | PackageSource::Flatpak | PackageSource::Snap
+        );
+        if candidate_is_system == system {
+            groups.entry(candidate.source).or_default().push(candidate);
+        }
+    }
+
+    let mut lines = Vec::new();
+    for (source, candidates) in groups {
+        lines.push(Line::from(vec![
+            Span::styled(source.label().to_owned(), theme.style(Token::Foreground)),
+            Span::styled(
+                format!(
+                    "{:>width$}",
+                    candidates.len(),
+                    width = 42usize.saturating_sub(source.label().len())
+                ),
+                theme.style(Token::Muted),
+            ),
+        ]));
+        for candidate in candidates {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<24}", truncate(&candidate.name, 24, theme.unicode)),
+                    theme.style(Token::Foreground),
+                ),
+                Span::styled(
+                    format!(
+                        "{} → {}",
+                        candidate.current_version.as_deref().unwrap_or("current"),
+                        candidate.available_version.as_deref().unwrap_or("latest")
+                    ),
+                    theme.style(Token::Muted),
+                ),
+            ]));
+        }
+    }
+
+    for inventory in &report.inventories {
+        let inventory_is_system = matches!(
+            inventory.source,
+            PackageSource::Apt | PackageSource::Flatpak | PackageSource::Snap
+        );
+        let incomplete = inventory
+            .metadata_state
+            .as_deref()
+            .is_some_and(|state| state.contains("incomplete") || state.contains("unknown"));
+        if inventory_is_system == system && (!inventory.available || incomplete) {
+            lines.push(ui::warning(
+                theme,
+                &format!("{}  Update status unavailable", inventory.source),
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(ui::empty(theme, "No updates in this group."));
+    }
+    lines
 }
 
 fn capability_summary(source: &SourceInfo) -> String {
@@ -1726,20 +2047,89 @@ fn layout_class(width: u16) -> LayoutClass {
     }
 }
 
-fn completeness_label(value: orbis_core::transaction::PlanCompleteness) -> &'static str {
-    match value {
-        orbis_core::transaction::PlanCompleteness::Complete => "complete",
-        orbis_core::transaction::PlanCompleteness::Partial => "partial",
-        orbis_core::transaction::PlanCompleteness::Unknown => "unknown",
-    }
-}
-
 fn confidence_label(value: orbis_core::transaction::PlanConfidence) -> &'static str {
     match value {
         orbis_core::transaction::PlanConfidence::High => "high",
         orbis_core::transaction::PlanConfidence::Medium => "medium",
         orbis_core::transaction::PlanConfidence::Low => "low",
     }
+}
+
+fn privilege_label(value: orbis_core::transaction::PrivilegeRequirement) -> &'static str {
+    match value {
+        orbis_core::transaction::PrivilegeRequirement::None => "Not required",
+        orbis_core::transaction::PrivilegeRequirement::Administrator => "Administrator",
+    }
+}
+
+fn verification_label(value: orbis_core::transaction::VerificationResult) -> &'static str {
+    match value {
+        orbis_core::transaction::VerificationResult::Verified => "Verified",
+        orbis_core::transaction::VerificationResult::PartiallyVerified => "Partially verified",
+        orbis_core::transaction::VerificationResult::Failed => "Failed",
+    }
+}
+
+fn history_token(status: &str) -> Token {
+    match status {
+        "succeeded" | "completed" => Token::Positive,
+        "failed" | "blocked" => Token::Destructive,
+        _ => Token::Caution,
+    }
+}
+
+fn status_label(status: &str) -> String {
+    match status {
+        "succeeded" => "Completed".into(),
+        "failed" => "Failed".into(),
+        "planned" => "Planned".into(),
+        "executing" => "In progress".into(),
+        "partially_verified" => "Limited verification".into(),
+        "partially_succeeded" => "Partially completed".into(),
+        "cancelled" => "Cancelled".into(),
+        "blocked" => "Blocked".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn maintenance_status_label(status: &orbis_core::maintenance::MaintenanceStatus) -> &'static str {
+    match status {
+        orbis_core::maintenance::MaintenanceStatus::Succeeded => "Completed",
+        orbis_core::maintenance::MaintenanceStatus::PartiallySucceeded => "Partially completed",
+        orbis_core::maintenance::MaintenanceStatus::Failed => "Failed",
+        orbis_core::maintenance::MaintenanceStatus::Cancelled => "Cancelled",
+        orbis_core::maintenance::MaintenanceStatus::Blocked => "Blocked",
+    }
+}
+
+fn history_day_label(timestamp_ms: u64) -> &'static str {
+    const DAY_MS: u64 = 86_400_000;
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64 / DAY_MS);
+    match today.saturating_sub(timestamp_ms / DAY_MS) {
+        0 => "TODAY",
+        1 => "YESTERDAY",
+        _ => "EARLIER",
+    }
+}
+
+fn history_time(timestamp_ms: u64) -> String {
+    let minutes = timestamp_ms / 60_000 % 1_440;
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn title_case(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(2));
@@ -1755,7 +2145,6 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orbis_core::maintenance::UpdateCandidate;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render_at(width: u16, height: u16) -> String {
@@ -1787,6 +2176,203 @@ mod tests {
             .buffer()
             .content
             .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn render_screen_lines(screen: Screen, width: u16, height: u16) -> Vec<String> {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(width as usize);
+        theme.unicode = true;
+        let mut app = App::new(registry, theme, tx, rx);
+        app.screen = screen;
+        app.animation = StartupAnimation::disabled();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw screen");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn sample_package() -> Package {
+        Package {
+            source: PackageSource::Apt,
+            provider_id: "btop".into(),
+            name: "btop".into(),
+            version: Some("1.4.5".into()),
+            summary: Some("Resource monitor for CPU, memory, disks and processes".into()),
+            description: None,
+            installed: Some(true),
+            kind: Some(orbis_core::models::PackageKind::CliTool),
+            origin: Some("Ubuntu repositories".into()),
+            architecture: None,
+            homepage: None,
+            license: None,
+            size_bytes: None,
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn sample_candidate(source: PackageSource, name: &str) -> UpdateCandidate {
+        UpdateCandidate {
+            source,
+            provider_id: name.into(),
+            name: name.into(),
+            current_version: Some("1.0".into()),
+            available_version: Some("1.1".into()),
+            architecture: None,
+            scope: None,
+            channel: None,
+            held: None,
+            security_relevance: None,
+            notes: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn configured_app() -> App<'static> {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(121);
+        theme.unicode = true;
+        let mut app = App::new(registry, theme, tx, rx);
+        let package = sample_package();
+        app.sources = Some(vec![
+            SourceInfo {
+                source: PackageSource::Apt,
+                available: true,
+                state: "ready".into(),
+                backend: Some("Nala".into()),
+                capabilities: orbis_core::models::ProviderCapabilities {
+                    search: true,
+                    info: true,
+                    installed_state: true,
+                    installed_list: true,
+                    mutations: true,
+                    install: true,
+                    remove: true,
+                    updates: true,
+                    upgrade: true,
+                    refresh: true,
+                    cleanup: true,
+                    why: true,
+                },
+                notes: Vec::new(),
+            },
+            SourceInfo {
+                source: PackageSource::Cargo,
+                available: true,
+                state: "ready".into(),
+                backend: Some("Cargo".into()),
+                capabilities: orbis_core::models::ProviderCapabilities {
+                    search: true,
+                    info: true,
+                    installed_state: true,
+                    installed_list: true,
+                    mutations: true,
+                    install: true,
+                    remove: true,
+                    updates: true,
+                    upgrade: true,
+                    refresh: true,
+                    cleanup: false,
+                    why: false,
+                },
+                notes: Vec::new(),
+            },
+        ]);
+        app.updates = Some(UpdateInventoryReport {
+            inventories: Vec::new(),
+            candidates: vec![sample_candidate(PackageSource::Apt, "curl")],
+            issues: Vec::new(),
+        });
+        app.search_query = "btop".into();
+        app.search_results = vec![package.clone()];
+        app.selected_package = Some(package.clone());
+        app.why = Some(WhyReport {
+            package: package.clone(),
+            installed_as: "Installed automatically as an APT dependency.".into(),
+            used_by: Vec::new(),
+            evidence: vec!["APT dependency metadata".into()],
+            removal_advice: "APT does not currently consider this package an autoremove candidate."
+                .into(),
+            orbis_history: Vec::new(),
+            notes: Vec::new(),
+        });
+        let mut plan = OperationPlan::new(
+            OperationAction::Install,
+            package,
+            orbis_core::transaction::InstallScope::System,
+        );
+        plan.completeness = orbis_core::transaction::PlanCompleteness::Complete;
+        plan.confidence = orbis_core::transaction::PlanConfidence::High;
+        plan.risk = orbis_core::transaction::RiskLevel::Normal;
+        plan.changes.push(orbis_core::transaction::PlannedChange {
+            kind: orbis_core::transaction::ChangeKind::Install,
+            package_id: "btop".into(),
+            name: Some("btop".into()),
+            version: Some("1.4.5".into()),
+            reason: None,
+        });
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
+            scope: Some(orbis_core::transaction::InstallScope::System),
+            channel: None,
+        };
+        app.plan = Some((request, plan));
+        app.maintenance = Some(MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            None,
+            vec![orbis_core::maintenance::ProviderMaintenancePlan::blocked(
+                PackageSource::Apt,
+                MaintenanceAction::Upgrade,
+                "Upgrade simulation is unavailable.",
+            )],
+        ));
+        app.progress_title = "Installing btop".into();
+        app.progress_context = "APT · System · Administrator access".into();
+        app.history.push(orbis_core::transaction::history::HistoryEntry {
+            kind: "transaction".into(),
+            operation_id: "tx-test-123".into(),
+            recorded_at_unix_ms: 1_700_000_000_000,
+            action: "Installed".into(),
+            source: Some(PackageSource::Apt),
+            package: Some("btop".into()),
+            scope: Some("system".into()),
+            status: "succeeded".into(),
+            verification: Some(orbis_core::transaction::VerificationResult::Verified),
+            risk: Some(orbis_core::transaction::RiskLevel::Normal),
+            message: None,
+        });
+        app.history_detail =
+            Some(serde_json::json!({"operation_id": "tx-test-123", "status": "succeeded"}));
+        app.doctor = Some(orbis_core::diagnostics::DoctorReport {
+            checks: vec![orbis_core::diagnostics::DiagnosticCheck::passed(
+                PackageSource::Apt,
+                "APT metadata responds",
+            )],
+            read_only: true,
+        });
+        app.doctor_loading = false;
+        app
+    }
+
+    fn render_configured_screen(screen: Screen) -> Vec<String> {
+        let mut app = configured_app();
+        app.screen = screen;
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw configured screen");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(121)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
     }
@@ -1874,6 +2460,95 @@ mod tests {
     }
 
     #[test]
+    fn every_major_tui_page_has_a_header_content_and_footer() {
+        let cases = [
+            (Screen::Dashboard, "SOFTWARE SOURCES", "/ Search"),
+            (Screen::Search, "SEARCH PACKAGES", "Navigate"),
+            (Screen::Package, "Package", "Esc Back"),
+            (Screen::Updates, "Updates", "Review plan"),
+            (Screen::MaintenanceReview, "plan", "Esc Back"),
+            (Screen::Confirm, "REVIEW PACKAGE CHANGE", "Esc Back"),
+            (Screen::Progress, "PROVIDER OUTPUT", "Scroll output"),
+            (Screen::Result, "Operation failed", "Return"),
+            (Screen::Sources, "Checking providers", "Refresh"),
+            (Screen::Doctor, "No diagnostic", "Recheck"),
+            (Screen::History, "History", "Details"),
+            (Screen::HistoryDetail, "OPERATION DETAILS", "Esc Back"),
+            (Screen::Why, "Why", "Esc Back"),
+            (Screen::Help, "Keyboard", "Q Quit"),
+        ];
+        for (width, height) in [(121, 24), (80, 24), (100, 30), (140, 40)] {
+            for (screen, section, footer) in cases {
+                let lines = render_screen_lines(screen, width, height);
+                assert_eq!(lines.len(), height as usize, "wrong height for {screen:?}");
+                assert!(
+                    lines.iter().any(|line| line.contains(section)),
+                    "missing {section:?} on {screen:?}\n{}",
+                    lines.join("\n")
+                );
+                assert!(
+                    lines.last().is_some_and(|line| line.contains(footer)),
+                    "missing footer on {screen:?}\n{}",
+                    lines.join("\n")
+                );
+                assert!(lines.iter().take(5).any(|line| line.contains("ORBIS")
+                    || line.contains('◈')
+                    || line.contains('█')));
+            }
+        }
+    }
+
+    #[test]
+    fn search_loading_and_empty_states_use_shared_language() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(registry, Theme::test(121), tx, rx);
+        app.screen = Screen::Search;
+        app.search_query = "btop".into();
+        app.search_loading = true;
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw loading search");
+        let loading: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(loading.contains("Checking providers"));
+        assert!(loading.contains("↑↓ Navigate"));
+
+        app.search_loading = false;
+        terminal.draw(|frame| app.draw(frame)).expect("draw empty search");
+        let empty: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(empty.contains("No matches"));
+        assert!(!empty.contains("candidate(s)"));
+    }
+
+    #[test]
+    fn configured_pages_render_primary_content_before_the_footer() {
+        let cases = [
+            (Screen::Search, "1 result"),
+            (Screen::Package, "WHAT IT DOES"),
+            (Screen::Updates, "1 update"),
+            (Screen::MaintenanceReview, "Upgrade plan"),
+            (Screen::Confirm, "CHANGES"),
+            (Screen::Progress, "APT · System"),
+            (Screen::Result, "No result"),
+            (Screen::Sources, "discover"),
+            (Screen::Doctor, "SYSTEM & DESKTOP"),
+            (Screen::History, "EARLIER"),
+            (Screen::HistoryDetail, "OPERATION DETAILS"),
+            (Screen::Why, "REQUIRED"),
+        ];
+        for (screen, expected) in cases {
+            let lines = render_configured_screen(screen);
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "missing {expected:?} on {screen:?}\n{}",
+                lines.join("\n")
+            );
+            assert!(lines.last().is_some_and(|line| !line.trim().is_empty()));
+        }
+    }
+
+    #[test]
     fn too_small_render_is_explanatory() {
         let content = render_at(48, 12);
         assert!(content.contains("needs a little more room"));
@@ -1896,7 +2571,7 @@ mod tests {
         let content: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
         assert!(content.contains("Installing btop"));
-        assert!(content.contains("STAGES"));
+        assert!(content.contains("PROGRESS"));
         assert!(content.contains("Executing"));
         assert!(content.contains("PROVIDER OUTPUT"));
         assert!(content.contains("Reading package lists..."));
@@ -1945,9 +2620,9 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).expect("draw result");
         let content: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content.contains("Install btop"));
+        assert!(content.contains("btop installed successfully"));
         assert!(content.contains("Completed"));
-        assert!(content.contains("verified"));
+        assert!(content.contains("Verified"));
         assert!(content.contains("tx-test-123"));
     }
 
