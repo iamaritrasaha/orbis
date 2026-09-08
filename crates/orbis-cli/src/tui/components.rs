@@ -143,7 +143,7 @@ pub(crate) fn provider_row(
 ) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{marker}  "), theme.style(token)),
-        Span::styled(format!("{provider:<10}"), theme.style(Token::Foreground)),
+        Span::styled(format!("{provider:<20}"), theme.style(Token::Foreground)),
         Span::styled(status.to_owned(), theme.style(token)),
     ])
 }

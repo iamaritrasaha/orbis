@@ -142,18 +142,10 @@ impl ProviderRegistry {
         if let Some(channel) = &request.channel {
             validate_channel(channel)?;
         }
-        if request.package.source.is_none()
-            && self.providers.iter().any(|provider| {
-                provider.source_info().available && provider.requires_source_qualification()
-            })
-        {
-            return Err(TransactionError::InvalidRequest(
-                "source qualification is required for mutation because one or more available developer providers cannot safely resolve unqualified package existence; use cargo:, npm:, pnpm:, uv:, or pipx:".into(),
-            ));
-        }
-
         let mut matches = Vec::new();
         let mut issues = Vec::new();
+        // An unqualified beginner request may resolve when exactly one safe
+        // source can identify it. Ambiguity remains a hard stop below.
         for provider in self.selected(request.package.source).into_iter().filter(|provider| {
             request.package.source.is_some() || provider.supports_unqualified_resolution()
         }) {

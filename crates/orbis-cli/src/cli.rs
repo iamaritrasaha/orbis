@@ -6,7 +6,8 @@ use orbis_core::{models::PackageSource, transaction::InstallScope};
     name = "orbis",
     version,
     about = "Your Linux software, in one place.",
-    long_about = "A calm, provider-neutral view of software available to your Linux system. Read-only discovery and carefully confirmed single-package operations."
+    long_about = "A calm, beginner-friendly way to find, understand, update, and safely manage software on Linux.",
+    help_template = "{name} {version}\n\n{about}\n\nCOMMON COMMANDS\n\n  find       Find software\n  show       Learn about software\n  install    Install software\n  remove     Remove software\n  update     Check for updates\n  refresh    Refresh software information\n  clean      Remove unused software safely\n  history    See previous Orbis actions\n  health     Check that everything is working\n\nEXAMPLES\n\n  orbis find firefox\n  orbis show btop\n  orbis install btop\n  orbis update\n  orbis health\n\nADVANCED\n\n  upgrade    Apply a reviewed update plan\n  sources    Inspect software sources\n  why        Inspect installation reasoning\n  --json     Use the stable machine-readable interface\n\nUse 'orbis <command> --help' for command details.\n"
 )]
 pub(crate) struct Cli {
     /// Emit structured JSON instead of terminal presentation.
@@ -27,39 +28,47 @@ pub(crate) enum Command {
     /// Launch the interactive Orbis dashboard.
     #[command(alias = "ui")]
     Dashboard,
-    /// Show detected providers and read-only capabilities.
+    /// Inspect software sources and their capabilities (advanced).
     Sources,
-    /// Search all available providers, or one selected source.
-    Search {
+    /// Find software across supported ecosystems.
+    #[command(aliases = ["search"])]
+    Find {
         /// Human package name, keyword, or application ID.
         query: String,
-        /// Restrict the search to one provider.
+        /// Restrict the search to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },
-    /// Show normalized metadata for one package.
+    /// Show the beginner-friendly Orbis Brief for one package.
+    Show {
+        /// A package name, application ID, or source-qualified reference.
+        package: String,
+        /// Restrict resolution to one advanced source.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+    },
+    /// Show normalized metadata for one package (advanced compatibility command).
+    #[command(hide = true)]
     Info {
-        /// Package ID, friendly name, or source-qualified reference such as apt:curl.
         package: String,
-        /// Restrict resolution to one provider.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },
-    /// Explain what a package is in plain language.
+    /// Explain what a package is in plain language (advanced compatibility command).
+    #[command(hide = true)]
     Explain {
-        /// Package ID, friendly name, or source-qualified reference.
         package: String,
-        /// Restrict resolution to one provider.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },
-    /// Run safe provider and environment diagnostics.
-    Doctor,
+    /// Run safe diagnostics (advanced alias: doctor).
+    #[command(aliases = ["doctor"])]
+    Health,
     /// Plan and, after confirmation, install one exact package.
     Install {
-        /// Package ID, friendly name, or source-qualified reference.
+        /// Software name or source-qualified reference.
         package: String,
-        /// Restrict resolution to one provider.
+        /// Restrict resolution to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
         /// Flatpak scope; defaults to system for new installs.
@@ -77,9 +86,9 @@ pub(crate) enum Command {
     },
     /// Plan and, after confirmation, remove one exact package without purge/autoremove.
     Remove {
-        /// Package ID, friendly name, or source-qualified reference.
+        /// Software name or source-qualified reference.
         package: String,
-        /// Restrict resolution to one provider.
+        /// Restrict resolution to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
         /// Flatpak scope; required when installed in both scopes.
@@ -92,9 +101,22 @@ pub(crate) enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Refresh package catalogs without upgrading installed software.
+    /// Check for available software updates. Read-only by default.
+    #[command(aliases = ["updates"])]
     Update {
-        /// Restrict the refresh to one provider.
+        /// Restrict the check to one advanced source.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// Compatibility flag for the former metadata-refresh spelling.
+        #[arg(long, hide = true)]
+        plan: bool,
+        /// Compatibility flag for the former metadata-refresh spelling.
+        #[arg(long, hide = true)]
+        yes: bool,
+    },
+    /// Refresh software information without changing installed software.
+    Refresh {
+        /// Restrict the refresh to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
         /// Show the refresh plan without changing catalog metadata.
@@ -104,15 +126,9 @@ pub(crate) enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Show installed software with updates available. Read-only.
-    Updates {
-        /// Show status for only one provider.
-        #[arg(long, value_enum)]
-        source: Option<SourceArg>,
-    },
     /// Plan and, after confirmation, apply safe available updates.
     Upgrade {
-        /// Restrict the upgrade to one provider.
+        /// Restrict the upgrade to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
         /// Show the coordinated upgrade plan without changing package state.
@@ -124,7 +140,7 @@ pub(crate) enum Command {
     },
     /// Plan and, after confirmation, remove confidently unused package-manager artifacts.
     Clean {
-        /// Restrict cleanup to one provider.
+        /// Restrict cleanup to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
         /// Show cleanup candidates without changing package state.
@@ -141,15 +157,15 @@ pub(crate) enum Command {
         /// Maximum number of rows to display.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Restrict history rows to one provider.
+        /// Restrict history rows to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },
     /// Explain why one installed package or ref is present.
     Why {
-        /// Package ID or source-qualified reference.
+        /// Package name or source-qualified reference.
         package: String,
-        /// Restrict resolution to one provider.
+        /// Restrict resolution to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },

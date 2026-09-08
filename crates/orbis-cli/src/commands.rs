@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
 use orbis_core::{
     ProviderRegistry, ResolveReport,
@@ -46,7 +46,7 @@ pub(crate) fn dispatch(
                 Ok(())
             }
         }
-        Some(Command::Search { query, source }) => {
+        Some(Command::Find { query, source }) => {
             let report = registry.search(&query, source.map(Into::into));
             if cli.json {
                 print_json(&report)
@@ -55,18 +55,21 @@ pub(crate) fn dispatch(
                 Ok(())
             }
         }
+        Some(Command::Show { package, source }) => {
+            run_show(registry, renderer, cli.json, package, source.map(Into::into))
+        }
         Some(Command::Info { package, source }) => {
             run_info(registry, renderer, cli.json, package, source.map(Into::into))
         }
         Some(Command::Explain { package, source }) => {
             run_explain(registry, renderer, cli.json, package, source.map(Into::into))
         }
-        Some(Command::Doctor) => {
+        Some(Command::Health) => {
             let report = registry.diagnostics(None).with_environment();
             if cli.json {
                 print_json(&report)
             } else {
-                print!("{}", renderer.doctor(&report));
+                print!("{}", renderer.health(&report));
                 Ok(())
             }
         }
@@ -98,7 +101,7 @@ pub(crate) fn dispatch(
                 yes,
             },
         ),
-        Some(Command::Update { source, plan, yes }) => run_maintenance(
+        Some(Command::Update { source, plan, yes }) if plan || yes => run_maintenance(
             registry,
             renderer,
             cli.json,
@@ -109,7 +112,7 @@ pub(crate) fn dispatch(
                 yes,
             },
         ),
-        Some(Command::Updates { source }) => {
+        Some(Command::Update { source, .. }) => {
             let report = registry.updates(source.map(Into::into));
             if cli.json {
                 print_json(&report)
@@ -118,6 +121,17 @@ pub(crate) fn dispatch(
                 Ok(())
             }
         }
+        Some(Command::Refresh { source, plan, yes }) => run_maintenance(
+            registry,
+            renderer,
+            cli.json,
+            MaintenanceOptions {
+                action: MaintenanceAction::Refresh,
+                source: source.map(Into::into),
+                plan_only: plan,
+                yes,
+            },
+        ),
         Some(Command::Upgrade { source, plan, yes }) => run_maintenance(
             registry,
             renderer,
@@ -224,6 +238,49 @@ fn run_info(
     }
 }
 
+fn run_show(
+    registry: &ProviderRegistry,
+    renderer: &Renderer,
+    json: bool,
+    package: String,
+    source: Option<PackageSource>,
+) -> Result<(), String> {
+    let reference = parse_reference(&package, source)?;
+    match registry.resolve(&reference) {
+        ResolveReport::Found { package, issues } => {
+            let brief = orbis_core::explain::build_brief(*package.clone());
+            let why =
+                if package.installed == Some(true) { registry.why(&package).ok() } else { None };
+            if json {
+                print_json(&serde_json::json!({"brief": brief, "why": why, "issues": issues}))
+            } else {
+                print!("{}", renderer.show(&brief, why.as_ref(), &issues));
+                Ok(())
+            }
+        }
+        ResolveReport::Ambiguous { matches, issues } => {
+            if json {
+                print_json(&serde_json::json!({
+                    "status": "ambiguous",
+                    "matches": matches,
+                    "issues": issues
+                }))?;
+            } else {
+                print!("{}", renderer.ambiguous(&reference.query, &matches, &issues));
+            }
+            Err("software name matches more than one source".into())
+        }
+        ResolveReport::NotFound { issues } => {
+            if json {
+                print_json(&serde_json::json!({"status": "not_found", "issues": issues}))?;
+            } else {
+                print!("{}", renderer.not_found(&reference.query, &issues));
+            }
+            Err("software was not found".into())
+        }
+    }
+}
+
 fn run_explain(
     registry: &ProviderRegistry,
     renderer: &Renderer,
@@ -279,7 +336,16 @@ fn run_transaction(
     json: bool,
     options: TransactionOptions,
 ) -> Result<(), String> {
-    let package_ref = parse_reference(&options.package, options.source)?;
+    let package_ref = match resolve_mutation_reference(
+        registry,
+        renderer,
+        json,
+        &options.package,
+        options.source,
+    ) {
+        Ok(reference) => reference,
+        Err(error) => return report_error(json, error),
+    };
     let request = OperationRequest {
         action: options.action,
         package: PackageRefJson::from(&package_ref),
@@ -352,6 +418,49 @@ fn run_transaction(
         } else {
             print!("{}", renderer.transaction_result(&result));
             Ok(())
+        }
+    }
+}
+
+fn resolve_mutation_reference(
+    registry: &ProviderRegistry,
+    renderer: &Renderer,
+    json: bool,
+    input: &str,
+    source: Option<PackageSource>,
+) -> Result<PackageRef, String> {
+    let mut reference = parse_reference(input, source)?;
+    if reference.source.is_some() {
+        return Ok(reference);
+    }
+    match registry.resolve(&reference) {
+        ResolveReport::Found { package, .. } => {
+            reference.source = Some(package.source);
+            Ok(reference)
+        }
+        ResolveReport::Ambiguous { matches, issues } => {
+            if json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return Err(format!(
+                    "{input} is available from several sources; use --source or a qualified reference.\n{}",
+                    renderer.ambiguous(input, &matches, &issues)
+                ));
+            }
+            print!("{}", renderer.ambiguous(input, &matches, &issues));
+            io::stdout().flush().map_err(|error| error.to_string())?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+            let choice = answer
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "choose one of the numbered software sources".to_owned())?;
+            let selected = matches
+                .get(choice.saturating_sub(1))
+                .ok_or_else(|| "that source choice is not available".to_owned())?;
+            reference.source = Some(selected.source);
+            Ok(reference)
+        }
+        ResolveReport::NotFound { issues } => {
+            Err(format!("{input} was not found.\n{}", renderer.not_found(input, &issues)))
         }
     }
 }

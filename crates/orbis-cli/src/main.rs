@@ -40,6 +40,7 @@ fn run() -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::cli::Command;
+    use clap::CommandFactory;
 
     #[test]
     fn plain_mode_is_available_as_a_global_escape_hatch() {
@@ -51,5 +52,39 @@ mod tests {
     fn dashboard_has_a_short_ui_alias() {
         let cli = Cli::try_parse_from(["orbis", "ui"]).expect("valid args");
         assert!(matches!(cli.command, Some(Command::Dashboard)));
+    }
+
+    #[test]
+    fn beginner_vocabulary_and_compatibility_aliases_parse() {
+        let cases = [
+            ("find", "btop"),
+            ("search", "btop"),
+            ("show", "btop"),
+            ("info", "btop"),
+            ("explain", "btop"),
+            ("update", ""),
+            ("updates", ""),
+            ("refresh", ""),
+            ("health", ""),
+            ("doctor", ""),
+        ];
+        for (command, argument) in cases {
+            let args = if argument.is_empty() {
+                vec!["orbis", command]
+            } else {
+                vec!["orbis", command, argument]
+            };
+            assert!(Cli::try_parse_from(args).is_ok(), "command did not parse: {command}");
+        }
+        assert!(Cli::try_parse_from(["orbis", "update", "--plan"]).is_ok());
+    }
+
+    #[test]
+    fn root_help_leads_with_beginner_vocabulary() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.find("COMMON COMMANDS") < help.find("ADVANCED"));
+        assert!(help.contains("orbis find firefox"));
+        assert!(help.contains("orbis update"));
+        assert!(help.contains("refresh    Refresh software information"));
     }
 }

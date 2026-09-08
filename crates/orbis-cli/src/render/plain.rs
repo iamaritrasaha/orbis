@@ -21,27 +21,26 @@ impl Renderer {
 
     pub(crate) fn home(&self, sources: &[SourceInfo]) -> String {
         let mut output = String::new();
-        for line in self.theme.brand_full() {
-            output.push_str(&self.theme.paint(line, Token::Primary));
-            output.push('\n');
-        }
-        output
-            .push_str(&self.theme.paint(&format!("  {}\n", Theme::brand_tagline()), Token::Muted));
-        output.push('\n');
-        output.push_str("Sources\n");
-        for source in sources {
-            let token = state_token(&source.state);
-            output.push_str(&format!(
-                "  {} {:<9} {}\n",
-                self.theme.paint(self.theme.mark(token), token),
-                source.source.label(),
-                self.theme.paint(&source.state, token)
-            ));
-        }
+        output.push_str(&format!(
+            "{}\n{}\n\n",
+            self.theme.paint(self.theme.brand_compact(), Token::Primary),
+            self.theme.paint(Theme::brand_tagline(), Token::Muted)
+        ));
         output.push_str(
-            "\nTry\n  orbis search <package>\n  orbis updates\n  orbis upgrade --plan\n  \
-             orbis explain <package>\n  orbis doctor\n",
+            "COMMON COMMANDS\n\n  orbis find <name>\n  orbis show <name>\n  orbis install <name>\n  orbis remove <name>\n  orbis update\n  orbis refresh\n  orbis clean\n  orbis health\n",
         );
+        if !sources.is_empty() {
+            output.push_str("\nSTATUS\n");
+            for source in sources {
+                let token = state_token(&source.state);
+                output.push_str(&format!(
+                    "  {} {:<24} {}\n",
+                    self.theme.paint(self.theme.mark(token), token),
+                    friendly_source(source.source),
+                    self.theme.paint(&friendly_state(&source.state), token)
+                ));
+            }
+        }
         output
     }
 
@@ -83,26 +82,78 @@ impl Renderer {
     }
 
     pub(crate) fn search(&self, query: &str, report: &SearchReport) -> String {
-        let mut output = self.heading("Search", &format!("Results for {query}"));
+        let mut output = self.heading("Find", &format!("Software matching {query}"));
         if report.results.is_empty() {
-            output.push_str("\nNo matches returned by the available sources.\n");
+            output.push_str("\nNo software matched that search.\n");
         }
         for package in &report.results {
-            output.push_str(&format!(
-                "\n{}  {}\n",
-                self.theme.paint(&package.name, Token::Primary),
-                package.source
-            ));
+            output.push_str(&format!("\n{}\n", self.theme.paint(&package.name, Token::Primary),));
             if let Some(summary) = &package.summary {
                 output.push_str(&format!("  {}\n", summary));
             }
-            output.push_str(&format!("  {}", status(package.installed)));
+            output.push_str(&format!("  {}", installed_state(package.installed)));
             if let Some(version) = &package.version {
                 output.push_str(&format!(" · {version}"));
             }
-            output.push('\n');
+            output.push_str(&format!(" · {}\n", friendly_source(package.source)));
         }
         self.render_issues(output, &report.issues)
+    }
+
+    pub(crate) fn show(
+        &self,
+        brief: &orbis_core::explain::PackageBrief,
+        why: Option<&WhyReport>,
+        issues: &[orbis_core::models::ProviderIssue],
+    ) -> String {
+        let package = &brief.package;
+        let mut output = self.heading(&package.name, &brief.headline);
+        output.push_str("\nWHAT IS IT?\n");
+        if brief.paragraphs.is_empty() {
+            output.push_str("No plain-language description is available from the source.\n");
+        } else {
+            output.push_str(&format!("{}\n", wrap(&brief.paragraphs[0], self.theme.width)));
+        }
+        if !brief.examples.is_empty() {
+            output.push_str("\nWHY WOULD I USE IT?\n");
+            for example in &brief.examples {
+                output.push_str(&format!("  • {example}\n"));
+            }
+        }
+        output.push_str("\nON THIS COMPUTER\n");
+        self.field(&mut output, "Status", installed_state(package.installed));
+        self.field(&mut output, "From", friendly_source(package.source));
+        if let Some(version) = &package.version {
+            self.field(&mut output, "Version", version);
+        }
+        if let Some(why) = why {
+            output.push_str("\nWHY IS IT INSTALLED?\n");
+            output.push_str(&format!("{}\n", why.installed_as));
+            if !why.orbis_history.is_empty() {
+                output.push_str("  Orbis has a matching installation record.\n");
+            }
+        }
+        if let Some(caution) = &brief.caution {
+            output.push_str(&format!("\nNOTE\n{}\n", wrap(caution, self.theme.width)));
+        }
+        output.push_str("\nDETAILS\n");
+        self.field(&mut output, "Confidence", &brief.confidence);
+        self.field(
+            &mut output,
+            "Evidence",
+            &brief
+                .evidence
+                .iter()
+                .map(|evidence| match evidence.kind {
+                    orbis_core::explain::EvidenceKind::ProviderMetadata => "source metadata",
+                    orbis_core::explain::EvidenceKind::OrbisInterpretation => {
+                        "Orbis interpretation"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        self.render_issues(output, issues)
     }
 
     pub(crate) fn info(
@@ -173,47 +224,39 @@ impl Renderer {
     }
 
     pub(crate) fn transaction_plan(&self, plan: &OperationPlan) -> String {
-        let mut output = self.heading(
-            "Transaction plan",
-            &format!("{} {} through {}", plan.action.label(), plan.target.name, plan.target.source),
-        );
-        self.field(&mut output, "Target", &plan.target.provider_id);
-        self.field(&mut output, "Source", &plan.target.source.to_string());
-        self.field(&mut output, "Scope", plan.scope.label());
-        self.field(&mut output, "Installed", installed_label(plan.target.installed));
-        self.field(
-            &mut output,
-            "Plan",
-            &format!(
-                "{} / {}",
-                completeness_label(plan.completeness),
-                confidence_label(plan.confidence)
-            ),
-        );
-        self.field(&mut output, "Privilege", privilege_label(plan.privilege));
-        self.field(&mut output, "Risk", plan.risk.label());
+        let verb = plan.action.label();
+        let mut output = self
+            .heading(&format!("{verb} {}?", plan.target.name), "Review before anything changes.");
+        output.push_str("THIS WILL\n");
         if !plan.changes.is_empty() {
-            output.push_str("\nChanges\n");
             for change in &plan.changes {
                 output.push_str(&format!(
-                    "  {} {}{}\n",
-                    change_kind_label(change.kind),
+                    "  • {}{}\n",
                     change.name.as_deref().unwrap_or(&change.package_id),
                     change.version.as_deref().map(|v| format!(" · {v}")).unwrap_or_default()
                 ));
             }
+        } else {
+            output.push_str("  • Change the selected software\n");
         }
-        if !plan.warnings.is_empty() {
-            output.push_str("\nNotes\n");
-            for warning in &plan.warnings {
-                output.push_str(&format!(
-                    "  {} {}\n",
-                    warning_marker(warning.level),
-                    warning.message
-                ));
-            }
+        output.push_str("\nFROM\n");
+        self.field(&mut output, "Source", friendly_source(plan.target.source));
+        self.field(
+            &mut output,
+            "Version",
+            plan.target.version.as_deref().unwrap_or("Not confirmed"),
+        );
+        self.field(&mut output, "Permission", privilege_label(plan.privilege));
+        if let Some(bytes) = plan.disk_delta_bytes {
+            self.field(&mut output, "Disk change", &format_size_delta(bytes));
         }
-        output.push_str("\nNo package state has been changed by planning.\n");
+        output.push_str("\nDETAILS\n");
+        self.field(&mut output, "Risk", plan.risk.label());
+        self.field(&mut output, "Confidence", confidence_label(plan.confidence));
+        for warning in &plan.warnings {
+            output.push_str(&format!("  {} {}\n", warning_marker(warning.level), warning.message));
+        }
+        output.push_str("\nNo package state has been changed by this review.\n");
         output
     }
 
@@ -238,9 +281,10 @@ impl Renderer {
     }
 
     pub(crate) fn updates(&self, report: &UpdateInventoryReport) -> String {
-        let mut output = self.heading("Updates", "Confirmed updates from available sources.");
+        let mut output =
+            self.heading("Software updates", "A read-only check; nothing changes yet.");
         if report.candidates.is_empty() {
-            output.push_str("\nYou're up to date.\n\nNo confirmed updates were found across the available sources.\n");
+            output.push_str("\nNo software updates are available.\n");
         } else {
             output.push_str(&format!(
                 "\n{} update{} available\n",
@@ -253,7 +297,7 @@ impl Renderer {
                     candidate.name,
                     candidate.current_version.as_deref().unwrap_or("current"),
                     candidate.available_version.as_deref().unwrap_or("latest"),
-                    candidate.source
+                    friendly_source(candidate.source)
                 ));
             }
         }
@@ -265,26 +309,28 @@ impl Renderer {
             {
                 output.push_str(&format!(
                     "\n  {} update status is incomplete; unknown is not counted as zero.\n",
-                    inventory.source
+                    friendly_source(inventory.source)
                 ));
             }
         }
         for issue in &report.issues {
-            output.push_str(&format!("\n  {}: {}\n", issue.source, issue.message));
+            output.push_str(&format!("\n  {}: {}\n", friendly_source(issue.source), issue.message));
         }
         output.push_str("\n  Read-only status; package state and indexes were not changed.\n");
         output
     }
 
     pub(crate) fn maintenance_plan(&self, plan: &MaintenancePlan) -> String {
-        let mut output = self.heading(
-            &format!("{} plan", plan.action.label()),
-            "Changes are coordinated across sources for review.",
-        );
+        let title = match plan.action {
+            orbis_core::maintenance::MaintenanceAction::Refresh => "Refresh software information",
+            orbis_core::maintenance::MaintenanceAction::Upgrade => "Update plan",
+            orbis_core::maintenance::MaintenanceAction::Cleanup => "Cleanup plan",
+        };
+        let mut output = self.heading(title, "Review the read-only plan before applying changes.");
         let total: usize =
             plan.providers.iter().map(|p| p.candidates.len().max(p.cleanup_candidates.len())).sum();
         output.push_str(&format!(
-            "\n  {total} planned change{} across {} provider plan{}\n",
+            "\n  {total} planned change{} across {} software source{}\n",
             if total == 1 { "" } else { "s" },
             plan.providers.len(),
             if plan.providers.len() == 1 { "" } else { "s" }
@@ -292,7 +338,7 @@ impl Renderer {
         for provider in &plan.providers {
             output.push_str(&format!(
                 "\n{}  {}\n",
-                self.theme.paint(provider.source.label(), Token::Provider),
+                self.theme.paint(friendly_source(provider.source), Token::Provider),
                 provider.scope.map(|s| s.label()).unwrap_or("scope not reported")
             ));
             for candidate in &provider.candidates {
@@ -331,7 +377,7 @@ impl Renderer {
             MaintenanceStatus::Blocked => "Blocked",
         };
         let mut output =
-            self.heading(title, &format!("{} maintenance across providers", result.action.label()));
+            self.heading(title, &format!("{} across available sources", result.action.label()));
         for provider in &result.providers {
             let status = match provider.status {
                 MaintenanceProviderStatus::Succeeded => "succeeded",
@@ -341,8 +387,8 @@ impl Renderer {
                 MaintenanceProviderStatus::Blocked => "blocked",
             };
             output.push_str(&format!(
-                "  {:<10} {:<22} {} change{}\n",
-                provider.source.label(),
+                "  {:<24} {:<22} {} change{}\n",
+                friendly_source(provider.source),
                 status,
                 provider.candidate_count,
                 if provider.candidate_count == 1 { "" } else { "s" }
@@ -371,7 +417,7 @@ impl Renderer {
                 entry.operation_id,
                 entry.action,
                 entry.status,
-                entry.source.map(|s| s.label()).unwrap_or("Orbis"),
+                entry.source.map(friendly_source).unwrap_or("Orbis"),
                 entry.package.as_deref().map(|p| format!(" · {p}")).unwrap_or_default()
             ));
             if let Some(message) = &entry.message {
@@ -390,7 +436,7 @@ impl Renderer {
     pub(crate) fn why(&self, report: &WhyReport) -> String {
         let mut output = self.heading("Why", &report.package.name);
         output.push_str(&format!("\nREQUIRED\n{}\n", report.installed_as));
-        self.field(&mut output, "Source", &report.package.source.to_string());
+        self.field(&mut output, "From", friendly_source(report.package.source));
         if !report.used_by.is_empty() {
             output.push_str("\nUSED BY\n");
             for consumer in &report.used_by {
@@ -410,8 +456,14 @@ impl Renderer {
         output
     }
 
-    pub(crate) fn doctor(&self, report: &DoctorReport) -> String {
-        let mut output = self.heading("Doctor", "Provider health and safe remediation checks.");
+    pub(crate) fn health(&self, report: &DoctorReport) -> String {
+        let mut output =
+            self.heading("Health", "A safe check of the software tools Orbis can use.");
+        let failed = report.checks.iter().filter(|check| !check.passed).count();
+        output.push_str(&format!(
+            "{}\n\n",
+            if failed == 0 { "Everything looks good." } else { "Some things need attention." }
+        ));
         output.push_str("SYSTEM\n");
         for check in &report.checks {
             if check.area == "Environment" {
@@ -419,9 +471,9 @@ impl Renderer {
             }
             let token = if check.passed { Token::Positive } else { Token::Caution };
             output.push_str(&format!(
-                "\n  {} {:<12} {}\n  {}\n",
+                "\n  {} {:<24} {}\n  {}\n",
                 self.theme.paint(self.theme.mark(token), token),
-                check.area,
+                friendly_area(&check.area),
                 check.title,
                 wrap(&check.message, self.theme.width.saturating_sub(4))
             ));
@@ -449,16 +501,21 @@ impl Renderer {
         issues: &[orbis_core::models::ProviderIssue],
     ) -> String {
         let mut output =
-            self.heading("Choose a source", &format!("{query} matches more than one provider."));
-        output.push_str("\nUse an explicit reference:\n");
-        for package in matches {
+            self.heading("Choose a source", &format!("{query} is available in several places."));
+        output.push_str("\nOrbis will not choose for you. Pick one explicitly:\n");
+        for (index, package) in matches.iter().enumerate() {
             output.push_str(&format!(
-                "  {}:{} · {}\n",
-                package.source.to_string().to_ascii_lowercase(),
-                package.provider_id,
-                status(package.installed)
+                "  {}. {}{}\n",
+                index + 1,
+                friendly_source(package.source),
+                if package.source == PackageSource::Apt {
+                    "  (recommended for most Linux systems)"
+                } else {
+                    ""
+                }
             ));
         }
+        output.push_str("\nFor scripts, use --source or a qualified reference.\n");
         self.render_issues(output, issues)
     }
     pub(crate) fn not_found(
@@ -467,8 +524,8 @@ impl Renderer {
         issues: &[orbis_core::models::ProviderIssue],
     ) -> String {
         self.render_issues(
-            self.heading("No package found", query)
-                + "\nTry a broader search or qualify the source.\n",
+            self.heading("No software found", query)
+                + "\nTry a broader search or check the spelling.\n",
             issues,
         )
     }
@@ -490,7 +547,7 @@ impl Renderer {
         issues: &[orbis_core::models::ProviderIssue],
     ) -> String {
         for issue in issues {
-            output.push_str(&format!("\n  {}: {}\n", issue.source, issue.message));
+            output.push_str(&format!("\n  {}: {}\n", friendly_source(issue.source), issue.message));
         }
         output
     }
@@ -541,21 +598,59 @@ fn mutation_summary(source: &SourceInfo) -> String {
     }
     values.join(", ")
 }
-fn status(installed: Option<bool>) -> &'static str {
+fn installed_state(installed: Option<bool>) -> &'static str {
     match installed {
-        Some(true) => "installed",
-        Some(false) => "available",
-        None => "state unknown",
+        Some(true) => "Installed",
+        Some(false) => "Available",
+        None => "Availability unknown",
     }
 }
 
-fn completeness_label(value: orbis_core::transaction::PlanCompleteness) -> &'static str {
-    match value {
-        orbis_core::transaction::PlanCompleteness::Complete => "all changes described",
-        orbis_core::transaction::PlanCompleteness::Partial => {
-            "some changes confirmed during install"
-        }
-        orbis_core::transaction::PlanCompleteness::Unknown => "impact not yet known",
+fn friendly_source(source: PackageSource) -> &'static str {
+    match source {
+        PackageSource::Apt => "Ubuntu/Debian repositories",
+        PackageSource::Flatpak => "Flatpak apps",
+        PackageSource::Snap => "Snap Store",
+        PackageSource::Cargo => "Rust tools",
+        PackageSource::Npm | PackageSource::Pnpm => "Node.js tools",
+        PackageSource::Uv | PackageSource::Pipx => "Python tools",
+    }
+}
+
+fn friendly_state(state: &str) -> String {
+    match state {
+        "ready" => "Ready".into(),
+        "restricted" => "Needs attention".into(),
+        "unavailable" => "Not installed".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn friendly_area(area: &str) -> &'static str {
+    match area {
+        "APT" => friendly_source(PackageSource::Apt),
+        "Flatpak" => friendly_source(PackageSource::Flatpak),
+        "Snap" => friendly_source(PackageSource::Snap),
+        "Cargo" => friendly_source(PackageSource::Cargo),
+        "npm" => friendly_source(PackageSource::Npm),
+        "pnpm" => friendly_source(PackageSource::Pnpm),
+        "uv" => friendly_source(PackageSource::Uv),
+        "pipx" => friendly_source(PackageSource::Pipx),
+        _ => "Software tools",
+    }
+}
+
+fn format_size_delta(bytes: i64) -> String {
+    let sign = if bytes >= 0 { "+" } else { "-" };
+    let value = bytes.unsigned_abs();
+    if value < 1024 {
+        format!("{sign}{value} B")
+    } else if value < 1024 * 1024 {
+        format!("{sign}{:.1} KB", value as f64 / 1024.0)
+    } else if value < 1024 * 1024 * 1024 {
+        format!("{sign}{:.1} MB", value as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{sign}{:.1} GB", value as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
@@ -564,14 +659,6 @@ fn confidence_label(value: orbis_core::transaction::PlanConfidence) -> &'static 
         orbis_core::transaction::PlanConfidence::High => "high",
         orbis_core::transaction::PlanConfidence::Medium => "medium",
         orbis_core::transaction::PlanConfidence::Low => "low",
-    }
-}
-
-fn change_kind_label(value: orbis_core::transaction::ChangeKind) -> &'static str {
-    match value {
-        orbis_core::transaction::ChangeKind::Install => "install",
-        orbis_core::transaction::ChangeKind::Remove => "remove",
-        orbis_core::transaction::ChangeKind::Configure => "configure",
     }
 }
 
@@ -645,7 +732,7 @@ mod tests {
             results: vec![package(PackageSource::Cargo, "bat", Some(true))],
             issues: Vec::new(),
         };
-        assert!(renderer.search("bat", &report).contains("installed"));
+        assert!(renderer.search("bat", &report).contains("Installed"));
         assert!(
             renderer
                 .brief(&orbis_core::explain::build_brief(package(
@@ -660,7 +747,7 @@ mod tests {
             candidates: Vec::new(),
             issues: Vec::new(),
         };
-        assert!(renderer.updates(&updates).contains("You're up to date"));
+        assert!(renderer.updates(&updates).contains("No software updates are available"));
         assert!(renderer.history(&[], 20).contains("No Orbis operations recorded yet"));
     }
 
@@ -676,7 +763,7 @@ mod tests {
         assert!(renderer.transaction_plan(&plan).contains("No package state has been changed"));
         let maintenance =
             MaintenancePlan::new(MaintenanceAction::Cleanup, Some(PackageSource::Apt), Vec::new());
-        assert!(renderer.maintenance_plan(&maintenance).contains("Clean plan"));
+        assert!(renderer.maintenance_plan(&maintenance).contains("Cleanup plan"));
         let why = WhyReport {
             package: target,
             installed_as: "Required by other installed software.".into(),
@@ -702,7 +789,26 @@ mod tests {
             checks: vec![DiagnosticCheck::environment(true, "Terminal", "plain")],
             read_only: true,
         };
-        assert!(renderer.doctor(&doctor).contains("Doctor"));
+        assert!(renderer.health(&doctor).contains("Health"));
+    }
+
+    #[test]
+    fn ambiguous_source_chooser_explains_the_safe_choice() {
+        let renderer = renderer();
+        let output = renderer.ambiguous(
+            "btop",
+            &[
+                package(PackageSource::Apt, "btop", Some(false)),
+                package(PackageSource::Snap, "btop", Some(false)),
+                package(PackageSource::Cargo, "btop", Some(false)),
+            ],
+            &[],
+        );
+        assert!(output.contains("btop is available in several places"));
+        assert!(output.contains("Ubuntu/Debian repositories"));
+        assert!(output.contains("Snap Store"));
+        assert!(output.contains("Orbis will not choose for you"));
+        assert!(output.contains("--source"));
     }
 }
 fn installed_label(installed: Option<bool>) -> &'static str {
