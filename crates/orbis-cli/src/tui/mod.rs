@@ -1613,37 +1613,72 @@ impl<'a> App<'a> {
             MaintenanceAction::Refresh => "refresh item",
         };
         if let Some(plan) = &self.maintenance {
-            let total: usize = plan
-                .providers
-                .iter()
-                .map(|provider| provider.candidates.len().max(provider.cleanup_candidates.len()))
-                .sum();
+            let mut grouped = BTreeMap::<PackageSource, (usize, bool, Option<String>)>::new();
+            for provider in &plan.providers {
+                let count = provider.candidates.len().max(provider.cleanup_candidates.len());
+                if count == 0 && provider.executable() {
+                    continue;
+                }
+                let entry = grouped.entry(provider.source).or_insert((0, false, None));
+                entry.0 += count;
+                entry.1 |= provider.executable();
+                if entry.2.is_none() {
+                    entry.2 = provider.warnings.first().map(|warning| warning.message.clone());
+                }
+            }
+            let total: usize = grouped.values().map(|(count, _, _)| *count).sum();
+            let provider_count = grouped.values().filter(|(count, _, _)| *count > 0).count();
+            let requires_admin = plan.providers.iter().any(|provider| {
+                let count = provider.candidates.len().max(provider.cleanup_candidates.len());
+                (count > 0 || !provider.executable())
+                    && provider.privilege != orbis_core::transaction::PrivilegeRequirement::None
+            });
             lines.push(Line::from(format!(
                 "{} {}{} across {} provider{}",
                 total,
                 item_label,
                 if total == 1 { "" } else { "s" },
-                plan.providers.len(),
-                if plan.providers.len() == 1 { "" } else { "s" }
+                provider_count,
+                if provider_count == 1 { "" } else { "s" }
             )));
-            for provider in &plan.providers {
-                let count = provider.candidates.len().max(provider.cleanup_candidates.len());
+            for (source, (count, executable, warning)) in
+                grouped.iter().filter(|(_, (count, _, _))| *count > 0)
+            {
                 lines.extend([
                     Line::from(""),
-                    ui::section_title(self.theme, provider.source.label()),
+                    ui::section_title(self.theme, source.label()),
                     ui::info_row(
                         self.theme,
                         "Items",
-                        format!("{count} item{}", if count == 1 { "" } else { "s" }),
+                        format!("{count} item{}", if *count == 1 { "" } else { "s" }),
                     ),
                     ui::info_row(
                         self.theme,
                         "Plan status",
-                        if provider.executable() { "Ready to review" } else { "Blocked" },
+                        if *executable { "Ready to review" } else { "Blocked" },
                     ),
                 ]);
-                for warning in &provider.warnings {
-                    lines.push(ui::warning(self.theme, &warning.message));
+                if let Some(warning) = warning {
+                    lines.push(ui::warning(self.theme, warning));
+                }
+            }
+            let blocked = grouped.values().filter(|(count, _, _)| *count == 0).count();
+            if blocked > 0 {
+                lines.push(Line::from(""));
+                lines.push(ui::section_title(self.theme, "NOT AVAILABLE"));
+                let detail_width = ui::inset(area).width.saturating_sub(2) as usize;
+                for (source, (_, _, warning)) in
+                    grouped.iter().filter(|(_, (count, _, _))| *count == 0)
+                {
+                    let detail = warning.as_deref().unwrap_or("No executable plan is available.");
+                    lines.push(ui::warning(
+                        self.theme,
+                        &truncate(
+                            &format!("{} · {detail}", source.label()),
+                            detail_width,
+                            self.theme.unicode,
+                        ),
+                    ));
                 }
             }
             lines.extend([
@@ -1654,13 +1689,7 @@ impl<'a> App<'a> {
                 ui::info_row(
                     self.theme,
                     "Administrator",
-                    if plan.providers.iter().any(|provider| {
-                        provider.privilege != orbis_core::transaction::PrivilegeRequirement::None
-                    }) {
-                        "Required for some providers"
-                    } else {
-                        "Not required"
-                    },
+                    if requires_admin { "Required for some providers" } else { "Not required" },
                 ),
                 Line::from(""),
                 ui::empty(self.theme, "This review is read-only. No package state has changed."),
