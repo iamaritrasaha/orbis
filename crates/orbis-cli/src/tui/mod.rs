@@ -34,6 +34,7 @@ use crate::{
     cli::Command,
     commands,
     render::theme::{StageState, Theme, Token},
+    self_update::{self, CheckReport, SelfUpdateReport, SelfUpdateStage, SelfUpdateState},
 };
 
 mod components;
@@ -59,6 +60,7 @@ enum Screen {
     MaintenanceReview,
     Progress,
     Result,
+    SelfUpdate,
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +81,10 @@ enum WorkerMessage {
     TransactionComplete(Box<Result<orbis_core::transaction::TransactionResult, String>>),
     #[allow(dead_code)]
     MaintenanceComplete(Box<Result<orbis_core::maintenance::MaintenanceResult, String>>),
+    UpdateNotice(String),
+    SelfUpdateChecked(Box<Result<CheckReport, SelfUpdateReport>>),
+    SelfUpdateProgress(SelfUpdateStage),
+    SelfUpdateComplete(SelfUpdateReport),
 }
 
 pub(crate) fn should_launch(command: Option<&Command>, json: bool, plain: bool) -> bool {
@@ -97,6 +103,12 @@ pub(crate) fn run(registry: &ProviderRegistry, theme: Theme, json: bool) -> Resu
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(registry, theme, tx, rx);
     app.refresh();
+    let update_tx = app.tx.clone();
+    std::thread::spawn(move || {
+        if let Some(notice) = self_update::background_notice() {
+            let _ = update_tx.send(WorkerMessage::UpdateNotice(notice));
+        }
+    });
     match ratatui::run(|terminal| app.event_loop(terminal)) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -107,6 +119,23 @@ pub(crate) fn run(registry: &ProviderRegistry, theme: Theme, json: bool) -> Resu
             eprintln!("orbis: dashboard unavailable ({error}); showing plain status");
             Ok(())
         }
+    }
+}
+
+/// Runs the Orbis self-update flow in the same calm full-screen presentation
+/// used by package operations. The updater has its own stages and never enters
+/// the package-provider transaction boundary.
+pub(crate) fn run_self_update(theme: Theme, check_only: bool, yes: bool) -> Result<(), String> {
+    if !terminal_capable() {
+        return Err("self-update presentation requires an interactive terminal".into());
+    }
+    let registry = ProviderRegistry::system();
+    let (tx, rx) = mpsc::channel();
+    let mut app = App::new(&registry, theme, tx, rx);
+    app.request_self_update(check_only, yes);
+    match ratatui::run(|terminal| app.event_loop(terminal)) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("self-update presentation unavailable: {error}")),
     }
 }
 
@@ -361,6 +390,14 @@ struct App<'a> {
     progress_maintenance: bool,
     transaction_result: Option<orbis_core::transaction::TransactionResult>,
     maintenance_result: Option<orbis_core::maintenance::MaintenanceResult>,
+    update_notice: Option<String>,
+    self_update_check: Option<CheckReport>,
+    self_update_report: Option<SelfUpdateReport>,
+    self_update_check_running: bool,
+    self_update_running: bool,
+    self_update_check_only: bool,
+    self_update_auto_apply: bool,
+    self_update_stage: SelfUpdateStage,
 }
 
 impl<'a> App<'a> {
@@ -418,6 +455,14 @@ impl<'a> App<'a> {
             progress_maintenance: false,
             transaction_result: None,
             maintenance_result: None,
+            update_notice: None,
+            self_update_check: None,
+            self_update_report: None,
+            self_update_check_running: false,
+            self_update_running: false,
+            self_update_check_only: false,
+            self_update_auto_apply: false,
+            self_update_stage: SelfUpdateStage::Checking,
         }
     }
 
@@ -435,7 +480,12 @@ impl<'a> App<'a> {
             if self.animation.is_active() {
                 dirty = true;
             }
-            if self.motion_enabled && (self.update_check_running || self.maintenance_executing) {
+            if self.motion_enabled
+                && (self.update_check_running
+                    || self.maintenance_executing
+                    || self.self_update_check_running
+                    || self.self_update_running)
+            {
                 self.spinner_index = self.spinner_index.wrapping_add(1);
                 dirty = true;
             }
@@ -573,6 +623,33 @@ impl<'a> App<'a> {
                     self.screen = Screen::Result;
                 }
             },
+            WorkerMessage::UpdateNotice(notice) => self.update_notice = Some(notice),
+            WorkerMessage::SelfUpdateChecked(result) => match *result {
+                Ok(check) => {
+                    self.self_update_check_running = false;
+                    self.self_update_check = Some(check.clone());
+                    let report = self_update::report_for_check(&check);
+                    if check.current_is_development
+                        || check.latest.is_none()
+                        || self.self_update_check_only
+                    {
+                        self.self_update_report = Some(report);
+                    } else if self.self_update_auto_apply {
+                        self.start_self_update_install();
+                    }
+                }
+                Err(report) => {
+                    self.self_update_check_running = false;
+                    self.self_update_report = Some(report);
+                }
+            },
+            WorkerMessage::SelfUpdateProgress(stage) => {
+                self.self_update_stage = stage;
+            }
+            WorkerMessage::SelfUpdateComplete(report) => {
+                self.self_update_running = false;
+                self.self_update_report = Some(report);
+            }
         }
     }
 
@@ -665,6 +742,34 @@ impl<'a> App<'a> {
             }
             Screen::Progress => self.handle_progress(key),
             Screen::Result => self.handle_result(key),
+            Screen::SelfUpdate => self.handle_self_update(key),
+        }
+    }
+
+    fn handle_self_update(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('q') {
+            self.quit = true;
+            return;
+        }
+        if key.code == KeyCode::Char('?') {
+            self.open(Screen::Help);
+            return;
+        }
+        if key.code == KeyCode::Esc && !self.self_update_check_running && !self.self_update_running
+        {
+            self.screen = Screen::Dashboard;
+            return;
+        }
+        if key.code == KeyCode::Enter
+            && !self.self_update_check_running
+            && !self.self_update_running
+            && self.self_update_check.as_ref().is_some_and(|check| check.latest.is_some())
+            && self
+                .self_update_report
+                .as_ref()
+                .is_some_and(|report| report.state == SelfUpdateState::UpdateAvailable)
+        {
+            self.start_self_update_install();
         }
     }
 
@@ -712,6 +817,9 @@ impl<'a> App<'a> {
             KeyCode::Char('a' | 'A') => self.open(Screen::Advanced),
             KeyCode::Char('t' | 'T') => self.open(Screen::History),
             KeyCode::Char('c' | 'C') => self.request_maintenance(MaintenanceAction::Cleanup),
+            KeyCode::Char('v' | 'V') if self.update_notice.is_some() => {
+                self.request_self_update(false, false)
+            }
             _ => {}
         }
     }
@@ -864,6 +972,48 @@ impl<'a> App<'a> {
             let _ = tx.send(WorkerMessage::Maintenance(result));
         });
         self.open(Screen::MaintenanceReview);
+    }
+
+    fn request_self_update(&mut self, check_only: bool, yes: bool) {
+        self.animation.finish();
+        self.previous = self.screen;
+        self.screen = Screen::SelfUpdate;
+        self.error = None;
+        self.self_update_check = None;
+        self.self_update_report = None;
+        self.self_update_check_running = true;
+        self.self_update_running = false;
+        self.self_update_check_only = check_only;
+        self.self_update_auto_apply = yes;
+        self.self_update_stage = SelfUpdateStage::Checking;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                self_update::check_current(check_only).map_err(self_update::error_report_for_cli);
+            let _ = tx.send(WorkerMessage::SelfUpdateChecked(Box::new(result)));
+        });
+    }
+
+    fn start_self_update_install(&mut self) {
+        let Some(check) = self.self_update_check.clone() else { return };
+        if check.latest.is_none() {
+            return;
+        }
+        self.self_update_running = true;
+        self.self_update_report = None;
+        self.self_update_stage = SelfUpdateStage::Downloading;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            struct TuiObserver(Sender<WorkerMessage>);
+            impl self_update::UpdateObserver for TuiObserver {
+                fn stage(&self, stage: SelfUpdateStage) {
+                    let _ = self.0.send(WorkerMessage::SelfUpdateProgress(stage));
+                }
+            }
+            let observer = TuiObserver(tx.clone());
+            let report = self_update::install_current(&check, &observer);
+            let _ = tx.send(WorkerMessage::SelfUpdateComplete(report));
+        });
     }
 
     fn start_maintenance(&mut self) {
@@ -1026,6 +1176,7 @@ impl<'a> App<'a> {
             }
             Screen::Progress => self.draw_progress(frame, area),
             Screen::Result => self.draw_result(frame, area),
+            Screen::SelfUpdate => self.draw_self_update(frame, area),
         }
     }
 
@@ -1117,6 +1268,15 @@ impl<'a> App<'a> {
                     "Updates are checked without changing software",
                     self.theme.style(Token::Muted),
                 )),
+                self.update_notice.as_ref().map_or_else(
+                    || Line::from(""),
+                    |notice| {
+                        Line::from(Span::styled(
+                            format!("{notice} · V Review update"),
+                            self.theme.style(Token::Primary),
+                        ))
+                    },
+                ),
                 Line::from(""),
                 Line::from(Span::styled(
                     "A Advanced  ·  T History",
@@ -2369,6 +2529,170 @@ impl<'a> App<'a> {
             "Enter / Esc Return   H History   ? Help",
         );
     }
+
+    fn draw_self_update(&self, frame: &mut Frame<'_>, area: Rect) {
+        let subtitle = if self.self_update_check_running {
+            "Checking the official Orbis release channel…"
+        } else if self.self_update_running {
+            "Updating only the executable you are running"
+        } else {
+            "A verified update keeps your existing installation intact until replacement"
+        };
+        let mut body = Vec::new();
+        if self.self_update_check_running || self.self_update_running {
+            body.extend(self.self_update_stage_lines());
+            body.push(Line::from(""));
+            body.push(ui::loading(
+                self.theme,
+                match self.self_update_stage {
+                    SelfUpdateStage::Checking => "Checking official releases…",
+                    SelfUpdateStage::Downloading => "Downloading the selected release…",
+                    SelfUpdateStage::Verifying => "Verifying the checksum and archive…",
+                    SelfUpdateStage::Installing => "Installing the verified executable…",
+                    SelfUpdateStage::Finishing => "Finishing up…",
+                    SelfUpdateStage::Done => "Update complete.",
+                    SelfUpdateStage::Failed => "The update was not installed.",
+                },
+            ));
+        } else if let Some(report) = &self.self_update_report {
+            let token = match report.state {
+                SelfUpdateState::UpToDate | SelfUpdateState::Updated => Token::Positive,
+                SelfUpdateState::DevelopmentBuild
+                | SelfUpdateState::UpdateAvailable
+                | SelfUpdateState::UnsupportedInstallation => Token::Caution,
+                SelfUpdateState::VerificationFailed | SelfUpdateState::NetworkError => {
+                    Token::Destructive
+                }
+            };
+            let status_message = match report.state {
+                SelfUpdateState::UpToDate => "Orbis is up to date.",
+                SelfUpdateState::UpdateAvailable => "A new Orbis release is ready to review.",
+                SelfUpdateState::Updated => "Orbis update complete.",
+                SelfUpdateState::DevelopmentBuild => "Development build · self-update is disabled",
+                SelfUpdateState::UnsupportedInstallation
+                | SelfUpdateState::VerificationFailed
+                | SelfUpdateState::NetworkError => &report.message,
+            };
+            body.push(ui::status_chip(self.theme, self.theme.mark(token), status_message, token));
+            body.push(Line::from(""));
+            if report.state == SelfUpdateState::DevelopmentBuild {
+                body.push(ui::section_title(self.theme, "DEVELOPMENT INSTALL"));
+                body.push(ui::empty(
+                    self.theme,
+                    "Pull the latest source, then run cargo install --path crates/orbis-cli --locked --force.",
+                ));
+                if let Some(version) = &report.available_version {
+                    body.push(ui::info_row(self.theme, "Latest public", version));
+                }
+            } else if report.state == SelfUpdateState::Updated {
+                body.push(ui::section_title(self.theme, "UPDATE COMPLETE"));
+                body.push(ui::info_row(self.theme, "Previous", &report.current_version));
+                body.push(ui::info_row(
+                    self.theme,
+                    "Installed",
+                    report.installed_version.as_deref().unwrap_or("Verified release"),
+                ));
+                body.push(Line::from(""));
+                body.push(ui::empty(self.theme, "Restart Orbis to begin using the new version."));
+            } else if let Some(version) = &report.available_version {
+                body.push(ui::section_title(self.theme, "RELEASE"));
+                body.push(ui::info_row(self.theme, "Current", &report.current_version));
+                body.push(ui::info_row(self.theme, "Available", version));
+            }
+        } else if let Some(check) = &self.self_update_check {
+            if let Some(release) = &check.latest {
+                body.extend([
+                    ui::status_chip(
+                        self.theme,
+                        self.theme.mark(Token::Primary),
+                        "A new Orbis release is ready to review.",
+                        Token::Primary,
+                    ),
+                    Line::from(""),
+                    ui::section_title(self.theme, "UPDATE"),
+                    ui::info_row(self.theme, "Current", check.current_version.to_string()),
+                    ui::info_row(self.theme, "Available", release.version.to_string()),
+                    ui::info_row(self.theme, "Source", "Official Orbis GitHub release"),
+                    Line::from(""),
+                    ui::empty(
+                        self.theme,
+                        "Only this user-owned Orbis executable will be replaced. Package software is not changed.",
+                    ),
+                ]);
+            } else {
+                body.push(ui::empty(self.theme, "Orbis is up to date."));
+            }
+        } else {
+            body.push(ui::loading(self.theme, "Preparing the update check…"));
+        }
+        self.shell_actions(
+            frame,
+            area,
+            "Update Orbis",
+            subtitle,
+            body,
+            0,
+            if self.self_update_check_running || self.self_update_running {
+                "Checking…   Esc unavailable   ? Help"
+            } else if self
+                .self_update_report
+                .as_ref()
+                .is_some_and(|report| report.state == SelfUpdateState::UpdateAvailable)
+            {
+                "Enter Update now   Esc Back   ? Help"
+            } else {
+                "Esc Back   ? Help"
+            },
+        );
+    }
+
+    fn self_update_stage_lines(&self) -> Vec<Line<'static>> {
+        let stages = [
+            (SelfUpdateStage::Checking, "Checking"),
+            (SelfUpdateStage::Downloading, "Downloading"),
+            (SelfUpdateStage::Verifying, "Verifying"),
+            (SelfUpdateStage::Installing, "Installing"),
+            (SelfUpdateStage::Finishing, "Finishing up"),
+        ];
+        let mut found_current = false;
+        let mut lines = vec![ui::section_title(self.theme, "UPDATE PROGRESS")];
+        for (stage, label) in stages {
+            let is_current = stage == self.self_update_stage;
+            if is_current {
+                found_current = true;
+            }
+            let state = if is_current {
+                if matches!(self.self_update_stage, SelfUpdateStage::Done) {
+                    StageState::Done
+                } else {
+                    StageState::Active
+                }
+            } else if !found_current {
+                StageState::Done
+            } else {
+                StageState::Pending
+            };
+            lines.push(ui::progress_stage(
+                self.theme,
+                if is_current && state == StageState::Active {
+                    self.spinner_mark()
+                } else {
+                    self.theme.stage_mark(state)
+                },
+                label,
+                if is_current { Token::Foreground } else { self.theme_token(state) },
+            ));
+        }
+        lines
+    }
+
+    fn theme_token(&self, state: StageState) -> Token {
+        match state {
+            StageState::Done => Token::Positive,
+            StageState::Active => Token::Caution,
+            StageState::Pending => Token::Muted,
+        }
+    }
 }
 
 fn state_label(state: &str) -> String {
@@ -3001,6 +3325,27 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_update_notice_is_subtle_and_does_not_displace_footer() {
+        for width in [121, 80] {
+            let registry = Box::leak(Box::new(ProviderRegistry::system()));
+            let (tx, rx) = mpsc::channel();
+            let mut app = App::new(registry, Theme::test(width as usize), tx, rx);
+            app.update_notice = Some("Orbis 0.1.0-beta.2 is available".into());
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+            terminal.draw(|frame| app.draw(frame)).expect("draw dashboard notice");
+            let lines: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            assert!(lines.iter().any(|line| line.contains("V Review update")));
+            assert!(lines.last().is_some_and(|line| line.contains("/ Find")));
+        }
+    }
+
+    #[test]
     fn compact_80x24_uses_the_small_brand_and_keeps_footer_visible() {
         let lines = render_lines(80, 24, false);
         assert!(lines[0].contains("@ ORBIS"));
@@ -3008,6 +3353,57 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("Find software")));
         assert!(lines[23].contains("/ Find"));
         assert_eq!(lines.len(), 24);
+    }
+
+    #[test]
+    fn self_update_view_keeps_release_state_and_footer_at_target_sizes() {
+        for (width, height) in [(121, 24), (80, 24), (100, 30), (140, 40)] {
+            let registry = Box::leak(Box::new(ProviderRegistry::system()));
+            let (tx, rx) = mpsc::channel();
+            let mut theme = Theme::test(width as usize);
+            theme.unicode = true;
+            let mut app = App::new(registry, theme, tx, rx);
+            app.screen = Screen::SelfUpdate;
+            app.self_update_report = Some(SelfUpdateReport {
+                state: SelfUpdateState::DevelopmentBuild,
+                current_version: "0.1.0-beta.1.dev.2".into(),
+                available_version: Some("0.1.0-beta.1".into()),
+                installed_version: None,
+                message: "This is a development build. It will not replace itself.".into(),
+            });
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+            terminal.draw(|frame| app.draw(frame)).expect("draw self-update");
+            let lines: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            assert!(lines.iter().any(|line| line.contains("Development build")));
+            assert!(lines.iter().any(|line| line.contains("cargo install")));
+            assert!(lines.last().is_some_and(|line| line.contains("Esc Back")));
+        }
+    }
+
+    #[test]
+    fn self_update_progress_uses_real_stages_without_percentages() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(registry, Theme::test(121), tx, rx);
+        app.screen = Screen::SelfUpdate;
+        app.self_update_check_running = true;
+        app.self_update_stage = SelfUpdateStage::Verifying;
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw self-update progress");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("UPDATE PROGRESS"));
+        assert!(content.contains("Downloading"));
+        assert!(content.contains("Verifying"));
+        assert!(content.contains("Esc unavailable"));
+        assert!(!content.contains('%'));
     }
 
     #[test]
@@ -3057,6 +3453,7 @@ mod tests {
             (Screen::HistoryDetail, "OPERATION DETAILS", "Esc Back"),
             (Screen::Why, "Why", "Esc Back"),
             (Screen::Help, "Keyboard", "Q Quit"),
+            (Screen::SelfUpdate, "Update Orbis", "Esc Back"),
         ];
         for (width, height) in [(121, 24), (80, 24), (100, 30), (140, 40)] {
             for (screen, section, footer) in cases {

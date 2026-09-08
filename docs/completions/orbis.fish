@@ -1,4 +1,4 @@
-# fish completion for Orbis 0.1.0-beta.1.dev.1
+# fish completion for Orbis 0.1.0-beta.1.dev.2
 
 complete -c orbis -f
 complete -c orbis -n '__fish_use_subcommand' -a dashboard -d 'Launch the interactive dashboard'
@@ -20,7 +20,10 @@ complete -c orbis -n '__fish_use_subcommand' -a clean -d 'Plan conservative clea
 complete -c orbis -n '__fish_use_subcommand' -a history -d 'Read transaction history'
 complete -c orbis -n '__fish_use_subcommand' -a why -d 'Explain why a package is present'
 complete -c orbis -n '__fish_use_subcommand' -a health -d 'Check that everything is working'
+complete -c orbis -n '__fish_use_subcommand' -a self-update -d 'Update Orbis safely'
 complete -c orbis -n '__fish_seen_subcommand_from update' -l apply -d 'Review and apply updates'
+complete -c orbis -n '__fish_seen_subcommand_from self-update' -l check -d 'Check without replacing anything'
+complete -c orbis -n '__fish_seen_subcommand_from self-update' -l yes -d 'Skip the confirmation prompt'
 complete -c orbis -l json -d 'Emit structured JSON'
 complete -c orbis -l no-color -d 'Disable ANSI styling'
 complete -c orbis -l plain -d 'Force plain presentation'

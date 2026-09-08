@@ -35,6 +35,7 @@ COMMON COMMANDS
   clean      Remove unused software safely
   history    See previous Orbis actions
   health     Check that everything is working
+  self-update Update Orbis safely
 
 EXAMPLES
 
@@ -125,6 +126,28 @@ orbis upgrade --plan         # advanced compatibility spelling
 
 `orbis update --yes` applies the exact reviewed update operation without the second confirmation prompt. `--yes` never bypasses provider safeguards or administrator authorization.
 
+## Updating Orbis itself
+
+Orbis can check and update a user-local Orbis installation from the official GitHub Releases channel:
+
+```sh
+orbis self-update --check
+orbis self-update
+```
+
+The normal flow shows the current and available versions, asks before downloading, verifies the SHA-256 checksum and archive structure, and atomically replaces only the executable that is actually running. The existing binary remains untouched if any check fails. `--yes` skips only the Orbis confirmation after the exact release has been selected; it never bypasses checksum verification, archive safety, or provider authorization.
+
+Self-update does not use `sudo`, does not run a downloaded installer script, and cannot replace a system-owned installation or another `orbis` found on `PATH`. For those installations, use the original install method. The supported release channel is the current Beta channel, with Linux x86_64 and ARM64 archives.
+
+Development builds contain `.dev.` in their version and never replace themselves. They report the safe source workflow instead:
+
+```sh
+git pull --ff-only
+cargo install --path crates/orbis-cli --locked --force
+```
+
+The release check is bounded and quiet during normal dashboard startup. If a new public release is known, the dashboard shows a small review notice; it never updates Orbis in the background. No account, telemetry, or hosted service is required beyond the public GitHub release request.
+
 ## Safety
 
 Orbis separates discovery, planning, confirmation, execution, verification, and history:
@@ -190,8 +213,10 @@ Use `aarch64-unknown-linux-gnu` for ARM64.
 Requires stable Rust and the locked workspace dependencies:
 
 ```sh
-cargo install --offline --path crates/orbis-cli --locked
+cargo install --path crates/orbis-cli --locked
 ```
+
+Use `--offline` when all locked dependencies are already cached. A source build installs to Cargo's user bin directory; a release installer uses `~/.local/bin`. If more than one `orbis` is installed, run `command -v orbis` and `type -a orbis`, then invoke the path you intended. Orbis self-update only considers the executable returned by `current_exe`, not whichever copy happens to appear first on `PATH`.
 
 Or run a release build without installing:
 

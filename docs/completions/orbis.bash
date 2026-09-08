@@ -1,10 +1,10 @@
-# bash completion for Orbis 0.1.0-beta.1.dev.1
+# bash completion for Orbis 0.1.0-beta.1.dev.2
 
 _orbis() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="dashboard ui find show install remove update refresh clean history health sources search info explain doctor updates upgrade why help"
+    local commands="dashboard ui find show install remove update refresh clean history health self-update sources search info explain doctor updates upgrade why help"
     local global_options="--json --no-color --plain --help --version"
     if (( cword == 1 )); then
         COMPREPLY=( $(compgen -W "${commands} ${global_options}" -- "${cur}") )
@@ -23,6 +23,9 @@ _orbis() {
             ;;
         update)
             COMPREPLY=( $(compgen -W "--source --plan --apply --yes --json --no-color --plain --help" -- "${cur}") )
+            ;;
+        self-update)
+            COMPREPLY=( $(compgen -W "--check --yes --json --no-color --plain --help" -- "${cur}") )
             ;;
         refresh|upgrade|clean)
             COMPREPLY=( $(compgen -W "--source --plan --yes --json --no-color --plain --help" -- "${cur}") )

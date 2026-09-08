@@ -22,6 +22,7 @@ _orbis() {
         'history:Read transaction history'
         'why:Explain why a package is present'
         'health:Check that everything is working'
+        'self-update:Update Orbis safely'
     )
     _arguments \
         '1:command:->command' \
@@ -39,6 +40,15 @@ _orbis() {
                         '--plan[Show the reviewed update plan]' \
                         '--apply[Review and apply updates]' \
                         '--yes[Skip the second confirmation]' \
+                        '--json[Emit structured JSON]' \
+                        '--no-color[Disable ANSI styling]' \
+                        '--plain[Force plain presentation]' \
+                        '--help[Print help]'
+                    ;;
+                self-update)
+                    _arguments \
+                        '--check[Check without replacing anything]' \
+                        '--yes[Skip the confirmation prompt]' \
                         '--json[Emit structured JSON]' \
                         '--no-color[Disable ANSI styling]' \
                         '--plain[Force plain presentation]' \

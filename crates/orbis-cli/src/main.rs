@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod render;
+mod self_update;
 mod tui;
 
 use std::{
@@ -67,6 +68,7 @@ mod tests {
             ("refresh", ""),
             ("health", ""),
             ("doctor", ""),
+            ("self-update", ""),
         ];
         for (command, argument) in cases {
             let args = if argument.is_empty() {
@@ -81,6 +83,8 @@ mod tests {
         assert!(Cli::try_parse_from(["orbis", "update", "--yes"]).is_ok());
         assert!(Cli::try_parse_from(["orbis", "refresh", "--plan"]).is_ok());
         assert!(Cli::try_parse_from(["orbis", "update", "--plan", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["orbis", "self-update", "--check"]).is_ok());
+        assert!(Cli::try_parse_from(["orbis", "self-update", "--yes"]).is_ok());
     }
 
     #[test]

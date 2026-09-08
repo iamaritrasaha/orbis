@@ -35,6 +35,12 @@ Inspect the generated manifest before publishing. Confirm the tag is `v0.1.0-bet
 
 The global build needs the local artifacts from every configured target to populate the unified checksum. The release workflow supplies those artifacts from its native target jobs; a local x86_64-only build may therefore produce an empty or incomplete local `sha256.sum` while still validating installer generation.
 
+## Self-update compatibility
+
+The CLI resolves releases only from `https://github.com/iamaritrasaha/orbis` and selects the current channel with SemVer. Beta builds may move from `beta.1` to `beta.2`; a development suffix is never an eligible replacement and channels are not silently crossed. Each supported target must publish `orbis-<target>.tar.xz` and its `.sha256` asset (or the unified `sha256.sum`). The updater extracts only the expected regular binary after rejecting absolute paths, traversal, links, and special files.
+
+Self-update is intentionally limited to user-owned, writable installations and replaces the current executable through a same-directory temporary file plus atomic rename. A system installation continues to be updated by its original package or archive method. No Beta 2 release is implied by this development work.
+
 ## Publishing gate
 
 The generated workflow runs `dist plan` for pull requests and creates the GitHub Release only for a pushed version tag. The final release sequence is:

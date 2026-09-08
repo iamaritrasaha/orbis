@@ -17,6 +17,7 @@ use orbis_core::{
 use crate::{
     cli::{Cli, Command},
     render::Renderer,
+    self_update::{self, SelfUpdateReport, SilentUpdateObserver},
 };
 
 pub(crate) fn dispatch(
@@ -72,6 +73,9 @@ pub(crate) fn dispatch(
                 print!("{}", renderer.health(&report));
                 Ok(())
             }
+        }
+        Some(Command::SelfUpdate { check, yes }) => {
+            run_self_update(renderer, cli.json, cli.plain, check, yes)
         }
         Some(Command::Install { package, source, scope, channel, plan, yes }) => run_transaction(
             registry,
@@ -185,6 +189,75 @@ pub(crate) fn dispatch(
             }
         }
     }
+}
+
+fn run_self_update(
+    renderer: &Renderer,
+    json: bool,
+    plain: bool,
+    check_only: bool,
+    yes: bool,
+) -> Result<(), String> {
+    if !json && !plain && crate::tui::should_launch_operation() {
+        return crate::tui::run_self_update(renderer.theme, check_only, yes);
+    }
+
+    let current = self_update::current_version().map_err(|error| error.to_string())?;
+    if self_update::is_development_version(&current) && !check_only {
+        let report = self_update::report_for_check(&self_update::CheckReport {
+            current_version: current,
+            current_is_development: true,
+            latest: None,
+        });
+        return print_self_update_report(json, report);
+    }
+
+    let check = match self_update::check_current(check_only) {
+        Ok(check) => check,
+        Err(error) => {
+            return print_self_update_report(json, self_update::error_report_for_cli(error));
+        }
+    };
+    let mut report = self_update::report_for_check(&check);
+    if check_only || check.latest.is_none() {
+        return print_self_update_report(json, report);
+    }
+    if !yes {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            report.message = "An update is available. Review it in an interactive terminal or pass --yes after reviewing the release details.".into();
+            return print_self_update_report(json, report);
+        }
+        println!("Current version: {}", report.current_version);
+        if let Some(version) = &report.available_version {
+            println!("Available release: {version}");
+        }
+        println!("Destination: the user-owned Orbis executable currently running");
+        println!("The package software on this computer will not be changed.");
+        println!("{}", report.message);
+        eprint!("Update Orbis now? [Y/n] ");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+            report.message = "Update cancelled. Orbis was not changed.".into();
+            return print_self_update_report(json, report);
+        }
+    }
+    report = self_update::install_current(&check, &SilentUpdateObserver);
+    print_self_update_report(json, report)
+}
+
+fn print_self_update_report(json: bool, report: SelfUpdateReport) -> Result<(), String> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?);
+    } else {
+        println!("◈ ORBIS");
+        println!();
+        println!("{}", report.message);
+        if let Some(version) = report.available_version {
+            println!("Available release: {version}");
+        }
+    }
+    Ok(())
 }
 
 /// Executes a previously generated, already-confirmed plan with live progress observation.
