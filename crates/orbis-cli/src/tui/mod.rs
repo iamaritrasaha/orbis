@@ -325,6 +325,7 @@ struct App<'a> {
     updates: Option<UpdateInventoryReport>,
     update_check_running: bool,
     spinner_index: usize,
+    motion_enabled: bool,
     search_query: String,
     search_results: Vec<Package>,
     selected: usize,
@@ -380,6 +381,7 @@ impl<'a> App<'a> {
             updates: None,
             update_check_running: false,
             spinner_index: 0,
+            motion_enabled: std::env::var_os("REDUCE_MOTION").is_none(),
             search_query: String::new(),
             search_results: Vec::new(),
             selected: 0,
@@ -433,7 +435,7 @@ impl<'a> App<'a> {
             if self.animation.is_active() {
                 dirty = true;
             }
-            if self.update_check_running || self.maintenance_executing {
+            if self.motion_enabled && (self.update_check_running || self.maintenance_executing) {
                 self.spinner_index = self.spinner_index.wrapping_add(1);
                 dirty = true;
             }
@@ -2222,6 +2224,9 @@ impl<'a> App<'a> {
     }
 
     fn spinner_mark(&self) -> &'static str {
+        if !self.motion_enabled {
+            return self.theme.stage_mark(StageState::Active);
+        }
         if self.theme.unicode {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             FRAMES[self.spinner_index % FRAMES.len()]
@@ -3227,6 +3232,20 @@ mod tests {
         assert!(content.contains("1 update found so far"));
         assert!(content.contains("curl"));
         assert!(content.contains("Checking…"));
+    }
+
+    #[test]
+    fn reduced_motion_keeps_the_active_progress_marker_static() {
+        let mut app = configured_app();
+        app.screen = Screen::Progress;
+        app.progress_stage = orbis_core::progress::ExecutionStage::Executing;
+        app.motion_enabled = false;
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw reduced-motion progress");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("◐ Installing"));
+        assert!(!content.contains("⠋"));
     }
 
     #[test]
