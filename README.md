@@ -50,55 +50,63 @@ Run `orbis <command> --help` for details. The older names `search`, `info`, `exp
 
 ## Dashboard preview
 
-The dashboard is task-led rather than a list of package-manager diagnostics. At the primary 121×24 terminal size it keeps the main choices, recent activity, and navigation together:
+The home screen uses a selectable command list, aligned shortcuts, and a compact software-management pulse. Values below illustrate the layout; the running view uses discovered sources, update results, and recorded history.
 
 ```text
-                                  ◈ ORBIS
-                         Your Linux software, in one place.
+                            ◈ ORBIS
+                 Your Linux software, in one place.
 
-  What would you like to do?
+  ──────────────────────────────────────────────────────────────────
+   ▸ FIND SOFTWARE                                             [/]
+     Search applications, tools and packages
+     UPDATES                                                   [U]
+     4 updates available
+     CLEAN                                                     [C]
+     Review unused software safely
+     HEALTH                                                    [H]
+     Everything looks good
 
-  ╭────────────────────────────────────╮  ╭────────────────────────────────────╮
-  │ [F] Find software                   │  │ [U] Updates                         │
-  │     Search apps and tools           │  │     4 updates available             │
-  ╰────────────────────────────────────╯  ╰────────────────────────────────────╯
-  ╭────────────────────────────────────╮  ╭────────────────────────────────────╮
-  │ [C] Clean up                       │  │ [H] Health                          │
-  │     Review unused software safely   │  │     Everything looks good           │
-  ╰────────────────────────────────────╯  ╰────────────────────────────────────╯
+  ──────────────────────────────────────────────────────────────────
+  SYSTEM PULSE
+  sources 6/8 ready  /  4 updates available
+  RECENT  no Orbis changes recorded yet
 
-  RECENT ACTIVITY
-  No recent Orbis activity
-  Updates are checked without changing software
-
-────────────────────────────────────────────────────────────────────────────────
-  / Find   U Updates   C Clean   H Health   A Advanced   ? Help   Q Quit
+  ──────────────────────────────────────────────────────────────────
+  ↑↓ move  Enter open  / Find  U updates  A advanced  ? Help  Q Quit
 ```
 
-The five-line wordmark is reserved for the short startup reveal. Once the dashboard is ready, Orbis uses the compact `◈ ORBIS` identity so the interface has room for useful work. Narrow terminals stack the same tasks and preserve the footer.
+Use Up/Down or j/k and Enter, or the direct shortcuts. The five-line wordmark appears only during the short dashboard startup reveal; direct operations use a compact reveal of about 320 ms. Any key skips the reveal. At 80 columns the same command list and footer remain visible. Wide layouts limit the home content width instead of stretching empty cards.
 
 ## Live operations
 
-Refresh, update application, cleanup, install, and removal use a short, persistent operation view in an interactive TTY:
+Orbis restores the normal terminal before requesting administrator authentication, then returns to the live operation view. Run `orbis refresh` normally; no preparatory authorization command is needed. User-level plans do not request administrator access.
 
 ```text
 ◈ ORBIS  /  Refreshing software information
-2 sources · staged safely
+3 sources · staged safely
 
-PROGRESS                    SOURCES
-● Preparing                 ● Ubuntu repositories  Done
-◐ Getting permission       ◐ Flatpak apps          Working…
-○ Installing               ○ Snap Store            Waiting
-○ Checking installation
+SOFTWARE SOURCES
+●  Ubuntu repositories Done
+⠹  Flatpak apps        Working…
+○  Snap Store          Waiting
+
+STAGE
+● Preparing
+● Permission granted
+⠹ Refreshing software information …
+○ Checking software information
 ○ Finishing up
 
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ PROVIDER OUTPUT · DETAILS                                                     │
-│ Get:1 ...                                                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
+1 done   1 active   1 waiting   0 problems
+──────────────────────────────────────────────────────────────────
+D details   L details   ? Help
 ```
 
-The view reports real lifecycle and provider events, shows update results as each source finishes, keeps raw provider output in a bounded details area, and never invents a percentage. It uses a small spinner only while work is active; `REDUCE_MOTION`, `NO_COLOR`, `TERM=dumb`, `--plain`, non-TTY output, and keypresses provide quiet deterministic fallbacks.
+The summary receives real provider start, output, and completion events. Providers that need no refresh report `Not needed`; Snap refresh is managed automatically. Unsupported plans are marked `Skipped safely`. Stable APT `Hit:`, `Get:`, `Ign:`, and `Err:` lines provide a best-effort source URL and activity label. This parsing affects presentation only, and unknown lines remain available in Details.
+
+Press D or L for a separate scrolling log of the most recent 200 provider output lines, then press it again to return to the summary. The summary reserves no empty log rectangle. Exact percentages are never invented. Ctrl+C during a provider operation requests exit after the operation finishes safely. Cached administrator credentials are checked noninteractively during execution; expired credentials fail safely and require a retry.
+
+The active spinner advances at about 10 Hz. `REDUCE_MOTION` disables motion; `NO_COLOR` disables color and startup reveal. `TERM=dumb`, `--plain`, and non-TTY output use plain presentation. The idle interface stops animation redraws once background work and startup are finished.
 
 ## Finding and understanding software
 

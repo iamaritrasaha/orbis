@@ -2,6 +2,13 @@
 
 All notable changes to Orbis are documented here.
 
+## 0.1.0-beta.1.dev.3 (development)
+
+- Restore the terminal before administrator authentication and prevent interactive sudo from worker execution paths.
+- Replace the dashboard card grid with a selectable command list, real software pulse, and recent history; use terminal dossiers for review and help.
+- Separate live provider summaries from scrolling details, animate active providers, and interpret stable APT repository lines for presentation.
+- Preserve safe completion on Ctrl+C during provider work and keep upgrade revalidation intact.
+
 ## [0.1.0-beta.1] — 2026-09-08
 
 Orbis's first early public release.

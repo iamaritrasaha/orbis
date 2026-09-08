@@ -1,9 +1,6 @@
 //! Narrow privilege boundary for validated provider operations.
 
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -24,6 +21,9 @@ pub enum PrivilegeError {
     /// The user did not complete authorization.
     #[error("administrator authorization was not granted")]
     Authorization,
+    /// Cached credentials are absent or expired; execution must not prompt.
+    #[error("administrator credentials expired or are required; retry the operation")]
+    AuthorizationRequired,
     /// The typed provider command could not be completed.
     #[error("{0} command could not be completed: {1}")]
     Execution(PackageSource, String),
@@ -32,24 +32,16 @@ pub enum PrivilegeError {
 /// Production executor. It never accepts a caller-provided executable or shell string.
 pub struct RealOperationExecutor {
     runner: SharedRunner,
-    administrator_authorized: AtomicBool,
 }
 
 impl RealOperationExecutor {
     /// Creates an executor using the same injected process seam as the providers.
     pub fn new(runner: SharedRunner) -> Self {
-        Self { runner, administrator_authorized: AtomicBool::new(false) }
+        Self { runner }
     }
 
     /// Preflights administrator authorization once for a coordinated maintenance run.
     pub fn authorize_administrator(&self) -> Result<(), PrivilegeError> {
-        self.ensure_authorized()
-    }
-
-    fn ensure_authorized(&self) -> Result<(), PrivilegeError> {
-        if self.administrator_authorized.load(Ordering::Acquire) {
-            return Ok(());
-        }
         if !self.runner.is_available("sudo") {
             return Err(PrivilegeError::Unavailable);
         }
@@ -60,7 +52,21 @@ impl RealOperationExecutor {
         if !output.success() {
             return Err(PrivilegeError::Authorization);
         }
-        self.administrator_authorized.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Checks cached authorization without ever prompting.
+    pub fn verify_administrator(&self) -> Result<(), PrivilegeError> {
+        if !self.runner.is_available("sudo") {
+            return Err(PrivilegeError::Unavailable);
+        }
+        let output = self
+            .runner
+            .run(&CommandSpec::new("sudo", ["-n", "-v"]).with_timeout(Duration::from_secs(10)))
+            .map_err(|error| PrivilegeError::Execution(PackageSource::Apt, error.to_string()))?;
+        if !output.success() {
+            return Err(PrivilegeError::AuthorizationRequired);
+        }
         Ok(())
     }
 
@@ -76,7 +82,7 @@ impl RealOperationExecutor {
         observer: &dyn crate::progress::ProgressObserver,
     ) -> Result<CommandOutput, PrivilegeError> {
         if requirement == PrivilegeRequirement::Administrator {
-            self.ensure_authorized()?;
+            self.verify_administrator()?;
         }
         let command =
             provider_command(operation, requirement == PrivilegeRequirement::Administrator);
@@ -89,6 +95,9 @@ impl RealOperationExecutor {
                 ));
             })
             .map_err(|error| PrivilegeError::Execution(source, error.to_string()))?;
+        if requirement == PrivilegeRequirement::Administrator && !output.success() {
+            self.verify_administrator()?;
+        }
         Ok(output)
     }
 }
@@ -100,7 +109,7 @@ impl OperationExecutor for RealOperationExecutor {
         requirement: PrivilegeRequirement,
     ) -> Result<CommandOutput, PrivilegeError> {
         if requirement == PrivilegeRequirement::Administrator {
-            self.ensure_authorized()?;
+            self.verify_administrator()?;
         }
 
         let command =
@@ -110,6 +119,9 @@ impl OperationExecutor for RealOperationExecutor {
             .runner
             .run(&command)
             .map_err(|error| PrivilegeError::Execution(source, error.to_string()))?;
+        if requirement == PrivilegeRequirement::Administrator && !output.success() {
+            self.verify_administrator()?;
+        }
         Ok(output)
     }
 
@@ -483,5 +495,79 @@ mod tests {
         assert_eq!(command.program, "snap");
         assert_eq!(command.args, ["refresh", "--list"]);
         assert_eq!(command.timeout, None);
+    }
+    #[derive(Default)]
+    struct RecordingRunner {
+        commands: std::sync::Mutex<Vec<CommandSpec>>,
+        reject_auth: bool,
+    }
+    impl crate::process::CommandRunner for RecordingRunner {
+        fn is_available(&self, _: &str) -> bool {
+            true
+        }
+        fn run(
+            &self,
+            command: &CommandSpec,
+        ) -> Result<CommandOutput, crate::process::ProcessError> {
+            self.commands.lock().unwrap().push(command.clone());
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                status: Some(if self.reject_auth { 1 } else { 0 }),
+            })
+        }
+    }
+
+    #[test]
+    fn worker_execution_never_requests_interactive_credentials() {
+        for reject_auth in [true, false] {
+            let runner = std::sync::Arc::new(RecordingRunner { reject_auth, ..Default::default() });
+            let executor = RealOperationExecutor::new(runner.clone());
+            let operation = ProviderOperation::Maintenance {
+                operation: crate::transaction::MaintenanceOperation::AptRefresh,
+            };
+            let result = executor.execute_streaming(
+                &operation,
+                PrivilegeRequirement::Administrator,
+                &crate::progress::SilentObserver,
+            );
+            let commands = runner.commands.lock().unwrap();
+            assert!(
+                commands.iter().all(|command| command.args.first().is_some_and(|arg| arg == "-n"))
+            );
+            if reject_auth {
+                assert!(matches!(result, Err(PrivilegeError::AuthorizationRequired)));
+                assert_eq!(commands.len(), 1, "no provider mutation after expired auth");
+            } else {
+                assert_eq!(commands.len(), 2);
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_authorization_inherits_secure_terminal_and_user_operations_skip_it() {
+        let runner = std::sync::Arc::new(RecordingRunner::default());
+        let executor = RealOperationExecutor::new(runner.clone());
+        executor.authorize_administrator().unwrap();
+        let commands = runner.commands.lock().unwrap();
+        assert_eq!(commands[0].args, ["-v"]);
+        assert_eq!(commands[0].stdin, StdioMode::Inherit);
+        assert_eq!(commands[0].stdout, StdioMode::Inherit);
+        drop(commands);
+        let runner = std::sync::Arc::new(RecordingRunner::default());
+        let executor = RealOperationExecutor::new(runner.clone());
+        executor
+            .execute(
+                &ProviderOperation::Uv {
+                    action: OperationAction::Install,
+                    package_id: "ruff".into(),
+                },
+                PrivilegeRequirement::None,
+            )
+            .unwrap();
+        let commands = runner.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "uv");
     }
 }

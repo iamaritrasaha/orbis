@@ -10,7 +10,6 @@ pub(crate) enum Token {
     Destructive,
     Unavailable,
     Selected,
-    Surface,
     Divider,
     Section,
     Provider,
@@ -173,7 +172,7 @@ impl Theme {
 fn basic_code(token: Token) -> u16 {
     match token {
         Token::Primary | Token::Section => 36,
-        Token::Foreground | Token::Selected | Token::Surface => 37,
+        Token::Foreground | Token::Selected => 37,
         Token::Caution => 33,
         Token::Provider => 37,
         Token::Muted | Token::Divider | Token::Unavailable => 90,
@@ -185,7 +184,7 @@ fn basic_code(token: Token) -> u16 {
 fn basic_color(token: Token) -> Color {
     match token {
         Token::Primary | Token::Section => Color::Cyan,
-        Token::Foreground | Token::Selected | Token::Surface => Color::White,
+        Token::Foreground | Token::Selected => Color::White,
         Token::Caution => Color::Yellow,
         Token::Provider => Color::White,
         Token::Muted | Token::Divider | Token::Unavailable => Color::DarkGray,
@@ -197,7 +196,7 @@ fn basic_color(token: Token) -> Color {
 fn ansi256_code(token: Token) -> u8 {
     match token {
         Token::Primary | Token::Section => 81,
-        Token::Foreground | Token::Selected | Token::Surface => 255,
+        Token::Foreground | Token::Selected => 255,
         Token::Caution => 221,
         Token::Provider => 255,
         Token::Muted | Token::Divider | Token::Unavailable => 245,
@@ -209,7 +208,7 @@ fn ansi256_code(token: Token) -> u8 {
 fn rgb(token: Token) -> (u8, u8, u8) {
     match token {
         Token::Primary | Token::Section => (94, 201, 213),
-        Token::Foreground | Token::Selected | Token::Surface => (232, 238, 244),
+        Token::Foreground | Token::Selected => (232, 238, 244),
         Token::Muted | Token::Divider | Token::Unavailable => (122, 136, 151),
         Token::Positive => (109, 201, 151),
         Token::Caution => (236, 196, 118),

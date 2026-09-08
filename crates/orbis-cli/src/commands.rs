@@ -484,6 +484,9 @@ fn run_transaction(
         let history = orbis_core::transaction::history::HistoryStore::default_location()
             .map_err(|e| format!("could not start transaction: {e}"))?;
         let executor = RealOperationExecutor::new(registry.runner());
+        if plan.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator {
+            executor.authorize_administrator().map_err(|error| error.to_string())?;
+        }
         let result = if json {
             registry
                 .execute_transaction_with_history(&request, plan, &executor, &history)
@@ -727,14 +730,6 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
     }
 
     let executor = RealOperationExecutor::new(registry.runner());
-    if plan.providers.iter().any(|provider| {
-        provider.executable()
-            && provider.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator
-    }) {
-        executor.authorize_administrator().map_err(|e| {
-            format!("administrator authorization failed before provider mutations: {e}")
-        })?;
-    }
     let history = if plan.mutates {
         let history = orbis_core::transaction::history::HistoryStore::default_location()
             .map_err(|e| format!("could not open history: {e}"))?;

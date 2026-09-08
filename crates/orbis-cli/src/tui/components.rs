@@ -82,24 +82,16 @@ pub(crate) fn page(
     page_footer(frame, footer, theme, actions);
 }
 
-pub(crate) fn panel<'a>(theme: Theme, title: &'a str) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.style(Token::Divider))
-        .title(Span::styled(title.to_owned(), theme.style(Token::Section)))
-}
-
-pub(crate) fn detail_panel<'a>(theme: Theme, title: &'a str) -> Block<'a> {
-    panel(theme, title)
-}
-
 pub(crate) fn section_title(theme: Theme, title: &str) -> Line<'static> {
     Line::from(Span::styled(title.to_owned(), theme.style(Token::Section)))
 }
 
 #[allow(dead_code)]
 pub(crate) fn divider(theme: Theme, width: u16) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(width as usize), theme.style(Token::Divider)))
+    Line::from(Span::styled(
+        (if theme.unicode { "─" } else { "-" }).repeat(width as usize),
+        theme.style(Token::Divider),
+    ))
 }
 
 pub(crate) fn info_row(theme: Theme, label: &str, value: impl Into<String>) -> Line<'static> {
@@ -198,4 +190,25 @@ pub(crate) fn error(theme: Theme, message: &str) -> Line<'static> {
 
 pub(crate) fn action_hint(theme: Theme, actions: &str) -> Line<'static> {
     Line::from(Span::styled(actions.to_owned(), theme.style(Token::Muted)))
+}
+
+/// A native command rail: cursor, aligned name, shortcut and quiet description.
+pub(crate) fn command_row(
+    theme: Theme,
+    selected: bool,
+    title: &str,
+    detail: &str,
+    key: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let marker = if selected { if theme.unicode { "▸" } else { ">" } } else { " " };
+    let token = if selected { Token::Primary } else { Token::Foreground };
+    let gap = (width as usize).saturating_sub(title.len() + key.len() + 9);
+    vec![
+        Line::from(vec![
+            Span::styled(format!(" {marker} {}", title.to_uppercase()), theme.style(token)),
+            Span::styled(format!("{} [{key}]", " ".repeat(gap)), theme.style(Token::Muted)),
+        ]),
+        Line::from(Span::styled(format!("   {detail}"), theme.style(Token::Muted))),
+    ]
 }
