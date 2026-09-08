@@ -35,4 +35,4 @@ Describe:
 - the tests and local commands actually run; and
 - any provider limitation or unavailable backend observed.
 
-Keep the public identity focused on Orbis. Do not add hosted-service, model, or agent branding to user-facing output or documentation.
+Keep the public identity focused on Orbis. Do not add hosted-service or external-product branding to user-facing output or documentation.

@@ -77,6 +77,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             TransactionOptions {
                 action: OperationAction::Install,
                 package,
@@ -91,6 +92,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             TransactionOptions {
                 action: OperationAction::Remove,
                 package,
@@ -101,17 +103,25 @@ pub(crate) fn dispatch(
                 yes,
             },
         ),
-        Some(Command::Update { source, plan, yes }) if plan || yes => run_maintenance(
-            registry,
-            renderer,
-            cli.json,
-            MaintenanceOptions {
-                action: MaintenanceAction::Refresh,
-                source: source.map(Into::into),
-                plan_only: plan,
-                yes,
-            },
-        ),
+        Some(Command::Update { source, plan, apply, yes }) if plan || apply || yes => {
+            run_maintenance(
+                registry,
+                renderer,
+                cli.json,
+                cli.plain,
+                MaintenanceOptions {
+                    action: MaintenanceAction::Upgrade,
+                    source: source.map(Into::into),
+                    plan_only: plan,
+                    yes,
+                },
+            )
+        }
+        Some(Command::Update { source, .. })
+            if !cli.json && !cli.plain && crate::tui::should_launch_operation() =>
+        {
+            crate::tui::run_update(registry, renderer.theme, source.map(Into::into))
+        }
         Some(Command::Update { source, .. }) => {
             let report = registry.updates(source.map(Into::into));
             if cli.json {
@@ -125,6 +135,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Refresh,
                 source: source.map(Into::into),
@@ -136,6 +147,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Upgrade,
                 source: source.map(Into::into),
@@ -147,6 +159,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Cleanup,
                 source: source.map(Into::into),
@@ -334,6 +347,7 @@ fn run_transaction(
     registry: &ProviderRegistry,
     renderer: &Renderer,
     json: bool,
+    plain: bool,
     options: TransactionOptions,
 ) -> Result<(), String> {
     let package_ref = match resolve_mutation_reference(
@@ -370,14 +384,23 @@ fn run_transaction(
             &plan,
         )
     } else {
+        if !options.yes && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
+            return report_transaction_error(
+                json,
+                "confirmation is required: use an interactive terminal or pass --yes after reviewing the plan",
+                &plan,
+            );
+        }
+        if !plain && crate::tui::should_launch_operation() {
+            return crate::tui::run_transaction(
+                registry,
+                renderer.theme,
+                request,
+                plan,
+                options.yes,
+            );
+        }
         if !options.yes {
-            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-                return report_transaction_error(
-                    json,
-                    "confirmation is required: use an interactive terminal or pass --yes after reviewing the plan",
-                    &plan,
-                );
-            }
             print!("{}", renderer.transaction_plan(&plan));
             if !confirm(&plan)? {
                 return Err("operation cancelled; no package state was changed".into());
@@ -476,8 +499,18 @@ fn run_maintenance(
     registry: &ProviderRegistry,
     renderer: &Renderer,
     json: bool,
+    plain: bool,
     options: MaintenanceOptions,
 ) -> Result<(), String> {
+    if !json && !plain && !options.plan_only && crate::tui::should_launch_operation() {
+        return crate::tui::run_maintenance(
+            registry,
+            renderer.theme,
+            options.action,
+            options.source,
+            options.yes,
+        );
+    }
     let plan = registry.maintenance_plan(options.action, options.source)?;
     if options.plan_only {
         if json {
@@ -603,6 +636,87 @@ fn run_maintenance(
         print!("{}", renderer.maintenance_result(&result));
         Ok(())
     }
+}
+
+/// Executes a reviewed maintenance plan while forwarding the same typed core
+/// events used by the interactive progress view. This keeps the plan/history/
+/// privilege boundary identical for TUI and non-TUI execution.
+pub(crate) fn execute_confirmed_maintenance_with_observer(
+    registry: &ProviderRegistry,
+    plan: MaintenancePlan,
+    observer: &dyn orbis_core::progress::ProgressObserver,
+) -> Result<MaintenanceResult, String> {
+    if !plan.executable() {
+        return Err("no executable provider plan is available; nothing was changed".into());
+    }
+    if plan.action == MaintenanceAction::Upgrade {
+        registry.revalidate_upgrade_plan(&plan)?;
+    }
+
+    let executor = RealOperationExecutor::new(registry.runner());
+    if plan.providers.iter().any(|provider| {
+        provider.executable()
+            && provider.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator
+    }) {
+        executor.authorize_administrator().map_err(|e| {
+            format!("administrator authorization failed before provider mutations: {e}")
+        })?;
+    }
+    let history = if plan.mutates {
+        let history = orbis_core::transaction::history::HistoryStore::default_location()
+            .map_err(|e| format!("could not open history: {e}"))?;
+        history
+            .write_maintenance(
+                &orbis_core::transaction::history::MaintenanceRecord::execution_started(
+                    plan.clone(),
+                ),
+                &plan.operation_id,
+            )
+            .map_err(|e| format!("could not start maintenance record: {e}"))?;
+        Some(history)
+    } else {
+        None
+    };
+
+    let mut providers = Vec::new();
+    for provider_plan in &plan.providers {
+        if !provider_plan.executable() {
+            providers.push(skipped_provider(provider_plan));
+            continue;
+        }
+        match registry.execute_maintenance_with_progress(provider_plan, &executor, observer) {
+            Ok(result) => providers.extend(result.providers),
+            Err(error) => providers.push(MaintenanceProviderResult {
+                source: provider_plan.source,
+                action: provider_plan.action,
+                status: MaintenanceProviderStatus::Failed,
+                candidate_count: provider_plan
+                    .candidates
+                    .len()
+                    .max(provider_plan.cleanup_candidates.len()),
+                verification: None,
+                message: Some(error),
+            }),
+        }
+    }
+    let result = MaintenanceResult {
+        operation_id: plan.operation_id.clone(),
+        action: plan.action,
+        status: maintenance_status(&providers),
+        providers,
+    };
+    if let Some(history) = history {
+        history
+            .write_maintenance(
+                &orbis_core::transaction::history::MaintenanceRecord::completed(
+                    plan,
+                    result.clone(),
+                ),
+                &result.operation_id,
+            )
+            .map_err(|e| format!("could not record maintenance: {e}"))?;
+    }
+    Ok(result)
 }
 
 fn skipped_provider(

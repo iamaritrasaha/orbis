@@ -77,6 +77,10 @@ mod tests {
             assert!(Cli::try_parse_from(args).is_ok(), "command did not parse: {command}");
         }
         assert!(Cli::try_parse_from(["orbis", "update", "--plan"]).is_ok());
+        assert!(Cli::try_parse_from(["orbis", "update", "--apply"]).is_ok());
+        assert!(Cli::try_parse_from(["orbis", "update", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["orbis", "refresh", "--plan"]).is_ok());
+        assert!(Cli::try_parse_from(["orbis", "update", "--plan", "--yes"]).is_err());
     }
 
     #[test]

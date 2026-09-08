@@ -48,13 +48,13 @@ Provider-qualified references use the concise form `apt:curl`, `flatpak:org.exam
 
 ## Read-only provider decisions
 
-APT uses `apt-cache` for package search and records, with `--no-generate`, and `dpkg-query` for installed state. This is intentionally separate from interactive terminal output. Nala is detected and shown as an available APT frontend, but APT remains the normalized source identity.
+APT uses `apt-cache` for package search and records, with `--no-generate`, and `dpkg-query` for installed state. This is intentionally separate from interactive terminal output. Nala is detected and shown as an available APT frontend, but APT remains the normalized source identity. `orbis update` reads the current local index; `orbis refresh` is the explicit metadata-refresh action.
 
 Flatpak uses the documented `--columns` forms where possible. Search and installed listing are parsed as column records, preserving application IDs, friendly names, versions, branches, remotes, architecture, and descriptions.
 
 Snap uses its stable command-line surfaces: `snap find` for discovery, `snap list` for installed state, and `snap info` for detailed metadata. Its tabular search output is parsed by column position and its indented info record is parsed without treating the output as YAML.
 
-These choices follow the providers' official command references and avoid scraping ANSI presentation.
+These choices follow the providers' official command references and avoid scraping ANSI presentation. Developer providers that do not maintain a separate local catalog report a successful metadata-only refresh without inventing a provider command.
 
 ## Process safety
 
@@ -84,7 +84,7 @@ Maintenance uses the same typed operation executor and privilege boundary. A coo
 - a confidence label; and
 - provenance entries.
 
-Milestone 1 uses a small maintained knowledge mechanism for a few high-confidence examples such as `btop`, `ffmpeg`, and `libssl-dev`, plus conservative classifications based on metadata and package naming. Unknown packages fall back to provider text and explicitly say that Orbis has not inferred a richer explanation. There is no hosted model or external API dependency.
+Milestone 1 uses a small maintained knowledge mechanism for a few high-confidence examples such as `btop`, `ffmpeg`, and `libssl-dev`, plus conservative classifications based on metadata and package naming. Unknown packages fall back to provider text and explicitly say that Orbis has not inferred a richer explanation. There is no hosted service or external API dependency.
 
 The evidence structure leaves room for richer local metadata sources later without changing the CLI or package model.
 
@@ -94,9 +94,9 @@ The core never emits ANSI or terminal decoration. `render/theme.rs` owns semanti
 
 `orbis` launches the TUI only when stdin and stdout are terminals and `TERM` is not `dumb`. `orbis dashboard`/`orbis ui` can be explicit, while `--plain` is an escape hatch. JSON always bypasses the TUI. `ratatui::run` owns the Crossterm raw-mode/alternate-screen lifecycle and restores the terminal on normal exit or returned initialization/draw errors. The event loop handles Ctrl-C, Escape/back, resize through Ratatui's current frame area, and a minimum-size message instead of drawing off-screen.
 
-The dashboard creates bounded, read-only standard-thread workers for source snapshots, update inventories, searches, and plans. They communicate through a channel; the event loop never waits on provider I/O. Package mutations are not background work: a selected action first requests an `OperationPlan`, displays it in a review overlay, rejects blocked plans, and only then calls the same typed executor and history lifecycle as the plain CLI. Upgrade review is likewise a read-only maintenance plan.
+The dashboard creates bounded, read-only standard-thread workers for source snapshots, update inventories, searches, and plans. They communicate through a channel; the event loop never waits on provider I/O. Package mutations are not background work: a selected action first requests an `OperationPlan`, displays it in a review overlay, rejects blocked plans, and only then calls the same typed executor and history lifecycle as the plain CLI. Explicit interactive commands use the same review and live execution view. Maintenance source activity is carried by typed progress events; provider output is bounded and presentation-only. Update review is likewise a read-only maintenance plan.
 
-`--json` changes the stdout contract to structured data for the home view, `sources`, `search`, `info`, `explain`, `doctor`, and transaction plans/results. Decorative messages are not mixed into JSON stdout. Human-readable provider issues remain available as structured fields. Mutation commands refuse non-interactive execution unless `--yes` is supplied; `--plan` and `--dry-run` never cross the execution boundary.
+`--json` changes the stdout contract to structured data for the home view, `sources`, `search`, `info`, `explain`, `health`/`doctor`, and transaction plans/results. Decorative messages are not mixed into JSON stdout. Human-readable provider issues remain available as structured fields. Mutation commands refuse non-interactive execution unless `--yes` is supplied; `--plan` and `--dry-run` never cross the execution boundary. `update` is the beginner read-only update check; `refresh` is the explicit metadata-refresh action, while `upgrade` remains the compatibility spelling for applying an update plan.
 
 ## Safety scope
 

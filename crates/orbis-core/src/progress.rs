@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-use crate::models::PackageSource;
+use crate::{maintenance::ProviderUpdateInventory, models::PackageSource};
 
 /// Universal Orbis execution stages.
 ///
@@ -99,6 +99,23 @@ pub struct OutputLine {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperationEvent {
+    /// A provider has begun work for the current operation.
+    ProviderStarted {
+        /// Provider/source being contacted.
+        source: PackageSource,
+    },
+    /// A provider has finished its work for the current operation.
+    ProviderFinished {
+        /// Provider/source that finished.
+        source: PackageSource,
+        /// Whether the provider operation completed successfully.
+        success: bool,
+    },
+    /// A provider has returned its typed read-only update inventory.
+    ProviderInventory {
+        /// The provider inventory returned by the read-only query.
+        inventory: ProviderUpdateInventory,
+    },
     /// The operation has moved to a new stage.
     StageChanged {
         /// The new active stage.
@@ -281,5 +298,23 @@ mod tests {
             OutputLine { stream: OutputStream::Stderr, content: "stderr content".into() };
         assert_eq!(stdout_line.stream, OutputStream::Stdout);
         assert_eq!(stderr_line.stream, OutputStream::Stderr);
+    }
+
+    #[test]
+    fn provider_activity_events_preserve_source_boundaries() {
+        let observer = CollectingObserver::new();
+        observer.on_event(&OperationEvent::ProviderStarted { source: PackageSource::Apt });
+        observer.on_event(&OperationEvent::ProviderFinished {
+            source: PackageSource::Apt,
+            success: true,
+        });
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                OperationEvent::ProviderStarted { source: PackageSource::Apt },
+                OperationEvent::ProviderFinished { source: PackageSource::Apt, success: true }
+            ]
+        ));
     }
 }

@@ -19,7 +19,7 @@ impl Renderer {
         Self { theme: Theme::detect(color) }
     }
 
-    pub(crate) fn home(&self, sources: &[SourceInfo]) -> String {
+    pub(crate) fn home(&self, _sources: &[SourceInfo]) -> String {
         let mut output = String::new();
         output.push_str(&format!(
             "{}\n{}\n\n",
@@ -29,18 +29,7 @@ impl Renderer {
         output.push_str(
             "COMMON COMMANDS\n\n  orbis find <name>\n  orbis show <name>\n  orbis install <name>\n  orbis remove <name>\n  orbis update\n  orbis refresh\n  orbis clean\n  orbis health\n",
         );
-        if !sources.is_empty() {
-            output.push_str("\nSTATUS\n");
-            for source in sources {
-                let token = state_token(&source.state);
-                output.push_str(&format!(
-                    "  {} {:<24} {}\n",
-                    self.theme.paint(self.theme.mark(token), token),
-                    friendly_source(source.source),
-                    self.theme.paint(&friendly_state(&source.state), token)
-                ));
-            }
-        }
+        output.push_str("\nTRY\n  orbis find <name>\n  orbis update\n  orbis health\n");
         output
     }
 
@@ -329,12 +318,26 @@ impl Renderer {
         let mut output = self.heading(title, "Review the read-only plan before applying changes.");
         let total: usize =
             plan.providers.iter().map(|p| p.candidates.len().max(p.cleanup_candidates.len())).sum();
-        output.push_str(&format!(
-            "\n  {total} planned change{} across {} software source{}\n",
-            if total == 1 { "" } else { "s" },
-            plan.providers.len(),
-            if plan.providers.len() == 1 { "" } else { "s" }
-        ));
+        let summary = match plan.action {
+            orbis_core::maintenance::MaintenanceAction::Refresh => format!(
+                "\n  Refreshing information from {} software source{}\n",
+                plan.providers.len(),
+                if plan.providers.len() == 1 { "" } else { "s" }
+            ),
+            orbis_core::maintenance::MaintenanceAction::Upgrade => format!(
+                "\n  {total} update{} across {} software source{}\n",
+                if total == 1 { "" } else { "s" },
+                plan.providers.len(),
+                if plan.providers.len() == 1 { "" } else { "s" }
+            ),
+            orbis_core::maintenance::MaintenanceAction::Cleanup => format!(
+                "\n  {total} cleanup item{} across {} software source{}\n",
+                if total == 1 { "" } else { "s" },
+                plan.providers.len(),
+                if plan.providers.len() == 1 { "" } else { "s" }
+            ),
+        };
+        output.push_str(&summary);
         for provider in &plan.providers {
             output.push_str(&format!(
                 "\n{}  {}\n",
@@ -350,7 +353,12 @@ impl Renderer {
                 ));
             }
             if provider.candidates.is_empty() {
-                output.push_str("  No changes reported.\n");
+                output.push_str(match plan.action {
+                    orbis_core::maintenance::MaintenanceAction::Refresh => {
+                        "  Software information will be refreshed.\n"
+                    }
+                    _ => "  No changes reported.\n",
+                });
             }
             for warning in &provider.warnings {
                 output.push_str(&format!(
@@ -614,15 +622,6 @@ fn friendly_source(source: PackageSource) -> &'static str {
         PackageSource::Cargo => "Rust tools",
         PackageSource::Npm | PackageSource::Pnpm => "Node.js tools",
         PackageSource::Uv | PackageSource::Pipx => "Python tools",
-    }
-}
-
-fn friendly_state(state: &str) -> String {
-    match state {
-        "ready" => "Ready".into(),
-        "restricted" => "Needs attention".into(),
-        "unavailable" => "Not installed".into(),
-        other => other.to_owned(),
     }
 }
 

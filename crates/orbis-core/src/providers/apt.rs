@@ -395,7 +395,7 @@ impl MaintenanceProvider for AptProvider {
             candidates: parse_apt_update_candidates(&output.stdout),
             notes: vec![
                 "Read-only inventory uses the current local APT package index.".into(),
-                "Orbis does not run apt-get update for `orbis updates`; refresh metadata with `orbis update`.".into(),
+                "Orbis does not run apt-get update for `orbis update`; refresh metadata with `orbis refresh`.".into(),
             ],
             metadata_state: Some("current_local_index_unknown_freshness".into()),
         })

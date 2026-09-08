@@ -30,9 +30,9 @@ pub enum MaintenanceAction {
 impl MaintenanceAction {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Refresh => "Update",
-            Self::Upgrade => "Upgrade",
-            Self::Cleanup => "Clean",
+            Self::Refresh => "Refresh",
+            Self::Upgrade => "Update",
+            Self::Cleanup => "Clean up",
         }
     }
 }

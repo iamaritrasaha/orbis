@@ -7,7 +7,7 @@ use orbis_core::{models::PackageSource, transaction::InstallScope};
     version,
     about = "Your Linux software, in one place.",
     long_about = "A calm, beginner-friendly way to find, understand, update, and safely manage software on Linux.",
-    help_template = "{name} {version}\n\n{about}\n\nCOMMON COMMANDS\n\n  find       Find software\n  show       Learn about software\n  install    Install software\n  remove     Remove software\n  update     Check for updates\n  refresh    Refresh software information\n  clean      Remove unused software safely\n  history    See previous Orbis actions\n  health     Check that everything is working\n\nEXAMPLES\n\n  orbis find firefox\n  orbis show btop\n  orbis install btop\n  orbis update\n  orbis health\n\nADVANCED\n\n  upgrade    Apply a reviewed update plan\n  sources    Inspect software sources\n  why        Inspect installation reasoning\n  --json     Use the stable machine-readable interface\n\nUse 'orbis <command> --help' for command details.\n"
+    help_template = "{name} {version}\n\nCOMMON COMMANDS\n\n  find       Find software\n  show       Learn about software\n  install    Install software\n  remove     Remove software\n  update     Check for updates\n  refresh    Refresh software information\n  clean      Remove unused software safely\n  history    See previous Orbis actions\n  health     Check that everything is working\n\nEXAMPLES\n\n  orbis find firefox\n  orbis show btop\n  orbis install btop\n  orbis update\n  orbis health\n\nADVANCED\n\n  upgrade    Apply a reviewed update plan\n  sources    Inspect software sources\n  why        Inspect installation reasoning\n  search     Compatibility alias for find\n  doctor     Compatibility alias for health\n  --json     Use the stable machine-readable interface\n\n{about}\n\nUse 'orbis <command> --help' for command details.\n"
 )]
 pub(crate) struct Cli {
     /// Emit structured JSON instead of terminal presentation.
@@ -107,11 +107,14 @@ pub(crate) enum Command {
         /// Restrict the check to one advanced source.
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
-        /// Compatibility flag for the former metadata-refresh spelling.
-        #[arg(long, hide = true)]
+        /// Build and show the reviewed plan for applying available updates.
+        #[arg(long, conflicts_with_all = ["apply", "yes"])]
         plan: bool,
-        /// Compatibility flag for the former metadata-refresh spelling.
-        #[arg(long, hide = true)]
+        /// Apply updates through the existing plan, confirmation, and execution flow.
+        #[arg(long, conflicts_with = "plan")]
+        apply: bool,
+        /// Apply the exact reviewed update plan without asking again.
+        #[arg(long, conflicts_with = "plan")]
         yes: bool,
     },
     /// Refresh software information without changing installed software.

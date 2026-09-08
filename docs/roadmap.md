@@ -31,7 +31,7 @@ Not included in this milestone: upgrades, update-all, autoremove, cleanup, rollb
 - Reverse-dependency and safety context.
 - A trustworthy `why` command for installed software.
 
-Milestone 3 establishes update versus updates versus upgrade semantics, provider-scoped maintenance, non-atomic unified results, revalidation, APT autoremove planning, history queries, and truthful provider limitations.
+Milestone 3 establishes read-only `update` versus metadata `refresh`, the compatibility `upgrade` path, provider-scoped maintenance, non-atomic unified results, revalidation, APT autoremove planning, history queries, and truthful provider limitations.
 
 ## Milestone 4 — additional ecosystems (complete)
 
@@ -42,7 +42,7 @@ Milestone 3 establishes update versus updates versus upgrade semantics, provider
 
 Milestone 4 manages user-wide developer tools only. It does not manage project dependency graphs, package manifests, lockfiles, virtual environments, or caches. Cargo automatic updates remain incomplete when original install provenance cannot be proven safely. npm excludes suspicious newer-than-latest installs, uv preserves recorded constraints/settings, and pipx preserves pins.
 
-The roadmap does not promise a daemon, hosted backend, telemetry, or AI dependency.
+The roadmap does not promise a daemon, hosted backend, or telemetry.
 
 ## Milestone 5 — Signature terminal experience (complete)
 

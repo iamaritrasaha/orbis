@@ -70,6 +70,7 @@ enum LayoutClass {
 
 enum WorkerMessage {
     Snapshot(Vec<SourceInfo>, UpdateInventoryReport, orbis_core::diagnostics::DoctorReport),
+    UpdateInventory(UpdateInventoryReport),
     Search(String, orbis_core::SearchReport),
     Plan(Box<Result<(OperationRequest, OperationPlan), String>>),
     Maintenance(Result<MaintenancePlan, String>),
@@ -106,6 +107,100 @@ pub(crate) fn run(registry: &ProviderRegistry, theme: Theme, json: bool) -> Resu
             eprintln!("orbis: dashboard unavailable ({error}); showing plain status");
             Ok(())
         }
+    }
+}
+
+/// Whether an operation should use the full-screen live presentation.
+pub(crate) fn should_launch_operation() -> bool {
+    terminal_capable()
+}
+
+/// Runs a reviewed maintenance operation in the live terminal presentation.
+/// The plan is still built by the core registry and execution still crosses the
+/// same typed executor/history boundary as the ordinary CLI.
+pub(crate) fn run_maintenance(
+    registry: &ProviderRegistry,
+    theme: Theme,
+    action: MaintenanceAction,
+    source: Option<PackageSource>,
+    yes: bool,
+) -> Result<(), String> {
+    if !terminal_capable() {
+        return Err("live operations require an interactive terminal".into());
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut app = App::new(registry, theme, tx, rx);
+    app.maintenance_source = source;
+    app.maintenance_auto_apply = yes;
+    app.request_maintenance(action);
+    match ratatui::run(|terminal| app.event_loop(terminal)) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("live operation unavailable: {error}")),
+    }
+}
+
+/// Runs an exact, already-resolved package plan in the live operation view.
+/// Resolution and planning remain outside this presentation entry point so an
+/// explicit CLI command and a dashboard selection share the same safety checks.
+pub(crate) fn run_transaction(
+    registry: &ProviderRegistry,
+    theme: Theme,
+    request: OperationRequest,
+    plan: OperationPlan,
+    yes: bool,
+) -> Result<(), String> {
+    if !terminal_capable() {
+        return Err("live operations require an interactive terminal".into());
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut app = App::new(registry, theme, tx, rx);
+    app.selected_package = Some(plan.target.clone());
+    app.plan = Some((request, plan));
+    app.screen = Screen::Confirm;
+    if yes {
+        app.start_transaction();
+    }
+    match ratatui::run(|terminal| app.event_loop(terminal)) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("live operation unavailable: {error}")),
+    }
+}
+
+/// Checks for updates in a focused read-only TUI view. The check uses the core
+/// registry directly and never crosses the mutation boundary.
+pub(crate) fn run_update(
+    registry: &ProviderRegistry,
+    theme: Theme,
+    source: Option<PackageSource>,
+) -> Result<(), String> {
+    if !terminal_capable() {
+        return Err("live update checks require an interactive terminal".into());
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut app = App::new(registry, theme, tx, rx);
+    app.screen = Screen::Updates;
+    app.update_check_running = true;
+    app.maintenance_provider_status = registry
+        .sources()
+        .into_iter()
+        .filter(|info| source.is_none_or(|wanted| wanted == info.source))
+        .map(|info| (info.source, "Waiting".to_owned()))
+        .collect();
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        struct TuiObserver(Sender<WorkerMessage>);
+        impl orbis_core::progress::ProgressObserver for TuiObserver {
+            fn on_event(&self, event: &orbis_core::progress::OperationEvent) {
+                let _ = self.0.send(WorkerMessage::Progress(event.clone()));
+            }
+        }
+        let observer = TuiObserver(tx.clone());
+        let report = ProviderRegistry::system().updates_with_observer(source, &observer);
+        let _ = tx.send(WorkerMessage::UpdateInventory(report));
+    });
+    match ratatui::run(|terminal| app.event_loop(terminal)) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("live update check unavailable: {error}")),
     }
 }
 
@@ -228,6 +323,8 @@ struct App<'a> {
     previous: Screen,
     sources: Option<Vec<SourceInfo>>,
     updates: Option<UpdateInventoryReport>,
+    update_check_running: bool,
+    spinner_index: usize,
     search_query: String,
     search_results: Vec<Package>,
     selected: usize,
@@ -242,6 +339,10 @@ struct App<'a> {
     plan: Option<(OperationRequest, OperationPlan)>,
     maintenance: Option<MaintenancePlan>,
     maintenance_action: MaintenanceAction,
+    maintenance_source: Option<PackageSource>,
+    maintenance_auto_apply: bool,
+    maintenance_executing: bool,
+    maintenance_provider_status: BTreeMap<PackageSource, String>,
     doctor: Option<orbis_core::diagnostics::DoctorReport>,
     why_loading: bool,
     doctor_loading: bool,
@@ -255,6 +356,8 @@ struct App<'a> {
     progress_context: String,
     progress_output: VecDeque<String>,
     progress_scroll: usize,
+    progress_show_details: bool,
+    progress_maintenance: bool,
     transaction_result: Option<orbis_core::transaction::TransactionResult>,
     maintenance_result: Option<orbis_core::maintenance::MaintenanceResult>,
 }
@@ -275,6 +378,8 @@ impl<'a> App<'a> {
             previous: Screen::Dashboard,
             sources: None,
             updates: None,
+            update_check_running: false,
+            spinner_index: 0,
             search_query: String::new(),
             search_results: Vec::new(),
             selected: 0,
@@ -289,6 +394,10 @@ impl<'a> App<'a> {
             plan: None,
             maintenance: None,
             maintenance_action: MaintenanceAction::Upgrade,
+            maintenance_source: None,
+            maintenance_auto_apply: false,
+            maintenance_executing: false,
+            maintenance_provider_status: BTreeMap::new(),
             doctor: None,
             why_loading: false,
             doctor_loading: false,
@@ -301,6 +410,10 @@ impl<'a> App<'a> {
             progress_context: String::new(),
             progress_output: VecDeque::new(),
             progress_scroll: 0,
+            // Static test/fixture progress views show their details panel;
+            // active operations explicitly start with details collapsed.
+            progress_show_details: true,
+            progress_maintenance: false,
             transaction_result: None,
             maintenance_result: None,
         }
@@ -318,6 +431,10 @@ impl<'a> App<'a> {
                 received = true;
             }
             if self.animation.is_active() {
+                dirty = true;
+            }
+            if self.update_check_running || self.maintenance_executing {
+                self.spinner_index = self.spinner_index.wrapping_add(1);
                 dirty = true;
             }
             if dirty || received {
@@ -350,6 +467,10 @@ impl<'a> App<'a> {
                 self.snapshot_loading = false;
                 self.doctor_loading = false;
             }
+            WorkerMessage::UpdateInventory(report) => {
+                self.updates = Some(report);
+                self.update_check_running = false;
+            }
             WorkerMessage::Search(query, report) if query == self.search_query => {
                 self.search_results = report.results;
                 self.search_loading = false;
@@ -365,7 +486,12 @@ impl<'a> App<'a> {
                 }
             }
             WorkerMessage::Maintenance(result) => match result {
-                Ok(plan) => self.maintenance = Some(plan),
+                Ok(plan) => {
+                    self.maintenance = Some(plan);
+                    if self.maintenance_auto_apply {
+                        self.start_maintenance();
+                    }
+                }
                 Err(error) => self.error = Some(error),
             },
             WorkerMessage::Why(result) => {
@@ -380,6 +506,28 @@ impl<'a> App<'a> {
                 match &event {
                     OperationEvent::StageChanged { stage } => {
                         self.progress_stage = *stage;
+                    }
+                    OperationEvent::ProviderStarted { source } => {
+                        self.maintenance_provider_status.insert(*source, "Working…".to_owned());
+                    }
+                    OperationEvent::ProviderInventory { inventory } => {
+                        let mut inventories = self
+                            .updates
+                            .take()
+                            .map(|report| report.inventories)
+                            .unwrap_or_default();
+                        inventories.retain(|item| item.source != inventory.source);
+                        inventories.push(inventory.clone());
+                        self.updates = Some(orbis_core::maintenance::aggregate_inventory(
+                            inventories,
+                            Vec::new(),
+                        ));
+                    }
+                    OperationEvent::ProviderFinished { source, success } => {
+                        self.maintenance_provider_status.insert(
+                            *source,
+                            if *success { "Done" } else { "Needs attention" }.to_owned(),
+                        );
                     }
                     OperationEvent::ProviderOutput(line) => {
                         self.progress_output.push_back(line.content.clone());
@@ -410,12 +558,14 @@ impl<'a> App<'a> {
             },
             WorkerMessage::MaintenanceComplete(result) => match *result {
                 Ok(result) => {
+                    self.maintenance_executing = false;
                     self.progress_stage = orbis_core::progress::ExecutionStage::Completed;
                     self.maintenance_result = Some(result);
                     self.screen = Screen::Result;
                     self.refresh();
                 }
                 Err(error) => {
+                    self.maintenance_executing = false;
                     self.progress_stage = orbis_core::progress::ExecutionStage::Failed;
                     self.error = Some(error);
                     self.screen = Screen::Result;
@@ -504,7 +654,9 @@ impl<'a> App<'a> {
             }
             Screen::Confirm => self.handle_confirm(key),
             Screen::MaintenanceReview => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('u')) {
+                if key.code == KeyCode::Enter {
+                    self.start_maintenance();
+                } else if matches!(key.code, KeyCode::Esc | KeyCode::Char('u')) {
                     self.screen = Screen::Updates;
                     self.maintenance = None;
                 }
@@ -521,6 +673,9 @@ impl<'a> App<'a> {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.progress_scroll = self.progress_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('l' | 'L') => {
+                self.progress_show_details = !self.progress_show_details;
             }
             _ => {}
         }
@@ -697,12 +852,64 @@ impl<'a> App<'a> {
     fn request_maintenance(&mut self, action: MaintenanceAction) {
         self.maintenance_action = action;
         self.maintenance = None;
+        self.maintenance_executing = false;
+        self.maintenance_provider_status.clear();
+        self.progress_maintenance = false;
+        let source = self.maintenance_source;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = ProviderRegistry::system().maintenance_plan(action, None);
+            let result = ProviderRegistry::system().maintenance_plan(action, source);
             let _ = tx.send(WorkerMessage::Maintenance(result));
         });
         self.open(Screen::MaintenanceReview);
+    }
+
+    fn start_maintenance(&mut self) {
+        let Some(plan) = self.maintenance.clone() else { return };
+        if !plan.executable() {
+            self.error = Some(
+                "Orbis cannot safely confirm everything this operation may change. Nothing was changed."
+                    .into(),
+            );
+            return;
+        }
+        self.maintenance_executing = true;
+        self.progress_maintenance = true;
+        self.progress_stage = orbis_core::progress::ExecutionStage::Preparing;
+        self.progress_title = match plan.action {
+            MaintenanceAction::Refresh => "Refreshing software information".to_owned(),
+            MaintenanceAction::Upgrade => "Updating your software".to_owned(),
+            MaintenanceAction::Cleanup => "Cleaning up".to_owned(),
+        };
+        let sources = plan.providers.iter().filter(|provider| provider.executable()).count();
+        self.progress_context =
+            format!("{} source{} · staged safely", sources, if sources == 1 { "" } else { "s" });
+        self.progress_output.clear();
+        self.progress_scroll = 0;
+        self.progress_show_details = false;
+        self.maintenance_provider_status = plan
+            .providers
+            .iter()
+            .filter(|provider| provider.executable())
+            .map(|provider| (provider.source, "Waiting".to_owned()))
+            .collect();
+        self.maintenance_result = None;
+        self.open(Screen::Progress);
+
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            struct TuiObserver(Sender<WorkerMessage>);
+            impl orbis_core::progress::ProgressObserver for TuiObserver {
+                fn on_event(&self, event: &orbis_core::progress::OperationEvent) {
+                    let _ = self.0.send(WorkerMessage::Progress(event.clone()));
+                }
+            }
+            let observer = TuiObserver(tx.clone());
+            let registry = ProviderRegistry::system();
+            let result =
+                commands::execute_confirmed_maintenance_with_observer(&registry, plan, &observer);
+            let _ = tx.send(WorkerMessage::MaintenanceComplete(Box::new(result)));
+        });
     }
 
     fn load_why(&mut self) {
@@ -725,45 +932,50 @@ impl<'a> App<'a> {
             return;
         }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char('y')) {
-            let Some((request, plan)) = self.plan.clone() else { return };
-            if !plan.executable() {
-                self.error =
-                    Some("This plan is blocked or incomplete and cannot be confirmed.".into());
-                return;
-            }
-            self.progress_stage = orbis_core::progress::ExecutionStage::Preparing;
-            self.progress_title = format!("{} {}", plan.action.label(), plan.target.name);
-            self.progress_context = format!(
-                "{} · {} · {} access",
-                friendly_source(plan.target.source),
-                plan.scope.label(),
-                if plan.privilege == orbis_core::transaction::PrivilegeRequirement::None {
-                    "User"
-                } else {
-                    "Administrator"
-                }
-            );
-            self.progress_output.clear();
-            self.progress_scroll = 0;
-            self.transaction_result = None;
-            self.open(Screen::Progress);
-
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                struct TuiObserver(Sender<WorkerMessage>);
-                impl orbis_core::progress::ProgressObserver for TuiObserver {
-                    fn on_event(&self, event: &orbis_core::progress::OperationEvent) {
-                        let _ = self.0.send(WorkerMessage::Progress(event.clone()));
-                    }
-                }
-                let observer = TuiObserver(tx.clone());
-                let registry = ProviderRegistry::system();
-                let result = commands::execute_confirmed_transaction_with_observer(
-                    &registry, &request, plan, &observer,
-                );
-                let _ = tx.send(WorkerMessage::TransactionComplete(Box::new(result)));
-            });
+            self.start_transaction();
         }
+    }
+
+    fn start_transaction(&mut self) {
+        let Some((request, plan)) = self.plan.clone() else { return };
+        if !plan.executable() {
+            self.error = Some("This plan is blocked or incomplete and cannot be confirmed.".into());
+            return;
+        }
+        self.progress_maintenance = false;
+        self.progress_stage = orbis_core::progress::ExecutionStage::Preparing;
+        self.progress_title = format!("{} {}", plan.action.label(), plan.target.name);
+        self.progress_context = format!(
+            "{} · {} · {} access",
+            friendly_source(plan.target.source),
+            plan.scope.label(),
+            if plan.privilege == orbis_core::transaction::PrivilegeRequirement::None {
+                "User"
+            } else {
+                "Administrator"
+            }
+        );
+        self.progress_output.clear();
+        self.progress_scroll = 0;
+        self.progress_show_details = false;
+        self.transaction_result = None;
+        self.open(Screen::Progress);
+
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            struct TuiObserver(Sender<WorkerMessage>);
+            impl orbis_core::progress::ProgressObserver for TuiObserver {
+                fn on_event(&self, event: &orbis_core::progress::OperationEvent) {
+                    let _ = self.0.send(WorkerMessage::Progress(event.clone()));
+                }
+            }
+            let observer = TuiObserver(tx.clone());
+            let registry = ProviderRegistry::system();
+            let result = commands::execute_confirmed_transaction_with_observer(
+                &registry, &request, plan, &observer,
+            );
+            let _ = tx.send(WorkerMessage::TransactionComplete(Box::new(result)));
+        });
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -1226,7 +1438,24 @@ impl<'a> App<'a> {
     fn draw_updates(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut body = Vec::new();
         match &self.updates {
-            None => body.push(ui::loading(self.theme, "Checking providers…")),
+            None => body.push(ui::loading(self.theme, "Checking software sources…")),
+            Some(report) if self.update_check_running => {
+                if report.candidates.is_empty() {
+                    body.push(ui::loading(self.theme, "Waiting for update results…"));
+                } else {
+                    body.push(Line::from(Span::styled(
+                        format!(
+                            "{} update{} found so far",
+                            report.total(),
+                            if report.total() == 1 { "" } else { "s" }
+                        ),
+                        self.theme.style(Token::Foreground),
+                    )));
+                    body.extend(update_group_lines(self.theme, report, true));
+                    body.extend([Line::from(""), ui::section_title(self.theme, "DEVELOPER TOOLS")]);
+                    body.extend(update_group_lines(self.theme, report, false));
+                }
+            }
             Some(report) if report.candidates.is_empty() => {
                 body.push(ui::empty(self.theme, "No updates available."));
                 for inventory in &report.inventories {
@@ -1251,14 +1480,42 @@ impl<'a> App<'a> {
                 body.extend(update_group_lines(self.theme, report, false));
             }
         }
+        if self.update_check_running {
+            body.extend([Line::from(""), ui::section_title(self.theme, "SOURCES")]);
+            for (source, status) in &self.maintenance_provider_status {
+                let token = if status == "Done" {
+                    Token::Positive
+                } else if status == "Needs attention" {
+                    Token::Caution
+                } else {
+                    Token::Muted
+                };
+                body.push(ui::provider_row(
+                    self.theme,
+                    self.theme.mark(token),
+                    friendly_source(*source),
+                    status,
+                    token,
+                ));
+            }
+        }
+        let subtitle = if self.update_check_running {
+            "Checking software sources…".to_owned()
+        } else {
+            update_summary(self.updates.as_ref(), self.snapshot_loading)
+        };
         self.shell_actions(
             frame,
             area,
             "Updates",
-            &update_summary(self.updates.as_ref(), self.snapshot_loading),
+            &subtitle,
             body,
             0,
-            "U Review plan   R Refresh   Esc Back   ? Help",
+            if self.update_check_running {
+                "Checking…   Esc Back   ? Help"
+            } else {
+                "U Review plan   R Refresh   Esc Back   ? Help"
+            },
         );
     }
 
@@ -1728,14 +1985,26 @@ impl<'a> App<'a> {
                 (count > 0 || !provider.executable())
                     && provider.privilege != orbis_core::transaction::PrivilegeRequirement::None
             });
-            lines.push(Line::from(format!(
-                "{} {}{} across {} provider{}",
-                total,
-                item_label,
-                if total == 1 { "" } else { "s" },
-                provider_count,
-                if provider_count == 1 { "" } else { "s" }
-            )));
+            let summary = match self.maintenance_action {
+                MaintenanceAction::Refresh => format!(
+                    "Refresh software information from {} source{}",
+                    plan.providers.len(),
+                    if plan.providers.len() == 1 { "" } else { "s" }
+                ),
+                MaintenanceAction::Upgrade if total == 0 => "No updates available.".to_owned(),
+                MaintenanceAction::Cleanup if total == 0 => {
+                    "No safely removable items were found.".to_owned()
+                }
+                _ => format!(
+                    "{} {}{} across {} source{}",
+                    total,
+                    item_label,
+                    if total == 1 { "" } else { "s" },
+                    provider_count,
+                    if provider_count == 1 { "" } else { "s" }
+                ),
+            };
+            lines.push(Line::from(summary));
             for (source, (count, executable, warning)) in
                 grouped.iter().filter(|(_, (count, _, _))| *count > 0)
             {
@@ -1803,6 +2072,15 @@ impl<'a> App<'a> {
             MaintenanceAction::Upgrade => "Update plan".to_owned(),
             MaintenanceAction::Cleanup => "Cleanup plan".to_owned(),
         };
+        let actions = self.maintenance.as_ref().map_or("Esc Back   ? Help", |plan| {
+            if plan.executable() && plan.mutates {
+                "Enter Apply   Esc Back   ? Help"
+            } else if plan.executable() {
+                "Enter Continue   Esc Back   ? Help"
+            } else {
+                "Esc Back   ? Help"
+            }
+        });
         self.shell_actions(
             frame,
             area,
@@ -1810,7 +2088,7 @@ impl<'a> App<'a> {
             "Review the read-only plan before applying changes",
             lines,
             0,
-            "Esc Back   ? Help",
+            actions,
         );
     }
 
@@ -1827,50 +2105,35 @@ impl<'a> App<'a> {
                 &self.progress_context
             },
         );
-        let chunks = Layout::vertical([Constraint::Length(7), Constraint::Min(5)]).split(body_area);
+        let top_height = if self.progress_maintenance { 8 } else { 7 };
+        let chunks =
+            Layout::vertical([Constraint::Length(top_height), Constraint::Min(5)]).split(body_area);
 
-        let stages = orbis_core::progress::ExecutionStage::transaction_stages();
-        let mut stage_lines = vec![ui::section_title(self.theme, "PROGRESS")];
-        let current = self.progress_stage;
-        let mut found_current = false;
-        for &stage in stages {
-            let is_current = stage == current;
-            if is_current {
-                found_current = true;
-            }
-            let is_past = !found_current;
-            let state = if is_current {
-                if stage.is_terminal() { StageState::Done } else { StageState::Active }
-            } else if is_past {
-                StageState::Done
-            } else {
-                StageState::Pending
-            };
-
-            let token = match state {
-                StageState::Done => Token::Positive,
-                StageState::Active => Token::Caution,
-                StageState::Pending => Token::Muted,
-            };
-            let label = if is_current && !stage.is_terminal() {
-                format!("{} …", beginner_stage_label(stage))
-            } else {
-                beginner_stage_label(stage).to_string()
-            };
-            stage_lines.push(ui::progress_stage(
-                self.theme,
-                self.theme.stage_mark(state),
-                &label,
-                if is_current { Token::Foreground } else { token },
-            ));
+        if self.progress_maintenance && body_area.width >= 90 {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(chunks[0]);
+            self.draw_progress_stages(frame, columns[0]);
+            self.draw_provider_activity(frame, columns[1]);
+        } else {
+            self.draw_progress_stages(frame, chunks[0]);
         }
-        frame.render_widget(Paragraph::new(Text::from(stage_lines)), chunks[0]);
 
-        let output_lines: Vec<Line<'static>> = self
-            .progress_output
-            .iter()
-            .map(|line| Line::from(Span::styled(line.clone(), self.theme.style(Token::Muted))))
-            .collect();
+        let output_lines: Vec<Line<'static>> = if self.progress_show_details {
+            self.progress_output
+                .iter()
+                .map(|line| Line::from(Span::styled(line.clone(), self.theme.style(Token::Muted))))
+                .collect()
+        } else {
+            vec![ui::empty(
+                self.theme,
+                if self.progress_output.is_empty() {
+                    "Provider details will appear here when available."
+                } else {
+                    "Provider details are available. Press L to view the bounded output."
+                },
+            )]
+        };
 
         let visible_height = chunks[1].height.saturating_sub(2) as usize;
         let total_lines = output_lines.len();
@@ -1884,7 +2147,14 @@ impl<'a> App<'a> {
         let output_block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.style(Token::Divider))
-            .title(Span::styled(" PROVIDER OUTPUT ", self.theme.style(Token::Section)));
+            .title(Span::styled(
+                if self.progress_show_details {
+                    " PROVIDER OUTPUT · DETAILS "
+                } else {
+                    " DETAILS "
+                },
+                self.theme.style(Token::Section),
+            ));
 
         let output_paragraph =
             Paragraph::new(Text::from(output_lines)).block(output_block).scroll((scroll_offset, 0));
@@ -1894,8 +2164,94 @@ impl<'a> App<'a> {
             frame,
             footer,
             self.theme,
-            "↑↓ Scroll output   Esc unavailable while active   ? Help",
+            if self.progress_maintenance {
+                if self.progress_show_details {
+                    "↑↓ Scroll details   L Hide details   Esc unavailable   ? Help"
+                } else {
+                    "L Show details   Esc unavailable while active   ? Help"
+                }
+            } else {
+                if self.progress_show_details {
+                    "↑↓ Scroll output   L Hide details   Esc unavailable   ? Help"
+                } else {
+                    "L Show details   Esc unavailable while active   ? Help"
+                }
+            },
         );
+    }
+
+    fn draw_progress_stages(&self, frame: &mut Frame<'_>, area: Rect) {
+        let stages = orbis_core::progress::ExecutionStage::transaction_stages();
+        let mut stage_lines = vec![ui::section_title(self.theme, "PROGRESS")];
+        let current = self.progress_stage;
+        let mut found_current = false;
+        for &stage in stages {
+            let is_current = stage == current;
+            if is_current {
+                found_current = true;
+            }
+            let state = if is_current {
+                if stage.is_terminal() { StageState::Done } else { StageState::Active }
+            } else if !found_current {
+                StageState::Done
+            } else {
+                StageState::Pending
+            };
+            let token = match state {
+                StageState::Done => Token::Positive,
+                StageState::Active => Token::Caution,
+                StageState::Pending => Token::Muted,
+            };
+            let label = if is_current && !stage.is_terminal() {
+                format!("{} …", beginner_stage_label_for(stage, &self.progress_title))
+            } else {
+                beginner_stage_label_for(stage, &self.progress_title).to_string()
+            };
+            stage_lines.push(ui::progress_stage(
+                self.theme,
+                if is_current && !stage.is_terminal() {
+                    self.spinner_mark()
+                } else {
+                    self.theme.stage_mark(state)
+                },
+                &label,
+                if is_current { Token::Foreground } else { token },
+            ));
+        }
+        frame.render_widget(Paragraph::new(Text::from(stage_lines)), area);
+    }
+
+    fn spinner_mark(&self) -> &'static str {
+        if self.theme.unicode {
+            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            FRAMES[self.spinner_index % FRAMES.len()]
+        } else {
+            ["|", "/", "-", "\\"][self.spinner_index % 4]
+        }
+    }
+
+    fn draw_provider_activity(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut lines = vec![ui::section_title(self.theme, "SOURCES")];
+        for (source, status) in &self.maintenance_provider_status {
+            let token = if status == "Done" {
+                Token::Positive
+            } else if status == "Needs attention" {
+                Token::Caution
+            } else {
+                Token::Muted
+            };
+            lines.push(ui::provider_row(
+                self.theme,
+                self.theme.mark(token),
+                friendly_source(*source),
+                status,
+                token,
+            ));
+        }
+        if self.maintenance_provider_status.is_empty() {
+            lines.push(ui::loading(self.theme, "Waiting for sources…"));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
     }
 
     fn draw_result(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -2271,6 +2627,28 @@ fn beginner_stage_label(stage: orbis_core::progress::ExecutionStage) -> &'static
         orbis_core::progress::ExecutionStage::Completed => "Done",
         orbis_core::progress::ExecutionStage::Failed => "Could not finish",
     }
+}
+
+fn beginner_stage_label_for(
+    stage: orbis_core::progress::ExecutionStage,
+    title: &str,
+) -> &'static str {
+    if stage == orbis_core::progress::ExecutionStage::Executing {
+        let title = title.to_ascii_lowercase();
+        if title.contains("remov") {
+            return "Removing";
+        }
+        if title.contains("clean") {
+            return "Cleaning up";
+        }
+        if title.contains("refresh") {
+            return "Refreshing";
+        }
+        if title.contains("updat") {
+            return "Updating";
+        }
+    }
+    beginner_stage_label(stage)
 }
 
 fn verification_label(value: orbis_core::transaction::VerificationResult) -> &'static str {
@@ -2700,7 +3078,9 @@ mod tests {
     fn search_loading_and_empty_states_use_shared_language() {
         let registry = Box::leak(Box::new(ProviderRegistry::system()));
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(registry, Theme::test(121), tx, rx);
+        let mut theme = Theme::test(121);
+        theme.unicode = true;
+        let mut app = App::new(registry, theme, tx, rx);
         app.screen = Screen::Search;
         app.search_query = "btop".into();
         app.search_loading = true;
@@ -2773,6 +3153,80 @@ mod tests {
         assert!(content.contains("Installing"));
         assert!(content.contains("PROVIDER OUTPUT"));
         assert!(content.contains("Reading package lists..."));
+    }
+
+    #[test]
+    fn maintenance_progress_renders_source_activity_and_details() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(121);
+        theme.unicode = true;
+        let mut app = App::new(registry, theme, tx, rx);
+        app.screen = Screen::Progress;
+        app.progress_maintenance = true;
+        app.progress_title = "Refreshing software information".into();
+        app.progress_context = "2 sources · staged safely".into();
+        app.progress_stage = orbis_core::progress::ExecutionStage::Executing;
+        app.maintenance_provider_status.insert(PackageSource::Apt, "Working…".into());
+        app.maintenance_provider_status.insert(PackageSource::Snap, "Waiting".into());
+        app.progress_output.push_back("Reading software information…".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw maintenance progress");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Refreshing software information"));
+        assert!(content.contains("SOURCES"));
+        assert!(content.contains("Ubuntu repositories"));
+        assert!(content.contains("PROVIDER OUTPUT · DETAILS"));
+        assert!(content.contains("↑↓ Scroll details"));
+    }
+
+    #[test]
+    fn update_check_loading_reserves_its_live_footer() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(121);
+        theme.unicode = true;
+        let mut app = App::new(registry, theme, tx, rx);
+        app.screen = Screen::Updates;
+        app.update_check_running = true;
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw update check");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Checking software sources"));
+        assert!(content.contains("Checking…"));
+        assert!(content.contains("◈ ORBIS"));
+    }
+
+    #[test]
+    fn update_check_renders_inventory_as_each_provider_finishes() {
+        let registry = Box::leak(Box::new(ProviderRegistry::system()));
+        let (tx, rx) = mpsc::channel();
+        let mut theme = Theme::test(121);
+        theme.unicode = true;
+        let mut app = App::new(registry, theme, tx, rx);
+        app.screen = Screen::Updates;
+        app.update_check_running = true;
+        app.accept(WorkerMessage::Progress(
+            orbis_core::progress::OperationEvent::ProviderInventory {
+                inventory: orbis_core::maintenance::ProviderUpdateInventory {
+                    source: PackageSource::Apt,
+                    available: true,
+                    candidates: vec![sample_candidate(PackageSource::Apt, "curl")],
+                    notes: Vec::new(),
+                    metadata_state: Some("current_local_index".into()),
+                },
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(121, 24)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw partial update check");
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("1 update found so far"));
+        assert!(content.contains("curl"));
+        assert!(content.contains("Checking…"));
     }
 
     #[test]

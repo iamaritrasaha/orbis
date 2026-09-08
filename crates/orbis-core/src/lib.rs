@@ -203,6 +203,8 @@ impl ProviderRegistry {
             .find(|provider| provider.source() == plan.target.source)
             .ok_or_else(|| TransactionError::Planning("resolved provider is unavailable".into()))?;
         let operation = provider.provider_operation(&plan)?;
+        observer
+            .on_event(&progress::OperationEvent::ProviderStarted { source: plan.target.source });
 
         if plan.privilege == transaction::PrivilegeRequirement::Administrator {
             observer.on_event(&progress::OperationEvent::StageChanged {
@@ -214,7 +216,16 @@ impl ProviderRegistry {
             stage: progress::ExecutionStage::Executing,
         });
 
-        let output = executor.execute_with_observer(&operation, plan.privilege, observer)?;
+        let output = match executor.execute_with_observer(&operation, plan.privilege, observer) {
+            Ok(output) => output,
+            Err(error) => {
+                observer.on_event(&progress::OperationEvent::ProviderFinished {
+                    source: plan.target.source,
+                    success: false,
+                });
+                return Err(error.into());
+            }
+        };
         let execution = ExecutionSummary {
             exit_status: output.status,
             process_succeeded: output.success(),
@@ -223,6 +234,10 @@ impl ProviderRegistry {
                 .flatten(),
         };
         if !output.success() {
+            observer.on_event(&progress::OperationEvent::ProviderFinished {
+                source: plan.target.source,
+                success: false,
+            });
             return Ok(TransactionResult {
                 plan,
                 execution,
@@ -235,12 +250,25 @@ impl ProviderRegistry {
             stage: progress::ExecutionStage::Verifying,
         });
 
-        let verification = provider.verify_transaction(&plan)?;
+        let verification = match provider.verify_transaction(&plan) {
+            Ok(verification) => verification,
+            Err(error) => {
+                observer.on_event(&progress::OperationEvent::ProviderFinished {
+                    source: plan.target.source,
+                    success: false,
+                });
+                return Err(error);
+            }
+        };
         let status = match verification {
             VerificationResult::Verified => TransactionStatus::Succeeded,
             VerificationResult::PartiallyVerified => TransactionStatus::PartiallyVerified,
             VerificationResult::Failed => TransactionStatus::Failed,
         };
+        observer.on_event(&progress::OperationEvent::ProviderFinished {
+            source: plan.target.source,
+            success: status != TransactionStatus::Failed,
+        });
         Ok(TransactionResult { plan, execution, verification, status })
     }
 
@@ -365,18 +393,52 @@ impl ProviderRegistry {
 
     /// Collects a unified, read-only update inventory from selected providers.
     pub fn updates(&self, source: Option<PackageSource>) -> UpdateInventoryReport {
+        self.updates_with_observer(source, &progress::SilentObserver)
+    }
+
+    /// Collects the update inventory while reporting read-only provider activity.
+    /// These events are presentation-only; the inventory remains the same typed
+    /// report returned by [`Self::updates`].
+    pub fn updates_with_observer(
+        &self,
+        source: Option<PackageSource>,
+        observer: &dyn progress::ProgressObserver,
+    ) -> UpdateInventoryReport {
         let mut inventories = Vec::new();
         let mut issues = Vec::new();
         let providers = self.selected_maintenance(source);
         std::thread::scope(|scope| {
-            let handles = providers
-                .into_iter()
-                .map(|provider| {
-                    scope.spawn(move || (provider.source(), provider.update_inventory()))
-                })
-                .collect::<Vec<_>>();
-            for handle in handles {
-                let (source, result) = handle.join().expect("provider update thread panicked");
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            for provider in providers {
+                let provider_source = provider.source();
+                observer.on_event(&progress::OperationEvent::ProviderStarted {
+                    source: provider_source,
+                });
+                let result_tx = result_tx.clone();
+                scope.spawn(move || {
+                    let result = provider.update_inventory();
+                    let _ = result_tx.send((provider_source, result));
+                });
+            }
+            drop(result_tx);
+            for (source, result) in result_rx {
+                let inventory = match &result {
+                    Ok(inventory) => inventory.clone(),
+                    Err(_) => maintenance::ProviderUpdateInventory {
+                        source,
+                        available: false,
+                        candidates: Vec::new(),
+                        notes: vec![
+                            "Provider could not answer this read-only inventory query.".into(),
+                        ],
+                        metadata_state: None,
+                    },
+                };
+                observer.on_event(&progress::OperationEvent::ProviderInventory { inventory });
+                observer.on_event(&progress::OperationEvent::ProviderFinished {
+                    source,
+                    success: result.is_ok(),
+                });
                 match result {
                     Ok(inventory) => inventories.push(inventory),
                     Err(error) => {
@@ -394,6 +456,8 @@ impl ProviderRegistry {
                 }
             }
         });
+        inventories.sort_by_key(|inventory| inventory.source);
+        issues.sort_by_key(|provider_issue| provider_issue.source);
         aggregate_inventory(inventories, issues)
     }
 
@@ -523,11 +587,51 @@ impl ProviderRegistry {
             .iter()
             .find(|provider| provider.source() == plan.source)
             .ok_or_else(|| format!("{} is unavailable", plan.source))?;
+
+        // Some developer ecosystems do not maintain a separate local catalog.
+        // Their refresh plan is an explicit, successful no-op so the live view
+        // can report that source without inventing a provider command.
+        if plan.action == MaintenanceAction::Refresh && !plan.mutates {
+            observer.on_event(&progress::OperationEvent::ProviderStarted { source: plan.source });
+            observer.on_event(&progress::OperationEvent::StageChanged {
+                stage: progress::ExecutionStage::Preparing,
+            });
+            observer.on_event(&progress::OperationEvent::StageChanged {
+                stage: progress::ExecutionStage::Verifying,
+            });
+            observer.on_event(&progress::OperationEvent::StageChanged {
+                stage: progress::ExecutionStage::SavingResult,
+            });
+            observer.on_event(&progress::OperationEvent::Finished {
+                stage: progress::ExecutionStage::Completed,
+                message: None,
+                operation_id: plan.operation_id.clone(),
+            });
+            observer.on_event(&progress::OperationEvent::ProviderFinished {
+                source: plan.source,
+                success: true,
+            });
+            return Ok(MaintenanceResult {
+                operation_id: plan.operation_id.clone(),
+                action: plan.action,
+                status: maintenance::MaintenanceStatus::Succeeded,
+                providers: vec![maintenance::MaintenanceProviderResult {
+                    source: plan.source,
+                    action: plan.action,
+                    status: maintenance::MaintenanceProviderStatus::Succeeded,
+                    candidate_count: 0,
+                    verification: Some(transaction::VerificationResult::Verified),
+                    message: plan.notes.first().cloned(),
+                }],
+            });
+        }
         let operation = provider.maintenance_operation(plan).map_err(|error| error.to_string())?;
         let operation = match operation {
             transaction::ProviderOperation::Maintenance { operation } => operation,
             _ => return Err("provider returned a non-maintenance operation".into()),
         };
+
+        observer.on_event(&progress::OperationEvent::ProviderStarted { source: plan.source });
 
         observer.on_event(&progress::OperationEvent::StageChanged {
             stage: progress::ExecutionStage::Preparing,
@@ -543,13 +647,20 @@ impl ProviderRegistry {
             stage: progress::ExecutionStage::Executing,
         });
 
-        let output = executor
-            .execute_with_observer(
-                &transaction::ProviderOperation::Maintenance { operation },
-                plan.privilege,
-                observer,
-            )
-            .map_err(|error| error.to_string())?;
+        let output = match executor.execute_with_observer(
+            &transaction::ProviderOperation::Maintenance { operation },
+            plan.privilege,
+            observer,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                observer.on_event(&progress::OperationEvent::ProviderFinished {
+                    source: plan.source,
+                    success: false,
+                });
+                return Err(error.to_string());
+            }
+        };
         if !output.success() {
             let msg = transaction::safe_process_message(&output);
             observer.on_event(&progress::OperationEvent::StageChanged {
@@ -559,6 +670,10 @@ impl ProviderRegistry {
                 stage: progress::ExecutionStage::Failed,
                 message: msg.clone(),
                 operation_id: plan.operation_id.clone(),
+            });
+            observer.on_event(&progress::OperationEvent::ProviderFinished {
+                source: plan.source,
+                success: false,
             });
             return Ok(MaintenanceResult {
                 operation_id: plan.operation_id.clone(),
@@ -579,7 +694,24 @@ impl ProviderRegistry {
             stage: progress::ExecutionStage::Verifying,
         });
 
-        let verification = provider.verify_maintenance(plan).map_err(|error| error.to_string())?;
+        let verification = match provider.verify_maintenance(plan) {
+            Ok(verification) => verification,
+            Err(error) => {
+                observer.on_event(&progress::OperationEvent::StageChanged {
+                    stage: progress::ExecutionStage::SavingResult,
+                });
+                observer.on_event(&progress::OperationEvent::Finished {
+                    stage: progress::ExecutionStage::Failed,
+                    message: Some(error.to_string()),
+                    operation_id: plan.operation_id.clone(),
+                });
+                observer.on_event(&progress::OperationEvent::ProviderFinished {
+                    source: plan.source,
+                    success: false,
+                });
+                return Err(error.to_string());
+            }
+        };
         let provider_status = match verification {
             transaction::VerificationResult::Verified => {
                 maintenance::MaintenanceProviderStatus::Succeeded
@@ -614,6 +746,10 @@ impl ProviderRegistry {
             stage: final_stage,
             message: None,
             operation_id: plan.operation_id.clone(),
+        });
+        observer.on_event(&progress::OperationEvent::ProviderFinished {
+            source: plan.source,
+            success: status != maintenance::MaintenanceStatus::Failed,
         });
 
         Ok(MaintenanceResult {
@@ -1038,6 +1174,7 @@ mod tests {
 
     struct StageRecorder {
         stages: std::sync::Mutex<Vec<crate::progress::ExecutionStage>>,
+        providers: std::sync::Mutex<Vec<(PackageSource, bool)>>,
     }
 
     impl crate::progress::ProgressObserver for StageRecorder {
@@ -1048,6 +1185,12 @@ mod tests {
                 }
                 crate::progress::OperationEvent::Finished { stage, .. } => {
                     self.stages.lock().unwrap().push(*stage);
+                }
+                crate::progress::OperationEvent::ProviderStarted { source } => {
+                    self.providers.lock().unwrap().push((*source, false));
+                }
+                crate::progress::OperationEvent::ProviderFinished { source, success } => {
+                    self.providers.lock().unwrap().push((*source, *success));
                 }
                 _ => {}
             }
@@ -1069,7 +1212,10 @@ mod tests {
         let history = crate::transaction::history::HistoryStore::at(&directory);
         let start_record = history.record_path(&plan.operation_id);
 
-        let recorder = Arc::new(StageRecorder { stages: std::sync::Mutex::new(Vec::new()) });
+        let recorder = Arc::new(StageRecorder {
+            stages: std::sync::Mutex::new(Vec::new()),
+            providers: std::sync::Mutex::new(Vec::new()),
+        });
 
         let result = registry
             .execute_transaction_with_progress(
@@ -1081,6 +1227,10 @@ mod tests {
             )
             .expect("execution");
         assert_eq!(result.status, crate::transaction::TransactionStatus::Succeeded);
+        assert_eq!(
+            *recorder.providers.lock().unwrap(),
+            vec![(PackageSource::Apt, false), (PackageSource::Apt, true)]
+        );
 
         let recorded = recorder.stages.lock().unwrap().clone();
         assert_eq!(
@@ -1108,6 +1258,108 @@ mod tests {
     }
 
     #[test]
+    fn update_inventory_reports_each_provider_as_it_finishes() {
+        struct EmptyRunner;
+        impl CommandRunner for EmptyRunner {
+            fn is_available(&self, _program: &str) -> bool {
+                true
+            }
+
+            fn run(&self, _command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), status: Some(0) })
+            }
+        }
+
+        struct EventRecorder(std::sync::Mutex<Vec<crate::progress::OperationEvent>>);
+        impl crate::progress::ProgressObserver for EventRecorder {
+            fn on_event(&self, event: &crate::progress::OperationEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let registry = ProviderRegistry::with_runner(EmptyRunner);
+        let recorder = EventRecorder(std::sync::Mutex::new(Vec::new()));
+        let _ = registry.updates_with_observer(None, &recorder);
+        let events = recorder.0.lock().unwrap();
+        let started = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::progress::OperationEvent::ProviderStarted { source } => Some(*source),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let finished = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::progress::OperationEvent::ProviderFinished { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let inventories = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::progress::OperationEvent::ProviderInventory { inventory } => {
+                    Some(inventory.source)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!started.is_empty());
+        assert_eq!(source_set(started.clone()), source_set(finished));
+        assert_eq!(source_set(started), source_set(inventories));
+    }
+
+    #[test]
+    fn metadata_only_refresh_completes_without_inventing_a_command() {
+        struct AvailableRunner;
+        impl CommandRunner for AvailableRunner {
+            fn is_available(&self, _program: &str) -> bool {
+                true
+            }
+
+            fn run(&self, _command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), status: Some(0) })
+            }
+        }
+
+        let registry = ProviderRegistry::with_runner(AvailableRunner);
+        let plan = registry
+            .maintenance_plan(MaintenanceAction::Refresh, Some(PackageSource::Cargo))
+            .expect("developer refresh plan");
+        let recorder = StageRecorder {
+            stages: std::sync::Mutex::new(Vec::new()),
+            providers: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = registry
+            .execute_maintenance_with_progress(
+                &plan.providers[0],
+                &FakeOperationExecutor {
+                    runner: Arc::new(TransactionFakeRunner::new()),
+                    start_record: None,
+                    fail: false,
+                },
+                &recorder,
+            )
+            .expect("metadata-only refresh succeeds");
+
+        assert_eq!(result.status, maintenance::MaintenanceStatus::Succeeded);
+        assert_eq!(result.providers[0].verification, Some(VerificationResult::Verified));
+        assert_eq!(
+            *recorder.providers.lock().unwrap(),
+            vec![(PackageSource::Cargo, false), (PackageSource::Cargo, true)]
+        );
+        assert_eq!(
+            *recorder.stages.lock().unwrap(),
+            vec![
+                progress::ExecutionStage::Preparing,
+                progress::ExecutionStage::Verifying,
+                progress::ExecutionStage::SavingResult,
+                progress::ExecutionStage::Completed,
+            ]
+        );
+    }
+
+    #[test]
     fn transaction_failure_progress_stages_are_strictly_monotonic() {
         let runner = Arc::new(TransactionFakeRunner::new());
         let registry = ProviderRegistry::with_runner(runner.clone());
@@ -1122,7 +1374,10 @@ mod tests {
         let history = crate::transaction::history::HistoryStore::at(&directory);
         let path = history.record_path(&plan.operation_id);
 
-        let recorder = Arc::new(StageRecorder { stages: std::sync::Mutex::new(Vec::new()) });
+        let recorder = Arc::new(StageRecorder {
+            stages: std::sync::Mutex::new(Vec::new()),
+            providers: std::sync::Mutex::new(Vec::new()),
+        });
 
         let result = registry.execute_transaction_with_progress(
             &request,
@@ -1132,6 +1387,10 @@ mod tests {
             recorder.as_ref(),
         );
         assert!(result.is_err());
+        assert_eq!(
+            *recorder.providers.lock().unwrap(),
+            vec![(PackageSource::Apt, false), (PackageSource::Apt, false)]
+        );
 
         let recorded = recorder.stages.lock().unwrap().clone();
         assert_eq!(

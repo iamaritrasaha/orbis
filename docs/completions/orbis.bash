@@ -4,7 +4,7 @@ _orbis() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="dashboard ui sources search info explain doctor install remove update updates upgrade clean history why help"
+    local commands="dashboard ui find show install remove update refresh clean history health sources search info explain doctor updates upgrade why help"
     local global_options="--json --no-color --plain --help --version"
     if (( cword == 1 )); then
         COMPREPLY=( $(compgen -W "${commands} ${global_options}" -- "${cur}") )
@@ -12,7 +12,7 @@ _orbis() {
     fi
 
     case "${words[1]}" in
-        search)
+        find|search)
             COMPREPLY=( $(compgen -W "--source --json --no-color --plain --help" -- "${cur}") )
             ;;
         info|explain|why)
@@ -21,10 +21,13 @@ _orbis() {
         install|remove)
             COMPREPLY=( $(compgen -W "--source --scope --plan --dry-run --yes --json --no-color --plain --help" -- "${cur}") )
             ;;
-        update|upgrade|clean)
+        update)
+            COMPREPLY=( $(compgen -W "--source --plan --apply --yes --json --no-color --plain --help" -- "${cur}") )
+            ;;
+        refresh|upgrade|clean)
             COMPREPLY=( $(compgen -W "--source --plan --yes --json --no-color --plain --help" -- "${cur}") )
             ;;
-        updates|sources|doctor|dashboard|ui)
+        updates|sources|doctor|health|dashboard|ui)
             COMPREPLY=( $(compgen -W "--json --no-color --plain --help" -- "${cur}") )
             ;;
         history)

@@ -6,9 +6,9 @@ orbis \- your Linux software, in one place
 .RI [ OPTIONS ]
 .RI [ COMMAND ]
 .SH DESCRIPTION
-Orbis is a Linux-first, provider-neutral interface for discovering software, explaining package metadata, reviewing transaction plans, and carrying out carefully confirmed package operations.
+Orbis is a beginner-friendly Linux interface for finding, understanding, updating, and safely managing software. It keeps provider-specific details available for advanced users while using natural language in the normal interface.
 .PP
-This is an early public Beta release. Orbis is safety-first but still evolving. Review every transaction plan before allowing package state to change.
+The public Beta 1 release is safety-first and still evolving. Review every plan before allowing package state to change.
 .SH OPTIONS
 .TP
 .B --json
@@ -18,63 +18,80 @@ Emit structured JSON instead of terminal presentation.
 Disable ANSI styling.
 .TP
 .B --plain
-Force the traditional terminal presentation.
+Use deterministic plain output instead of the full-screen TUI.
 .TP
 .B -h, --help
 Print help.
 .TP
 .B -V, --version
 Print the Orbis version.
-.SH COMMANDS
+.SH COMMON COMMANDS
 .TP
-.B dashboard
-Launch the interactive dashboard. \fBui\fR is an alias.
+.B find \fIQUERY\fR
+Find software across supported systems.
 .TP
-.B sources
-Show detected providers and read-only capabilities.
-.TP
-.B search \fIQUERY\fR
-Search available providers.
-.TP
-.B info \fIPACKAGE\fR
-Show normalized package metadata.
-.TP
-.B explain \fIPACKAGE\fR
-Explain a package in plain language.
-.TP
-.B doctor
-Run safe provider and environment diagnostics.
+.B show \fIPACKAGE\fR
+Learn what software does, whether it is installed, and where it came from.
 .TP
 .B install \fIPACKAGE\fR
-Plan and, after confirmation, install one exact package.
+Review and install one exact piece of software.
 .TP
 .B remove \fIPACKAGE\fR
-Plan and, after confirmation, remove one exact package without purge or autoremove.
+Review and remove one exact piece of software without purge or autoremove.
 .TP
 .B update
-Refresh package catalogs without upgrading installed software.
+Check for available software updates. Read-only by default.
 .TP
-.B updates
-Show installed software with updates available. Read-only.
-.TP
-.B upgrade
-Plan and, after confirmation, apply safe available updates.
+.B refresh
+Refresh software information without upgrading installed software.
 .TP
 .B clean
-Plan and, after confirmation, remove confidently unused package-manager artifacts.
+Review confidently unused software items for safe cleanup.
 .TP
 .B history
-Read sanitized Orbis transaction and maintenance history.
+Read previous Orbis operations.
+.TP
+.B health
+Check that software systems are working.
+.SH UPDATE OPTIONS
+.TP
+.B update --plan
+Build and show a read-only plan for applying available updates.
+.TP
+.B update --apply
+Review, confirm, execute, verify, and record available updates.
+.TP
+.B update --yes
+Apply the exact reviewed update plan without a second confirmation prompt.
+.TP
+.B refresh --plan
+Show refresh work without changing software information.
+.TP
+.B upgrade
+Compatibility command for applying a reviewed update plan.
+.SH ADVANCED COMMANDS
+.TP
+.B sources
+Inspect exact software systems, backends, capabilities, and limitations.
 .TP
 .B why \fIPACKAGE\fR
-Explain why one installed package or ref is present.
+Inspect evidence for why an installed package is present.
+.TP
+.B search, info, explain, updates, doctor
+Compatibility spellings for existing scripts and advanced workflows.
 .SH SAFETY
 .B --plan
 and
 .B --dry-run
 stop before execution. Without
 .B --yes,
-an actual operation requires an interactive terminal and an explicit confirmation. Administrator authorization is requested only for the exact system-scoped operation that has been reviewed.
+an actual mutating operation requires an interactive terminal and explicit confirmation. Ambiguous software names are never silently selected; use an interactive source chooser or provide
+.B --source
+or a qualified reference. Administrator authorization is requested only for the exact reviewed system operation.
+.PP
+Interactive operations show real lifecycle and provider activity in a bounded details view. They do not invent percentages. Piped, non-TTY, JSON, and
+.B --plain
+output remains deterministic and contains no terminal control sequences.
 .SH FILES
 .TP
 .I $XDG_STATE_HOME/orbis/transactions/

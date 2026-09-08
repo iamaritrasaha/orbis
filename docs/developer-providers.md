@@ -24,4 +24,4 @@ uv uses `uv tool list --outdated` and exact `uv tool upgrade` operations. uv its
 
 pipx uses its structured installed snapshot and `--skip-maintenance` for exact operations where supported. This prevents unrelated shared-library maintenance during an Orbis single-package transaction. Pinned applications are shown as held and are never silently upgraded. Existing recorded pipx backends are preserved.
 
-`orbis clean` remains conservative. It does not run `cargo clean`, `npm cache clean --force`, `pnpm store prune`, `uv cache clean`, or `pipx cache purge`; cache management is a separate future feature. `orbis update` reports that these registries are queried live rather than inventing a catalog mutation.
+`orbis clean` remains conservative. It does not run `cargo clean`, `npm cache clean --force`, `pnpm store prune`, `uv cache clean`, or `pipx cache purge`; cache management is a separate future feature. `orbis update` reports that these registries are queried live rather than inventing a catalog mutation. Use `orbis refresh` when the goal is to refresh software information.
