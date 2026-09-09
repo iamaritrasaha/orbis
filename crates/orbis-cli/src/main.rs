@@ -26,8 +26,10 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
-    let color =
-        !cli.no_color && io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let color = !cli.plain
+        && !cli.no_color
+        && io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none();
     let renderer = Renderer::new(color);
     let registry = ProviderRegistry::system();
 

@@ -81,6 +81,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             TransactionOptions {
                 action: OperationAction::Install,
                 package,
@@ -95,6 +96,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             TransactionOptions {
                 action: OperationAction::Remove,
                 package,
@@ -110,6 +112,7 @@ pub(crate) fn dispatch(
                 registry,
                 renderer,
                 cli.json,
+                cli.plain,
                 MaintenanceOptions {
                     action: MaintenanceAction::Upgrade,
                     source: source.map(Into::into),
@@ -135,6 +138,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Refresh,
                 source: source.map(Into::into),
@@ -146,6 +150,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Upgrade,
                 source: source.map(Into::into),
@@ -157,6 +162,7 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
+            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Cleanup,
                 source: source.map(Into::into),
@@ -414,6 +420,7 @@ fn run_transaction(
     registry: &ProviderRegistry,
     renderer: &Renderer,
     json: bool,
+    preserve_raw_output: bool,
     options: TransactionOptions,
 ) -> Result<(), String> {
     let package_ref = match resolve_mutation_reference(
@@ -495,12 +502,15 @@ fn run_transaction(
                 privileged: plan.privilege
                     == orbis_core::transaction::PrivilegeRequirement::Administrator,
             };
-            let progress = crate::render::progress::PlainProgressRenderer::new(
+            let progress = crate::render::progress::PlainProgressRenderer::new_with_output_policy(
+                // Interactive output is interpreted and transient; --plain
+                // explicitly opts into sequential raw provider lines.
                 renderer.theme,
                 header,
                 orbis_core::progress::ExecutionStage::transaction_stages(),
-                io::stderr().is_terminal(),
+                io::stderr().is_terminal() && !preserve_raw_output,
                 8,
+                preserve_raw_output,
             );
             progress.print_header();
             registry
@@ -570,6 +580,7 @@ fn run_maintenance(
     registry: &ProviderRegistry,
     renderer: &Renderer,
     json: bool,
+    preserve_raw_output: bool,
     options: MaintenanceOptions,
 ) -> Result<(), String> {
     let plan = registry.maintenance_plan(options.action, options.source)?;
@@ -650,13 +661,15 @@ fn run_maintenance(
                 privileged: provider_plan.privilege
                     == orbis_core::transaction::PrivilegeRequirement::Administrator,
             };
-            let progress = crate::render::progress::PlainProgressRenderer::new(
-                renderer.theme,
-                header,
-                orbis_core::progress::ExecutionStage::maintenance_stages(),
-                io::stderr().is_terminal(),
-                8,
-            );
+            let progress =
+                crate::render::progress::PlainProgressRenderer::new_refresh_with_output_policy(
+                    renderer.theme,
+                    header,
+                    orbis_core::progress::ExecutionStage::maintenance_stages(),
+                    io::stderr().is_terminal() && !preserve_raw_output,
+                    8,
+                    preserve_raw_output,
+                );
             progress.print_header();
             registry.execute_maintenance_with_progress(provider_plan, &executor, &progress)
         };
@@ -681,6 +694,7 @@ fn run_maintenance(
         status: maintenance_status(&providers),
         providers,
     };
+    let result_plans = plan.providers.clone();
     if let Some(history) = history {
         history
             .write_maintenance(
@@ -695,7 +709,7 @@ fn run_maintenance(
     if json {
         print_json(&result)
     } else {
-        print!("{}", renderer.maintenance_result(&result));
+        print!("{}", renderer.maintenance_result(&result, &result_plans));
         Ok(())
     }
 }

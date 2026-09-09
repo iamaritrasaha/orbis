@@ -3,7 +3,7 @@ members = ["crates/orbis-core", "crates/orbis-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-beta.1.dev.4"
+version = "0.1.0-beta.1.dev.5"
 edition = "2024"
 rust-version = "1.88"
 license-file = "LICENSE"
@@ -24,7 +24,7 @@ thiserror = "2.0"
 wait-timeout = "0.2"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
-orbis-core = { path = "crates/orbis-core", version = "0.1.0-beta.1.dev.4" }
+orbis-core = { path = "crates/orbis-core", version = "0.1.0-beta.1.dev.5" }
 
 # The profile that 'dist' will build with
 [profile.dist]

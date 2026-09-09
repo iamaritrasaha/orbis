@@ -3,8 +3,8 @@ use orbis_core::{
     SearchReport,
     diagnostics::DoctorReport,
     maintenance::{
-        MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult, MaintenanceStatus,
-        UpdateInventoryReport, WhyReport,
+        MaintenancePlan, MaintenanceProviderResult, MaintenanceProviderStatus, MaintenanceResult,
+        MaintenanceStatus, ProviderMaintenancePlan, UpdateInventoryReport, WhyReport,
     },
     models::{Package, PackageSource, SourceInfo},
     transaction::{OperationPlan, TransactionResult, TransactionStatus, VerificationResult},
@@ -429,12 +429,23 @@ impl Renderer {
                 ));
             }
             if provider.candidates.is_empty() {
-                output.push_str(match plan.action {
+                let explanation = match plan.action {
+                    orbis_core::maintenance::MaintenanceAction::Refresh if !provider.mutates => {
+                        match provider.source {
+                            PackageSource::Snap => {
+                                "  Managed automatically.\n  snapd handles store refresh awareness.\n"
+                            }
+                            _ => {
+                                "  No refresh needed.\n  Provider metadata is queried on demand.\n"
+                            }
+                        }
+                    }
                     orbis_core::maintenance::MaintenanceAction::Refresh => {
                         "  Software information will be refreshed.\n"
                     }
                     _ => "  No changes reported.\n",
-                });
+                };
+                output.push_str(explanation);
             }
             for warning in &provider.warnings {
                 output.push_str(&format!(
@@ -452,7 +463,11 @@ impl Renderer {
         output
     }
 
-    pub(crate) fn maintenance_result(&self, result: &MaintenanceResult) -> String {
+    pub(crate) fn maintenance_result(
+        &self,
+        result: &MaintenanceResult,
+        plans: &[ProviderMaintenancePlan],
+    ) -> String {
         let title = match result.status {
             MaintenanceStatus::Succeeded => "Completed",
             MaintenanceStatus::PartiallySucceeded => "Partially completed",
@@ -462,7 +477,47 @@ impl Renderer {
         };
         let mut output =
             self.heading(title, &format!("{} across available sources", result.action.label()));
+        let mut occurrences = std::collections::BTreeMap::new();
         for provider in &result.providers {
+            let occurrence = occurrences.entry(provider.source).or_insert(0);
+            let matching_plan =
+                plans.iter().filter(|plan| plan.source == provider.source).nth(*occurrence);
+            *occurrence += 1;
+
+            if result.action == orbis_core::maintenance::MaintenanceAction::Refresh {
+                let has_duplicate_scope = result
+                    .providers
+                    .iter()
+                    .filter(|candidate| candidate.source == provider.source)
+                    .count()
+                    > 1;
+                let source_label = if provider.source == PackageSource::Flatpak {
+                    matching_plan
+                        .and_then(|plan| plan.scope)
+                        .map(|scope| {
+                            format!("{} · {}", friendly_source(provider.source), scope.label())
+                        })
+                        .or_else(|| {
+                            has_duplicate_scope.then(|| {
+                                format!("{} · scope not reported", friendly_source(provider.source))
+                            })
+                        })
+                        .unwrap_or_else(|| friendly_source(provider.source).to_string())
+                } else {
+                    friendly_source(provider.source).to_string()
+                };
+                let outcome = refresh_outcome(provider);
+                output.push_str(&format!("  {source_label}\n    {outcome}\n"));
+                if let Some(explanation) =
+                    refresh_explanation(provider.source, provider.status.clone())
+                {
+                    output.push_str(&format!("    {explanation}\n"));
+                } else if let Some(message) = &provider.message {
+                    output.push_str(&format!("    {message}\n"));
+                }
+                continue;
+            }
+
             let status = match provider.status {
                 MaintenanceProviderStatus::Succeeded => "succeeded",
                 MaintenanceProviderStatus::PartiallySucceeded => "partially succeeded",
@@ -706,6 +761,42 @@ fn friendly_source(source: PackageSource) -> &'static str {
     }
 }
 
+fn refresh_outcome(provider: &MaintenanceProviderResult) -> &'static str {
+    match provider.status {
+        MaintenanceProviderStatus::Failed => "failed",
+        MaintenanceProviderStatus::Skipped | MaintenanceProviderStatus::Blocked => "unavailable",
+        MaintenanceProviderStatus::PartiallySucceeded => "partially refreshed",
+        MaintenanceProviderStatus::Succeeded => match provider.source {
+            PackageSource::Cargo
+            | PackageSource::Npm
+            | PackageSource::Pnpm
+            | PackageSource::Uv
+            | PackageSource::Pipx => "no refresh needed",
+            PackageSource::Snap => "managed automatically",
+            PackageSource::Apt | PackageSource::Flatpak => "refreshed",
+        },
+    }
+}
+
+fn refresh_explanation(
+    source: PackageSource,
+    status: MaintenanceProviderStatus,
+) -> Option<&'static str> {
+    if status != MaintenanceProviderStatus::Succeeded {
+        return None;
+    }
+    match source {
+        PackageSource::Cargo => Some("Cargo metadata is queried live."),
+        PackageSource::Npm | PackageSource::Pnpm => {
+            Some("Package registry metadata is queried live.")
+        }
+        PackageSource::Uv => Some("uv tool metadata is resolved on demand."),
+        PackageSource::Pipx => Some("pipx package metadata is resolved on demand."),
+        PackageSource::Snap => Some("snapd handles store refresh awareness."),
+        PackageSource::Apt | PackageSource::Flatpak => None,
+    }
+}
+
 fn friendly_area(area: &str) -> &'static str {
     match area {
         "APT" => friendly_source(PackageSource::Apt),
@@ -748,9 +839,13 @@ mod tests {
     use super::*;
     use orbis_core::{
         diagnostics::{DiagnosticCheck, DoctorReport},
-        maintenance::{MaintenanceAction, MaintenancePlan, WhyReport},
+        maintenance::{
+            MaintenanceAction, MaintenancePlan, MaintenanceProviderResult,
+            MaintenanceProviderStatus, MaintenanceResult, MaintenanceStatus,
+            ProviderMaintenancePlan, WhyReport,
+        },
         models::{PackageKind, ProviderCapabilities, ProviderIssue},
-        transaction::{OperationAction, OperationPlan},
+        transaction::{InstallScope, OperationAction, OperationPlan},
     };
     use std::collections::BTreeMap;
 
@@ -891,6 +986,68 @@ mod tests {
         assert!(output.contains("Snap Store"));
         assert!(output.contains("Orbis will not choose for you"));
         assert!(output.contains("--source"));
+    }
+
+    #[test]
+    fn refresh_results_use_semantic_states_and_flatpak_scopes() {
+        let renderer = renderer();
+        let result = MaintenanceResult {
+            operation_id: "refresh-test".into(),
+            action: MaintenanceAction::Refresh,
+            status: MaintenanceStatus::Succeeded,
+            providers: vec![
+                MaintenanceProviderResult {
+                    source: PackageSource::Cargo,
+                    action: MaintenanceAction::Refresh,
+                    status: MaintenanceProviderStatus::Succeeded,
+                    candidate_count: 0,
+                    verification: None,
+                    message: None,
+                },
+                MaintenanceProviderResult {
+                    source: PackageSource::Flatpak,
+                    action: MaintenanceAction::Refresh,
+                    status: MaintenanceProviderStatus::Succeeded,
+                    candidate_count: 0,
+                    verification: None,
+                    message: None,
+                },
+                MaintenanceProviderResult {
+                    source: PackageSource::Flatpak,
+                    action: MaintenanceAction::Refresh,
+                    status: MaintenanceProviderStatus::Succeeded,
+                    candidate_count: 0,
+                    verification: None,
+                    message: None,
+                },
+            ],
+        };
+        let plan = |scope| ProviderMaintenancePlan {
+            operation_id: "refresh-plan".into(),
+            source: PackageSource::Flatpak,
+            action: MaintenanceAction::Refresh,
+            scope: Some(scope),
+            candidates: Vec::new(),
+            cleanup_candidates: Vec::new(),
+            privilege: orbis_core::transaction::PrivilegeRequirement::None,
+            completeness: orbis_core::transaction::PlanCompleteness::Complete,
+            confidence: orbis_core::transaction::PlanConfidence::High,
+            authoritative_simulation: false,
+            risk: orbis_core::transaction::RiskLevel::Normal,
+            supported: true,
+            mutates: false,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        };
+        let output = renderer
+            .maintenance_result(&result, &[plan(InstallScope::System), plan(InstallScope::User)]);
+        assert!(output.contains("Rust tools\n    no refresh needed"));
+        assert!(output.contains("Cargo metadata is queried live."));
+        assert!(output.contains("Flatpak apps · system"));
+        assert!(output.contains("Flatpak apps · user"));
+        assert!(!output.contains("0 changes"));
     }
 }
 fn installed_label(installed: Option<bool>) -> &'static str {
