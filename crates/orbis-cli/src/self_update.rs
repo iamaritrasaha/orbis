@@ -1013,7 +1013,7 @@ mod tests {
         assert!(!is_development_version(&beta1));
         assert!(parse_public_tag("v0.1.0-beta.2").is_some());
         assert!(parse_public_tag("vnot-semver").is_none());
-        assert!(parse_public_tag("v0.1.0-beta.1.dev.9").is_none());
+        assert!(parse_public_tag("v0.1.0-beta.1.dev.10").is_none());
     }
 
     #[test]

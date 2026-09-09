@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use super::region::{clear_owned_frame, write_owned_frame};
+use super::region::TransientRegion;
 
 #[derive(Clone)]
 struct MaintenanceRowMeta {
@@ -72,6 +72,7 @@ pub(crate) struct PlainProgressRenderer {
     output_lines: Mutex<VecDeque<String>>,
     spinner_started: AtomicBool,
     spinner_thread: Mutex<Option<JoinHandle<()>>>,
+    region: Option<TransientRegion>,
     is_tty: bool,
     animate: bool,
     max_output_lines: usize,
@@ -145,6 +146,8 @@ impl PlainProgressRenderer {
         let animate = is_tty
             && std::env::var_os("REDUCE_MOTION").is_none()
             && std::env::var("TERM").map(|term| term != "dumb").unwrap_or(true);
+        let region =
+            is_tty.then(|| TransientRegion::new(progress_region_height(&mode, max_output_lines)));
         Self {
             theme,
             mode,
@@ -163,6 +166,7 @@ impl PlainProgressRenderer {
             output_lines: Mutex::new(VecDeque::new()),
             spinner_started: AtomicBool::new(false),
             spinner_thread: Mutex::new(None),
+            region,
             is_tty,
             animate,
             max_output_lines,
@@ -172,7 +176,15 @@ impl PlainProgressRenderer {
 
     pub(crate) fn print_header(&self) {
         if self.is_tty {
-            self.redraw();
+            let _guard = output_lock();
+            let mut stderr = io::stderr();
+            if let Some(region) = self.region {
+                let _ = region.reserve(&mut stderr);
+                if let Ok(mut state) = self.state.lock() {
+                    draw_tty_to_region(&mut stderr, self.theme, &self.mode, region, &mut state);
+                }
+                let _ = stderr.flush();
+            }
             let has_active_animation = match &self.mode {
                 RenderMode::Standard { .. } => true,
                 RenderMode::Maintenance { rows } => {
@@ -192,6 +204,7 @@ impl PlainProgressRenderer {
         let state = Arc::clone(&self.state);
         let theme = self.theme;
         let mode = self.mode.clone();
+        let Some(region) = self.region else { return };
         let handle = thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_millis(100));
@@ -214,7 +227,7 @@ impl PlainProgressRenderer {
                 if !still_running {
                     break;
                 }
-                draw_tty(theme, &mode, &state);
+                draw_tty(theme, &mode, region, &state);
             }
         });
         *self.spinner_thread.lock().expect("spinner thread lock poisoned") = Some(handle);
@@ -225,7 +238,9 @@ impl PlainProgressRenderer {
             return;
         }
         let _guard = output_lock();
-        draw_tty(self.theme, &self.mode, &self.state);
+        if let Some(region) = self.region {
+            draw_tty(self.theme, &self.mode, region, &self.state);
+        }
     }
 
     fn finish_standard(&self, stage: ExecutionStage) {
@@ -237,12 +252,8 @@ impl PlainProgressRenderer {
             state.running = false;
         }
         self.output_lines.lock().expect("output lines lock poisoned").clear();
-        if self.is_tty {
-            let _guard = output_lock();
-            draw_tty(self.theme, &self.mode, &self.state);
-            drop(_guard);
-        }
         self.join_spinner();
+        self.commit_tty_frame();
     }
 
     pub(crate) fn finish_maintenance(&self, result: &MaintenanceResult) {
@@ -256,12 +267,8 @@ impl PlainProgressRenderer {
             state.final_summary = Some(maintenance_summary(&state.provider_states));
             state.running = false;
         }
-        if self.is_tty {
-            let _guard = output_lock();
-            draw_tty(self.theme, &self.mode, &self.state);
-            drop(_guard);
-        }
         self.join_spinner();
+        self.commit_tty_frame();
     }
 
     pub(crate) fn mark_provider_failure(&self, source: PackageSource) {
@@ -297,6 +304,21 @@ impl PlainProgressRenderer {
             let _ = handle.join();
         }
     }
+
+    fn commit_tty_frame(&self) {
+        if !self.is_tty {
+            return;
+        }
+        let Some(region) = self.region else { return };
+        let _guard = output_lock();
+        let mut stderr = io::stderr();
+        if let Ok(mut state) = self.state.lock() {
+            let meaningful_height =
+                draw_tty_to_region(&mut stderr, self.theme, &self.mode, region, &mut state);
+            let _ = region.commit(&mut stderr, meaningful_height);
+            let _ = stderr.flush();
+        }
+    }
 }
 
 impl Drop for PlainProgressRenderer {
@@ -308,15 +330,15 @@ impl Drop for PlainProgressRenderer {
         } else {
             false
         };
+        self.join_spinner();
         if self.is_tty && was_running {
             let _guard = output_lock();
             let mut stderr = io::stderr();
-            if let Ok(mut state) = self.state.lock() {
-                clear_owned_frame(&mut stderr, state.rendered_line_count);
-                state.rendered_line_count = 0;
+            if let Some(region) = self.region {
+                let _ = region.clear_and_finish(&mut stderr);
+                let _ = stderr.flush();
             }
         }
-        self.join_spinner();
     }
 }
 
@@ -548,12 +570,37 @@ fn output_lock() -> MutexGuard<'static, ()> {
     OUTPUT_LOCK.get_or_init(|| Mutex::new(())).lock().expect("output lock poisoned")
 }
 
-fn draw_tty(theme: Theme, mode: &RenderMode, state: &Arc<Mutex<ProgressState>>) {
+fn draw_tty(
+    theme: Theme,
+    mode: &RenderMode,
+    region: TransientRegion,
+    state: &Arc<Mutex<ProgressState>>,
+) {
     let mut stderr = io::stderr();
     let Ok(mut state) = state.lock() else { return };
-    draw_tty_to(&mut stderr, theme, mode, &mut state);
+    draw_tty_to_region(&mut stderr, theme, mode, region, &mut state);
 }
 
+fn draw_tty_to_region<W: Write>(
+    writer: &mut W,
+    theme: Theme,
+    mode: &RenderMode,
+    region: TransientRegion,
+    state: &mut ProgressState,
+) -> usize {
+    let frame = match mode {
+        RenderMode::Standard { header, stages, refresh } => {
+            standard_frame_lines(theme, header.privileged, stages, *refresh, state)
+        }
+        RenderMode::Maintenance { rows } => maintenance_frame_lines(theme, rows, state),
+    };
+    let meaningful_height = frame.len();
+    let _ = region.render(writer, &frame);
+    state.rendered_line_count = meaningful_height;
+    meaningful_height
+}
+
+#[cfg(test)]
 fn draw_tty_to<W: Write>(
     writer: &mut W,
     theme: Theme,
@@ -566,7 +613,16 @@ fn draw_tty_to<W: Write>(
         }
         RenderMode::Maintenance { rows } => maintenance_frame_lines(theme, rows, state),
     };
-    state.rendered_line_count = write_owned_frame(writer, state.rendered_line_count, &frame);
+    let region = TransientRegion::new(state.rendered_line_count.max(frame.len()));
+    let _ = region.render(writer, &frame);
+    state.rendered_line_count = frame.len();
+}
+
+fn progress_region_height(mode: &RenderMode, max_output_lines: usize) -> usize {
+    match mode {
+        RenderMode::Standard { stages, .. } => stages.len() + max_output_lines + 1,
+        RenderMode::Maintenance { rows } => rows.len() + max_output_lines + 3,
+    }
 }
 
 fn standard_frame_lines(
@@ -1079,6 +1135,14 @@ mod tests {
         assert!(String::from_utf8_lossy(&capture).matches("\x1b[").count() >= 19);
         assert_eq!(visible.iter().filter(|line| line.contains("Preparing")).count(), 1);
         assert_eq!(visible.iter().filter(|line| line.contains("Finishing up")).count(), 1);
+    }
+
+    #[test]
+    fn tty_progress_reserves_one_fixed_region_for_redraws() {
+        let stages = ExecutionStage::transaction_stages();
+        let renderer =
+            PlainProgressRenderer::new(Theme::test(80), create_header(), stages, true, 8);
+        assert_eq!(renderer.region.expect("TTY region").height(), stages.len() + 8 + 1);
     }
 
     #[test]

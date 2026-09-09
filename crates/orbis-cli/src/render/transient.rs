@@ -100,7 +100,7 @@ pub(crate) fn reveal(theme: Theme, label: &str) {
     let _ = region.render(&mut stdout, collapse.lines());
     let _ = stdout.flush();
     drop(raw_guard);
-    let _ = region.finish(&mut stdout);
+    let _ = region.clear_and_release_at_anchor(&mut stdout);
     let _ = stdout.flush();
 }
 
@@ -167,7 +167,7 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
         }
     })();
     drop(raw_guard);
-    region.finish(&mut stdout).map_err(|error| error.to_string())?;
+    region.clear_and_finish(&mut stdout).map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())?;
     let result = result?;
 

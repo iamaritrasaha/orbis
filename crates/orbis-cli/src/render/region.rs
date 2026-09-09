@@ -21,6 +21,11 @@ impl TransientRegion {
         Self { height }
     }
 
+    #[cfg(test)]
+    pub(crate) fn height(&self) -> usize {
+        self.height
+    }
+
     pub(crate) fn reserve<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let count = self.cursor_count()?;
         if count == 0 {
@@ -60,7 +65,56 @@ impl TransientRegion {
         execute!(writer, MoveUp(count - 1), MoveToColumn(0))
     }
 
-    pub(crate) fn finish<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    /// Clears the owned canvas and returns to its anchor for the next view.
+    ///
+    /// This is the transition operation: it deliberately does not advance
+    /// below the reserved canvas, so the next renderer can reuse the same
+    /// terminal position without leaving a blank gap in scrollback.
+    pub(crate) fn clear_and_release_at_anchor<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.clear_at_anchor(writer)
+    }
+
+    /// Preserves the meaningful part of the current frame and places the
+    /// cursor immediately below it.
+    ///
+    /// The region may be larger than the final frame because transient
+    /// activity needs bounded spare rows. Those spare rows are cleared before
+    /// the cursor is positioned below the committed frame.
+    pub(crate) fn commit<W: Write>(
+        &self,
+        writer: &mut W,
+        meaningful_height: usize,
+    ) -> io::Result<()> {
+        if meaningful_height > self.height {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "committed frame exceeds its reserved region",
+            ));
+        }
+        let count = self.cursor_count()?;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let unused = self.height - meaningful_height;
+        if unused == 0 {
+            execute!(writer, MoveDown(count), MoveToColumn(0))
+        } else {
+            execute!(writer, MoveDown(meaningful_height as u16))?;
+            for index in 0..unused {
+                execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+                if index + 1 < unused {
+                    execute!(writer, MoveDown(1))?;
+                }
+            }
+            execute!(writer, MoveUp((unused - 1) as u16), MoveToColumn(0))
+        }
+    }
+
+    /// Clears the owned canvas and leaves the cursor below its full reserved
+    /// height. This is used when a temporary UI is cancelled and no final
+    /// frame is being committed (for example, the launcher).
+    pub(crate) fn clear_and_finish<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let count = self.cursor_count()?;
         if count == 0 {
             return Ok(());
@@ -92,13 +146,8 @@ impl TransientRegion {
     }
 }
 
-/// Clears exactly the terminal lines most recently owned by a transient view.
-/// The cursor is expected to be at the region anchor and remains there.
-pub(crate) fn clear_owned_frame<W: Write>(writer: &mut W, line_count: usize) {
-    let _ = TransientRegion::new(line_count).clear_at_anchor(writer);
-}
-
 /// Replaces one owned transient frame without touching lines above it.
+#[cfg(test)]
 pub(crate) fn write_owned_frame<W: Write>(
     writer: &mut W,
     previous_line_count: usize,
@@ -194,6 +243,63 @@ mod tests {
         assert_eq!(screen.first().map(String::as_str), Some("final"));
         assert!(screen.iter().skip(1).all(|line| line.is_empty()), "screen: {screen:?}");
         assert!(output.ends_with(b"\x1b[3A\x1b[1G"));
+    }
+
+    #[test]
+    fn release_returns_to_anchor_without_a_blank_gap() {
+        let mut output = Cursor::new(Vec::new());
+        let region = TransientRegion::new(4);
+        region.reserve(&mut output).expect("reserve rows");
+        region
+            .render(&mut output, &frame(&["ORBIS", "identity", "signature", "tagline"]))
+            .expect("render identity");
+        region.clear_and_release_at_anchor(&mut output).expect("release identity region");
+        write!(output, "◈ ORBIS // REFRESH").expect("write replacement heading");
+
+        let screen = replay(&output.into_inner());
+        assert_eq!(screen.first().map(String::as_str), Some("◈ ORBIS // REFRESH"));
+        assert!(screen.iter().skip(1).all(|line| line.is_empty()), "screen: {screen:?}");
+    }
+
+    #[test]
+    fn commit_places_shell_prompt_below_meaningful_final_frame() {
+        let mut output = Cursor::new(Vec::new());
+        let region = TransientRegion::new(15);
+        region.reserve(&mut output).expect("reserve rows");
+        let final_frame = frame(&["Ubuntu repositories", "Flatpak · system", "summary"]);
+        region.render(&mut output, &final_frame).expect("render final frame");
+        region.commit(&mut output, final_frame.len()).expect("commit final frame");
+        write!(output, "SHELL_PROMPT").expect("write shell prompt");
+
+        let screen = replay(&output.into_inner());
+        assert_eq!(screen.first().map(String::as_str), Some("Ubuntu repositories"));
+        assert_eq!(screen.get(1).map(String::as_str), Some("Flatpak · system"));
+        assert_eq!(screen.get(2).map(String::as_str), Some("summary"));
+        assert_eq!(screen.get(3).map(String::as_str), Some("SHELL_PROMPT"));
+        assert!(screen.iter().skip(4).all(|line| line.is_empty()), "screen: {screen:?}");
+    }
+
+    #[test]
+    fn commit_clears_unused_reserved_rows_and_repeated_commands_do_not_overlap() {
+        let mut output = Cursor::new(Vec::new());
+        let first = TransientRegion::new(15);
+        first.reserve(&mut output).expect("reserve first command");
+        first.render(&mut output, &frame(&["first", "summary"])).expect("render first");
+        first.commit(&mut output, 2).expect("commit first");
+
+        let second = TransientRegion::new(15);
+        second.reserve(&mut output).expect("reserve second command");
+        second.render(&mut output, &frame(&["second", "summary"])).expect("render second");
+        second.commit(&mut output, 2).expect("commit second");
+        write!(output, "SHELL_PROMPT").expect("write shell prompt");
+
+        let screen = replay(&output.into_inner());
+        assert_eq!(screen.first().map(String::as_str), Some("first"));
+        assert_eq!(screen.get(1).map(String::as_str), Some("summary"));
+        assert_eq!(screen.get(2).map(String::as_str), Some("second"));
+        assert_eq!(screen.get(3).map(String::as_str), Some("summary"));
+        assert_eq!(screen.get(4).map(String::as_str), Some("SHELL_PROMPT"));
+        assert!(screen.iter().skip(5).all(|line| line.is_empty()), "screen: {screen:?}");
     }
 
     #[test]
