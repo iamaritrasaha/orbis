@@ -51,6 +51,7 @@ impl BrandFrame {
         &self.lines
     }
 
+    #[cfg(test)]
     pub(crate) fn text(&self) -> String {
         let mut text = self.lines.join("\n");
         text.push('\n');

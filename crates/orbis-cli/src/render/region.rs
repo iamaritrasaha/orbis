@@ -1,26 +1,101 @@
 use crossterm::{
-    cursor::{MoveDown, MoveToColumn, MoveToNextLine, MoveUp},
+    cursor::{MoveDown, MoveToColumn, MoveUp},
     execute,
     style::Print,
     terminal::{Clear, ClearType},
 };
-use std::io::Write;
+use std::io::{self, Write};
+
+/// A terminal region with a fixed anchor and height.
+///
+/// Once reserved, rendering never moves below the region.  Every operation
+/// restores the cursor to the anchor at column zero, so callers can safely
+/// enter raw mode and redraw without relying on newline translation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransientRegion {
+    height: usize,
+}
+
+impl TransientRegion {
+    pub(crate) fn new(height: usize) -> Self {
+        Self { height }
+    }
+
+    pub(crate) fn reserve<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let count = self.cursor_count()?;
+        if count == 0 {
+            return Ok(());
+        }
+
+        // Reservation happens in cooked mode.  Explicit CRLF creates the
+        // space once, including when the cursor is near the bottom edge;
+        // subsequent redraws stay inside these rows.
+        for _ in 0..self.height {
+            writer.write_all(b"\r\n")?;
+        }
+        execute!(writer, MoveUp(count), MoveToColumn(0))
+    }
+
+    pub(crate) fn render<W: Write>(&self, writer: &mut W, frame: &[String]) -> io::Result<()> {
+        if frame.len() > self.height {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transient frame exceeds its reserved region",
+            ));
+        }
+        let count = self.cursor_count()?;
+        if count == 0 {
+            return Ok(());
+        }
+
+        for index in 0..self.height {
+            execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            if let Some(line) = frame.get(index) {
+                execute!(writer, Print(line))?;
+            }
+            if index + 1 < self.height {
+                execute!(writer, MoveDown(1))?;
+            }
+        }
+        execute!(writer, MoveUp(count - 1), MoveToColumn(0))
+    }
+
+    pub(crate) fn finish<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let count = self.cursor_count()?;
+        if count == 0 {
+            return Ok(());
+        }
+        self.clear_at_anchor(writer)?;
+        // Reservation guarantees that this is the line immediately below the
+        // owned region, never a new scroll-producing line.
+        execute!(writer, MoveDown(count), MoveToColumn(0))
+    }
+
+    fn clear_at_anchor<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let count = self.cursor_count()?;
+        if count == 0 {
+            return Ok(());
+        }
+        for index in 0..self.height {
+            execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            if index + 1 < self.height {
+                execute!(writer, MoveDown(1))?;
+            }
+        }
+        execute!(writer, MoveUp(count - 1), MoveToColumn(0))
+    }
+
+    fn cursor_count(&self) -> io::Result<u16> {
+        self.height.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "transient region is too tall")
+        })
+    }
+}
 
 /// Clears exactly the terminal lines most recently owned by a transient view.
-/// The cursor is returned to the beginning of that region for the next frame.
+/// The cursor is expected to be at the region anchor and remains there.
 pub(crate) fn clear_owned_frame<W: Write>(writer: &mut W, line_count: usize) {
-    if line_count == 0 {
-        return;
-    }
-    let count = line_count.min(u16::MAX as usize) as u16;
-    let _ = execute!(writer, MoveUp(count), MoveToColumn(0));
-    for index in 0..usize::from(count) {
-        let _ = execute!(writer, Clear(ClearType::CurrentLine));
-        if index + 1 < usize::from(count) {
-            let _ = execute!(writer, MoveDown(1), MoveToColumn(0));
-        }
-    }
-    let _ = execute!(writer, MoveUp(count.saturating_sub(1)), MoveToColumn(0));
+    let _ = TransientRegion::new(line_count).clear_at_anchor(writer);
 }
 
 /// Replaces one owned transient frame without touching lines above it.
@@ -29,14 +104,8 @@ pub(crate) fn write_owned_frame<W: Write>(
     previous_line_count: usize,
     frame: &[String],
 ) -> usize {
-    clear_owned_frame(writer, previous_line_count);
-    for line in frame {
-        // Raw mode disables terminal output post-processing on Unix.  A bare
-        // newline can therefore advance vertically without returning to
-        // column zero, which corrupts multiline geometric frames.  Keep the
-        // cursor contract explicit for every row instead.
-        let _ = execute!(writer, MoveToColumn(0), Print(line), MoveToNextLine(1));
-    }
+    let region = TransientRegion::new(previous_line_count.max(frame.len()));
+    let _ = region.render(writer, frame);
     frame.len()
 }
 
@@ -55,8 +124,8 @@ mod tests {
         write_owned_frame(&mut output, 0, &frame(&["one", "two", "three"]));
         let output = String::from_utf8(output.into_inner()).expect("UTF-8 ANSI stream");
 
-        assert_eq!(output.matches("\x1b[1G").count(), 3);
-        assert_eq!(output.matches("\x1b[1E").count(), 3);
+        assert!(output.matches("\x1b[1G").count() >= 3);
+        assert!(output.matches("\x1b[1B").count() >= 2);
         assert!(!output.contains("one\ntwo\nthree"));
     }
 
@@ -70,7 +139,14 @@ mod tests {
         ];
         write_owned_frame(&mut output, 0, &rows);
         let output = String::from_utf8(output.into_inner()).expect("UTF-8 ANSI stream");
-        let expected = rows.iter().map(|row| format!("\x1b[1G{row}\x1b[1E")).collect::<String>();
+        let expected = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let move_down = if index + 1 < rows.len() { "\x1b[1B" } else { "" };
+                format!("\x1b[1G\x1b[2K{row}{move_down}")
+            })
+            .collect::<String>();
         assert!(output.contains(&expected));
     }
 
@@ -103,6 +179,24 @@ mod tests {
     }
 
     #[test]
+    fn reserved_region_keeps_the_cursor_at_its_anchor() {
+        let mut output = Cursor::new(Vec::new());
+        let region = TransientRegion::new(4);
+        region.reserve(&mut output).expect("reserve rows");
+        region.render(&mut output, &frame(&["one"])).expect("render short frame");
+        region
+            .render(&mut output, &frame(&["one", "two", "three", "four"]))
+            .expect("render full frame");
+        region.render(&mut output, &frame(&["final"])).expect("render replacement");
+
+        let output = output.into_inner();
+        let screen = replay(&output);
+        assert_eq!(screen.first().map(String::as_str), Some("final"));
+        assert!(screen.iter().skip(1).all(|line| line.is_empty()), "screen: {screen:?}");
+        assert!(output.ends_with(b"\x1b[3A\x1b[1G"));
+    }
+
+    #[test]
     fn raw_mode_pty_keeps_each_wordmark_row_at_column_zero() {
         if Command::new("script").arg("--version").output().is_err() {
             eprintln!("skipping pseudo-TTY check: script is unavailable");
@@ -127,7 +221,14 @@ mod tests {
             "│  │  ├──╯  ├──┤    │    ╰──╮",
             "╰──╯  ╵  ╲  ╰──╯    ╵    ╰──╯",
         ];
-        let expected = rows.iter().map(|row| format!("\x1b[1G{row}\x1b[1E")).collect::<String>();
+        let expected = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let move_down = if index + 1 < rows.len() { "\x1b[1B" } else { "" };
+                format!("\x1b[1G\x1b[2K{row}{move_down}")
+            })
+            .collect::<String>();
         assert!(transcript.contains(&expected), "raw-mode transcript: {transcript:?}");
     }
 

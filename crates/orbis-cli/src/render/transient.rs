@@ -11,7 +11,7 @@ use crossterm::{event, terminal};
 
 use super::{
     brand::{BrandFrame, IdentityMode},
-    region::{clear_owned_frame, write_owned_frame},
+    region::TransientRegion,
     theme::{Theme, Token},
 };
 use crate::cli::Command;
@@ -67,13 +67,22 @@ pub(crate) fn reveal(theme: Theme, label: &str) {
         return;
     }
 
-    let raw_guard = RawModeGuard::new();
     let mut stdout = io::stdout();
-    let mut rendered_line_count = 0;
+    let region = TransientRegion::new(4);
+    if region.reserve(&mut stdout).is_err() {
+        return;
+    }
+    let initial = BrandFrame::animation(theme, 0);
+    if region.render(&mut stdout, initial.lines()).is_err() {
+        return;
+    }
+    let _ = stdout.flush();
+
+    let raw_guard = RawModeGuard::new();
     let mut skipped = false;
-    for step in 0..=6 {
+    for step in 1..=6 {
         let frame = BrandFrame::animation(theme, step);
-        rendered_line_count = write_owned_frame(&mut stdout, rendered_line_count, frame.lines());
+        let _ = region.render(&mut stdout, frame.lines());
         let _ = stdout.flush();
         let wait = [45, 55, 55, 65, 65, 75, 0][step];
         if wait > 0 && event::poll(Duration::from_millis(wait)).unwrap_or(false) {
@@ -84,17 +93,15 @@ pub(crate) fn reveal(theme: Theme, label: &str) {
     }
     if skipped {
         let frame = BrandFrame::animation(theme, usize::MAX);
-        rendered_line_count = write_owned_frame(&mut stdout, rendered_line_count, frame.lines());
+        let _ = region.render(&mut stdout, frame.lines());
         let _ = stdout.flush();
     }
     let collapse = BrandFrame::settled(theme, IdentityMode::Command(label));
-    rendered_line_count = write_owned_frame(&mut stdout, rendered_line_count, collapse.lines());
-    let _ = stdout.flush();
-    // The command renderer owns the permanent compact identity. Clear the
-    // reveal's copy so the following heading rewrites the same region once.
-    clear_owned_frame(&mut stdout, rendered_line_count);
+    let _ = region.render(&mut stdout, collapse.lines());
     let _ = stdout.flush();
     drop(raw_guard);
+    let _ = region.finish(&mut stdout);
+    let _ = stdout.flush();
 }
 
 struct RawModeGuard(bool);
@@ -102,6 +109,11 @@ struct RawModeGuard(bool);
 impl RawModeGuard {
     fn new() -> Self {
         Self(terminal::enable_raw_mode().is_ok())
+    }
+
+    fn try_new() -> Result<Self, String> {
+        terminal::enable_raw_mode().map_err(|error| error.to_string())?;
+        Ok(Self(true))
     }
 }
 
@@ -122,9 +134,14 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
     }
 
     let mut selected = 0usize;
-    print!("{}", launcher_text(theme, selected));
-    io::stdout().flush().map_err(|error| error.to_string())?;
-    terminal::enable_raw_mode().map_err(|error| error.to_string())?;
+    let region = TransientRegion::new(launcher_rows(theme, selected).len());
+    let mut stdout = io::stdout();
+    region.reserve(&mut stdout).map_err(|error| error.to_string())?;
+    region
+        .render(&mut stdout, &launcher_rows(theme, selected))
+        .map_err(|error| error.to_string())?;
+    stdout.flush().map_err(|error| error.to_string())?;
+    let raw_guard = RawModeGuard::try_new()?;
     let result: Result<Option<usize>, String> = (|| loop {
         if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
             continue;
@@ -146,13 +163,13 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
             _ => {}
         }
         if changed {
-            redraw_launcher(theme, selected)?;
+            redraw_launcher(&region, theme, selected)?;
         }
     })();
-    let restore = terminal::disable_raw_mode().map_err(|error| error.to_string());
-    restore?;
+    drop(raw_guard);
+    region.finish(&mut stdout).map_err(|error| error.to_string())?;
+    stdout.flush().map_err(|error| error.to_string())?;
     let result = result?;
-    println!();
 
     let Some(selected) = result else { return Ok(None) };
     Ok(Some(command_for_selection(selected)?))
@@ -181,21 +198,29 @@ fn prompt(label: &str) -> Result<String, String> {
     if value.is_empty() { Err("a software name is required".into()) } else { Ok(value) }
 }
 
-fn redraw_launcher(theme: Theme, selected: usize) -> Result<(), String> {
+fn redraw_launcher(region: &TransientRegion, theme: Theme, selected: usize) -> Result<(), String> {
     let mut stdout = io::stdout();
-    clear_owned_frame(&mut stdout, launcher_line_count(theme));
-    write!(stdout, "{}", launcher_text(theme, selected)).map_err(|error| error.to_string())?;
+    region
+        .render(&mut stdout, &launcher_rows(theme, selected))
+        .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn launcher_text(theme: Theme, selected: usize) -> String {
-    let mut output = BrandFrame::settled(theme, IdentityMode::Launcher).text();
+    let mut output = launcher_rows(theme, selected).join("\n");
     output.push('\n');
+    output
+}
+
+fn launcher_rows(theme: Theme, selected: usize) -> Vec<String> {
+    let mut rows = BrandFrame::settled(theme, IdentityMode::Launcher).lines().to_vec();
+    rows.push(String::new());
     for (index, option) in LAUNCHER_OPTIONS.iter().enumerate() {
         let marker = if index == selected { if theme.unicode { "▸" } else { ">" } } else { " " };
         let token = if index == selected { Token::Selected } else { Token::Foreground };
-        output.push_str(&format!(
-            "  {} {}\n",
+        rows.push(format!(
+            "  {} {}",
             theme.paint(marker, Token::Primary),
             theme.paint(option, token)
         ));
@@ -205,8 +230,9 @@ pub(crate) fn launcher_text(theme: Theme, selected: usize) -> String {
     } else {
         "j/k move  Enter choose  q cancel"
     };
-    output.push_str(&format!("\n  {controls}\n"));
-    output
+    rows.push(String::new());
+    rows.push(format!("  {controls}"));
+    rows
 }
 
 fn launcher_text_compact(theme: Theme, selected: usize) -> String {
@@ -226,10 +252,6 @@ fn launcher_text_compact(theme: Theme, selected: usize) -> String {
     }
     output.push_str("\n  j/k move  Enter choose  q cancel\n");
     output
-}
-
-fn launcher_line_count(theme: Theme) -> usize {
-    launcher_text(theme, 0).bytes().filter(|byte| *byte == b'\n').count()
 }
 
 fn terminal_capable() -> bool {
@@ -257,5 +279,31 @@ mod tests {
     fn command_labels_are_compact_and_explicit() {
         assert_eq!(command_label(Some(&Command::Health)), Some("HEALTH"));
         assert_eq!(command_label(Some(&Command::Dashboard)), Some("UI"));
+    }
+
+    #[test]
+    fn launcher_navigation_reuses_one_fixed_frame() {
+        let theme = Theme::test(80);
+        let initial = launcher_rows(theme, 0);
+        assert_eq!(initial.len(), 17);
+
+        for selected in 0..=4 {
+            let rows = launcher_rows(theme, selected);
+            assert_eq!(rows.len(), initial.len());
+            assert_eq!(rows.iter().filter(|row| row.contains("Find software")).count(), 1);
+            assert_eq!(rows.iter().filter(|row| row.contains("Clean up")).count(), 1);
+        }
+
+        let clean_up = launcher_rows(theme, 4);
+        let clean_up_index = initial.iter().position(|row| row.contains("Clean up")).unwrap();
+        for (index, (before, after)) in initial.iter().zip(clean_up.iter()).enumerate() {
+            assert_eq!(
+                before.replace("> ", "  "),
+                after.replace("> ", "  "),
+                "unexpected launcher row change at {index}"
+            );
+        }
+        assert!(initial.iter().any(|row| row.contains("> Find software")));
+        assert!(clean_up[clean_up_index].contains("> Clean up"));
     }
 }

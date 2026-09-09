@@ -1,4 +1,4 @@
-# bash completion for Orbis 0.1.0-beta.1.dev.8
+# bash completion for Orbis 0.1.0-beta.1.dev.9
 
 _orbis() {
     local cur prev words cword
