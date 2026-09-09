@@ -1,3 +1,8 @@
+use std::{
+    collections::BTreeSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use super::theme::{Theme, Token};
 use orbis_core::{
     SearchReport,
@@ -9,6 +14,7 @@ use orbis_core::{
     models::{Package, PackageSource, SourceInfo},
     transaction::{OperationPlan, TransactionResult, TransactionStatus, VerificationResult},
 };
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) struct Renderer {
     pub(crate) theme: Theme,
@@ -298,42 +304,69 @@ impl Renderer {
     }
 
     pub(crate) fn updates(&self, report: &UpdateInventoryReport) -> String {
-        let mut output = self.heading("Updates", "A read-only check; nothing changes yet.");
-        if report.candidates.is_empty() {
-            output.push_str("\nNo software updates are available.\n");
+        self.updates_header() + &self.updates_body(report)
+    }
+
+    pub(crate) fn updates_header(&self) -> String {
+        self.heading("Updates", "")
+    }
+
+    pub(crate) fn updates_body(&self, report: &UpdateInventoryReport) -> String {
+        let coverage = coverage_rows(report);
+        let mut output = if report.candidates.is_empty() {
+            if coverage.incomplete_sources == 0 {
+                "Everything checked is up to date.".into()
+            } else {
+                format!(
+                    "No updates found in checked sources.\n{} source{} could not report a complete status.",
+                    coverage.incomplete_sources,
+                    if coverage.incomplete_sources == 1 { "" } else { "s" }
+                )
+            }
         } else {
-            output.push_str(&format!(
-                "\n{} update{} available\n",
+            format!(
+                "{} update{} available",
                 report.total(),
                 if report.total() == 1 { "" } else { "s" }
+            )
+        };
+        output.push('\n');
+
+        if !report.candidates.is_empty() {
+            for (label, candidates) in grouped_update_candidates(&report.candidates) {
+                output.push('\n');
+                output.push_str(&format!("{}\n", self.theme.paint(&label, Token::Muted)));
+                output.push_str(&render_update_group(self, &candidates));
+            }
+        }
+
+        if !coverage.rows.is_empty() {
+            output.push_str("\nCoverage\n");
+            for (label, detail) in coverage.rows {
+                output.push_str(&format!(
+                    "  {} {:<23} {}\n",
+                    self.theme.mark(Token::Unavailable),
+                    self.theme.paint(&label, Token::Muted),
+                    self.theme.paint(&detail, Token::Caution)
+                ));
+            }
+            output.push_str(&format!(
+                "  {}\n",
+                self.theme
+                    .paint("Incomplete sources are excluded from the update count.", Token::Muted)
             ));
-            for candidate in &report.candidates {
-                output.push_str(&format!(
-                    "  {:<28} {} {} {} · {}\n",
-                    candidate.name,
-                    candidate.current_version.as_deref().unwrap_or("current"),
-                    if self.theme.unicode { "→" } else { "->" },
-                    candidate.available_version.as_deref().unwrap_or("latest"),
-                    friendly_source(candidate.source)
-                ));
-            }
         }
-        for inventory in &report.inventories {
-            if inventory
-                .metadata_state
-                .as_deref()
-                .is_some_and(|s| s.contains("incomplete") || s.contains("unknown"))
-            {
-                output.push_str(&format!(
-                    "\n  {} update status is incomplete; unknown is not counted as zero.\n",
-                    friendly_source(inventory.source)
-                ));
-            }
+
+        output.push_str(&format!(
+            "\n{}\n",
+            self.theme.paint("Read-only check · nothing changed", Token::Muted)
+        ));
+        if !report.candidates.is_empty() {
+            output.push_str(&format!(
+                "{}\n",
+                self.theme.paint("Review changes with `orbis update --apply`", Token::Primary)
+            ));
         }
-        for issue in &report.issues {
-            output.push_str(&format!("\n  {}: {}\n", friendly_source(issue.source), issue.message));
-        }
-        output.push_str("\n  Read-only status; package state and indexes were not changed.\n");
         output
     }
 
@@ -342,19 +375,20 @@ impl Renderer {
         sources: &[SourceInfo],
         selected: Option<PackageSource>,
     ) -> String {
-        let mut output = self.heading("Updates", "Checking software sources");
         let active = if self.theme.unicode { "⠹" } else { ">" };
-        for source in
-            sources.iter().filter(|source| selected.is_none_or(|wanted| wanted == source.source))
-        {
-            output.push_str(&format!(
-                "{} {}  checking\n",
-                self.theme.paint(active, Token::Primary),
-                friendly_source(source.source)
-            ));
-        }
-        output.push('\n');
-        output
+        let count = sources
+            .iter()
+            .filter(|source| selected.is_none_or(|wanted| wanted == source.source))
+            .map(|source| provider_family(source.source))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let suffix = if self.theme.unicode { "…" } else { "..." };
+        let checking = if count == 0 {
+            format!("Checking software sources{suffix}")
+        } else {
+            format!("Checking {count} software source{}{suffix}", if count == 1 { "" } else { "s" })
+        };
+        format!("{} {}", self.theme.paint(active, Token::Primary), checking)
     }
 
     pub(crate) fn maintenance_plan(&self, plan: &MaintenancePlan, diagnostic: bool) -> String {
@@ -544,24 +578,37 @@ impl Renderer {
     pub(crate) fn history(
         &self,
         entries: &[orbis_core::transaction::history::HistoryEntry],
-        limit: usize,
+        diagnostic: bool,
     ) -> String {
-        let mut output =
-            self.heading("History", &format!("Recent Orbis operations (limit {limit})."));
+        let mut output = self.heading("History", "");
         if entries.is_empty() {
-            return output + "\nNo Orbis operations recorded yet.\n";
+            return output + "No activity recorded yet.\n";
         }
         for entry in entries {
+            let status = history_status(&entry.status, self.theme);
+            let age = relative_time(entry.recorded_at_unix_ms, current_time_ms());
+            let action = human_history_action(entry);
+            output.push_str(&format!("{}  {:<10} {}\n", status.glyph, age, action));
             output.push_str(&format!(
-                "\n  {}  {:<12} {:<10} {}{}\n",
-                entry.operation_id,
-                entry.action,
-                entry.status,
-                entry.source.map(friendly_source).unwrap_or("Orbis"),
-                entry.package.as_deref().map(|p| format!(" · {p}")).unwrap_or_default()
+                "              {}\n",
+                self.theme.paint(status.label, status.token)
             ));
-            if let Some(message) = &entry.message {
-                output.push_str(&format!("    {message}\n"));
+            let show_id = diagnostic || status.kind != HistoryStatusKind::Completed;
+            if show_id {
+                output.push_str(&format!(
+                    "              {} {}\n",
+                    self.theme.paint("Operation", Token::Muted),
+                    entry.operation_id
+                ));
+            }
+            if let Some(message) = &entry.message
+                && (diagnostic || status.kind != HistoryStatusKind::Completed)
+            {
+                output.push_str(&format!(
+                    "              {}\n",
+                    wrap(message, self.theme.width.saturating_sub(14))
+                        .replace('\n', "\n              ")
+                ));
             }
         }
         output
@@ -766,6 +813,271 @@ fn friendly_source(source: PackageSource) -> &'static str {
     }
 }
 
+fn source_family_label(source: PackageSource) -> &'static str {
+    match provider_family(source) {
+        PackageSource::Apt => "Ubuntu repositories",
+        PackageSource::Flatpak => "Flatpak",
+        PackageSource::Snap => "Snap",
+        PackageSource::Cargo => "Rust tools",
+        PackageSource::Npm => "Node.js tools",
+        PackageSource::Uv => "Python tools",
+        PackageSource::Pnpm | PackageSource::Pipx => unreachable!("family is normalized"),
+    }
+}
+
+fn update_group_label(candidate: &orbis_core::maintenance::UpdateCandidate) -> String {
+    if candidate.source == PackageSource::Flatpak {
+        candidate.scope.map_or_else(
+            || "FLATPAK".into(),
+            |scope| format!("FLATPAK · {}", scope.label().to_ascii_uppercase()),
+        )
+    } else {
+        match provider_family(candidate.source) {
+            PackageSource::Apt => "UBUNTU".into(),
+            PackageSource::Snap => "SNAP".into(),
+            PackageSource::Cargo => "RUST".into(),
+            PackageSource::Npm => "NODE.JS".into(),
+            PackageSource::Uv => "PYTHON".into(),
+            PackageSource::Flatpak | PackageSource::Pnpm | PackageSource::Pipx => {
+                unreachable!("family is normalized")
+            }
+        }
+    }
+}
+
+fn grouped_update_candidates<'a>(
+    candidates: &'a [orbis_core::maintenance::UpdateCandidate],
+) -> Vec<(String, Vec<&'a orbis_core::maintenance::UpdateCandidate>)> {
+    let mut groups: Vec<(String, Vec<&'a orbis_core::maintenance::UpdateCandidate>)> = Vec::new();
+    for candidate in candidates {
+        let label = update_group_label(candidate);
+        if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == label) {
+            group.push(candidate);
+        } else {
+            groups.push((label, vec![candidate]));
+        }
+    }
+    groups
+}
+
+fn render_update_group(
+    renderer: &Renderer,
+    candidates: &[&orbis_core::maintenance::UpdateCandidate],
+) -> String {
+    let names_width = candidates
+        .iter()
+        .map(|candidate| UnicodeWidthStr::width(candidate.name.as_str()))
+        .max()
+        .unwrap_or(0);
+    let content_width = renderer.theme.width.saturating_sub(2).min(72);
+    let versions = candidates
+        .iter()
+        .map(|candidate| {
+            let current = candidate.current_version.as_deref().unwrap_or("current");
+            let available = candidate.available_version.as_deref().unwrap_or("latest");
+            let arrow = if renderer.theme.unicode { "→" } else { "->" };
+            UnicodeWidthStr::width(current)
+                + 1
+                + UnicodeWidthStr::width(arrow)
+                + 1
+                + UnicodeWidthStr::width(available)
+        })
+        .max()
+        .unwrap_or(0);
+    let single_line = names_width + versions + 3 <= content_width;
+    let mut output = String::new();
+    for candidate in candidates {
+        let current = renderer
+            .theme
+            .paint(candidate.current_version.as_deref().unwrap_or("current"), Token::Muted);
+        let available = renderer
+            .theme
+            .paint(candidate.available_version.as_deref().unwrap_or("latest"), Token::Positive);
+        let arrow =
+            renderer.theme.paint(if renderer.theme.unicode { "→" } else { "->" }, Token::Primary);
+        if single_line {
+            let name_width = UnicodeWidthStr::width(candidate.name.as_str());
+            output.push_str(&format!(
+                "  {}{} {} {} {}\n",
+                candidate.name,
+                " ".repeat(names_width.saturating_sub(name_width)),
+                current,
+                arrow,
+                available
+            ));
+        } else {
+            output.push_str(&format!("  {}\n", candidate.name));
+            output.push_str(&format!("    {} {} {}\n", current, arrow, available));
+        }
+    }
+    output
+}
+
+struct Coverage {
+    rows: Vec<(String, String)>,
+    incomplete_sources: usize,
+}
+
+fn coverage_rows(report: &UpdateInventoryReport) -> Coverage {
+    let mut incomplete = BTreeSet::new();
+    let mut rows = Vec::new();
+    for inventory in &report.inventories {
+        if inventory
+            .metadata_state
+            .as_deref()
+            .is_some_and(|state| state.contains("incomplete") || state.contains("unknown"))
+        {
+            incomplete.insert(provider_family(inventory.source));
+            push_coverage_row(
+                &mut rows,
+                source_family_label(inventory.source),
+                "status incomplete",
+            );
+        }
+    }
+
+    let mut unavailable = Vec::new();
+    for issue in &report.issues {
+        incomplete.insert(provider_family(issue.source));
+        if is_unavailable(issue.message.as_str())
+            && matches!(
+                issue.source,
+                PackageSource::Npm | PackageSource::Pnpm | PackageSource::Uv | PackageSource::Pipx
+            )
+        {
+            unavailable.push(issue.source.label().to_ascii_lowercase());
+        } else {
+            push_coverage_row(&mut rows, source_family_label(issue.source), "status incomplete");
+        }
+    }
+    unavailable.dedup();
+    if !unavailable.is_empty() {
+        push_coverage_row(
+            &mut rows,
+            "Optional providers",
+            &format!("{} unavailable", unavailable.join(", ")),
+        );
+    }
+    Coverage { rows, incomplete_sources: incomplete.len() }
+}
+
+fn push_coverage_row(rows: &mut Vec<(String, String)>, label: &str, detail: &str) {
+    if !rows.iter().any(|(existing, _)| existing == label) {
+        rows.push((label.into(), detail.into()));
+    }
+}
+
+fn is_unavailable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("unavailable")
+        || message.contains("not installed")
+        || message.contains("not available")
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_millis() as u64)
+}
+
+fn relative_time(recorded_at_unix_ms: u64, now_unix_ms: u64) -> String {
+    let seconds = now_unix_ms.saturating_sub(recorded_at_unix_ms) / 1_000;
+    if seconds < 60 {
+        "just now".into()
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+fn human_history_action(entry: &orbis_core::transaction::history::HistoryEntry) -> String {
+    if entry.kind == "maintenance" {
+        match entry.action.to_ascii_lowercase().as_str() {
+            "refresh" => "Refresh software information".into(),
+            "update" | "upgrade" => "Apply software updates".into(),
+            "clean up" | "cleanup" => "Clean up unused software".into(),
+            _ => "Software maintenance".into(),
+        }
+    } else {
+        let package = entry.package.as_deref().unwrap_or("software");
+        entry.source.map_or_else(
+            || format!("{} {package}", entry.action),
+            |source| format!("{} {package} · {}", entry.action, source_family_label(source)),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryStatusKind {
+    Completed,
+    Limited,
+    Failed,
+    Active,
+    Planned,
+}
+
+struct HistoryStatusView {
+    glyph: &'static str,
+    label: &'static str,
+    token: Token,
+    kind: HistoryStatusKind,
+}
+
+fn history_status(status: &str, theme: Theme) -> HistoryStatusView {
+    let normalized = status.to_ascii_lowercase().replace('_', "");
+    let (kind, label, token) = match normalized.as_str() {
+        "succeeded" | "completed" => (HistoryStatusKind::Completed, "completed", Token::Positive),
+        "partiallysucceeded" | "partiallyverified" | "limited" => {
+            (HistoryStatusKind::Limited, "completed with limitations", Token::Caution)
+        }
+        "failed" | "cancelled" | "blocked" => {
+            (HistoryStatusKind::Failed, "failed", Token::Destructive)
+        }
+        "executing" | "inprogress" => (HistoryStatusKind::Active, "in progress", Token::Primary),
+        "planned" => (HistoryStatusKind::Planned, "planned", Token::Muted),
+        _ => (HistoryStatusKind::Active, "in progress", Token::Primary),
+    };
+    let glyph = match kind {
+        HistoryStatusKind::Completed => {
+            if theme.unicode {
+                "●"
+            } else {
+                "*"
+            }
+        }
+        HistoryStatusKind::Limited => {
+            if theme.unicode {
+                "◐"
+            } else {
+                "!"
+            }
+        }
+        HistoryStatusKind::Failed => {
+            if theme.unicode {
+                "×"
+            } else {
+                "x"
+            }
+        }
+        HistoryStatusKind::Active => {
+            if theme.unicode {
+                "⠹"
+            } else {
+                ">"
+            }
+        }
+        HistoryStatusKind::Planned => {
+            if theme.unicode {
+                "○"
+            } else {
+                "o"
+            }
+        }
+    };
+    HistoryStatusView { glyph, label, token, kind }
+}
+
 #[derive(Clone)]
 struct MaintenanceReviewRow {
     label: String,
@@ -949,7 +1261,7 @@ mod tests {
         maintenance::{
             MaintenanceAction, MaintenancePlan, MaintenanceProviderResult,
             MaintenanceProviderStatus, MaintenanceResult, MaintenanceStatus,
-            ProviderMaintenancePlan, WhyReport,
+            ProviderMaintenancePlan, ProviderUpdateInventory, UpdateCandidate, WhyReport,
         },
         models::{PackageKind, ProviderCapabilities, ProviderIssue},
         transaction::{InstallScope, OperationAction, OperationPlan},
@@ -1029,8 +1341,239 @@ mod tests {
             candidates: Vec::new(),
             issues: Vec::new(),
         };
-        assert!(renderer.updates(&updates).contains("No software updates are available"));
-        assert!(renderer.history(&[], 20).contains("No Orbis operations recorded yet"));
+        assert!(renderer.updates(&updates).contains("Everything checked is up to date"));
+        assert!(renderer.history(&[], false).contains("No activity recorded yet"));
+    }
+
+    fn update_candidate(source: PackageSource, name: &str) -> UpdateCandidate {
+        UpdateCandidate {
+            source,
+            provider_id: name.into(),
+            name: name.into(),
+            current_version: Some("1.0.0".into()),
+            available_version: Some("2.0.0".into()),
+            architecture: None,
+            scope: None,
+            channel: None,
+            held: None,
+            security_relevance: None,
+            notes: Vec::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn updates_use_one_header_a_transient_line_and_grouped_families() {
+        let renderer = renderer();
+        let report = UpdateInventoryReport {
+            inventories: vec![
+                ProviderUpdateInventory {
+                    source: PackageSource::Apt,
+                    available: true,
+                    candidates: Vec::new(),
+                    notes: Vec::new(),
+                    metadata_state: Some("current_local_index_unknown_freshness".into()),
+                },
+                ProviderUpdateInventory {
+                    source: PackageSource::Cargo,
+                    available: true,
+                    candidates: Vec::new(),
+                    notes: Vec::new(),
+                    metadata_state: Some("incomplete_unknown_install_provenance".into()),
+                },
+            ],
+            candidates: vec![
+                update_candidate(PackageSource::Npm, "@deepseek-ai/dsh"),
+                update_candidate(PackageSource::Pnpm, "@qwen-code/qwen-code"),
+                update_candidate(PackageSource::Uv, "ruff"),
+                update_candidate(PackageSource::Pipx, "black"),
+            ],
+            issues: vec![
+                ProviderIssue {
+                    source: PackageSource::Pnpm,
+                    message: "pnpm is not installed".into(),
+                    technical: None,
+                },
+                ProviderIssue {
+                    source: PackageSource::Pipx,
+                    message: "pipx unavailable".into(),
+                    technical: None,
+                },
+            ],
+        };
+        let output = renderer.updates(&report);
+        assert_eq!(output.matches("ORBIS // UPDATES").count(), 1);
+        assert_eq!(output.matches("NODE.JS").count(), 1);
+        assert_eq!(output.matches("PYTHON").count(), 1);
+        assert!(output.contains("@deepseek-ai/dsh"));
+        assert!(output.contains("Review changes with `orbis update --apply`"));
+        assert!(output.contains("Ubuntu repositories"));
+        assert!(output.contains("Rust tools"));
+        assert!(output.contains("Optional providers"));
+        assert!(output.contains("pnpm, pipx unavailable"));
+        assert!(output.contains("Incomplete sources are excluded from the update count."));
+        assert!(!output.contains("Node.js tools\nNode.js tools"));
+        assert!(!output.contains("Python tools\nPython tools"));
+
+        let sources = vec![
+            SourceInfo {
+                source: PackageSource::Npm,
+                available: true,
+                state: "ready".into(),
+                backend: None,
+                capabilities: capabilities(),
+                notes: Vec::new(),
+            },
+            SourceInfo {
+                source: PackageSource::Pnpm,
+                available: true,
+                state: "ready".into(),
+                backend: None,
+                capabilities: capabilities(),
+                notes: Vec::new(),
+            },
+        ];
+        let checking = renderer.updates_checking(&sources, None);
+        assert!(checking.contains("Checking 1 software source"));
+        assert!(!checking.contains("ORBIS"));
+        assert!(!checking.contains("Node.js tools"));
+    }
+
+    #[test]
+    fn incomplete_coverage_never_claims_everything_is_current() {
+        let renderer = renderer();
+        let report = UpdateInventoryReport {
+            inventories: vec![ProviderUpdateInventory {
+                source: PackageSource::Apt,
+                available: true,
+                candidates: Vec::new(),
+                notes: Vec::new(),
+                metadata_state: Some("current_local_index_unknown_freshness".into()),
+            }],
+            candidates: Vec::new(),
+            issues: Vec::new(),
+        };
+        let output = renderer.updates(&report);
+        assert!(output.contains("No updates found in checked sources."));
+        assert!(!output.contains("Everything checked is up to date."));
+        assert_eq!(output.matches("status incomplete").count(), 1);
+    }
+
+    #[test]
+    fn long_update_names_switch_to_two_line_rows_at_narrow_widths() {
+        let renderer = Renderer { theme: Theme::test(80) };
+        let long_name = "@example/very-long-package-name-that-needs-a-second-line";
+        let report = UpdateInventoryReport {
+            inventories: Vec::new(),
+            candidates: vec![update_candidate(PackageSource::Npm, long_name)],
+            issues: Vec::new(),
+        };
+        let output = renderer.updates(&report);
+        assert!(output.contains(&format!("  {long_name}\n    1.0.0 -> 2.0.0")));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn history_entry(
+        kind: &str,
+        operation_id: &str,
+        recorded_at_unix_ms: u64,
+        action: &str,
+        status: &str,
+        source: Option<PackageSource>,
+        package: Option<&str>,
+        message: Option<&str>,
+    ) -> orbis_core::transaction::history::HistoryEntry {
+        orbis_core::transaction::history::HistoryEntry {
+            kind: kind.into(),
+            operation_id: operation_id.into(),
+            recorded_at_unix_ms,
+            action: action.into(),
+            source,
+            package: package.map(str::to_owned),
+            scope: None,
+            status: status.into(),
+            verification: None,
+            risk: None,
+            message: message.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn history_is_human_readable_but_plain_keeps_diagnostic_records() {
+        let renderer = renderer();
+        let now = current_time_ms();
+        let entries = vec![
+            history_entry(
+                "maintenance",
+                "maint-success",
+                now - 4 * 60_000,
+                "Refresh",
+                "succeeded",
+                None,
+                None,
+                Some("snapd manages store awareness automatically"),
+            ),
+            history_entry(
+                "maintenance",
+                "maint-limited",
+                now - 2 * 86_400_000,
+                "Refresh",
+                "partiallysucceeded",
+                None,
+                None,
+                Some("Cargo upgrade provenance incomplete"),
+            ),
+            history_entry(
+                "transaction",
+                "tx-flatpak",
+                now - 3 * 86_400_000,
+                "Install",
+                "succeeded",
+                Some(PackageSource::Apt),
+                Some("flatpak"),
+                None,
+            ),
+            history_entry(
+                "maintenance",
+                "maint-failed",
+                now - 5 * 86_400_000,
+                "Refresh",
+                "failed",
+                None,
+                None,
+                Some("Ubuntu repositories could not be reached"),
+            ),
+        ];
+        let output = renderer.history(&entries, false);
+        assert!(output.contains("4m ago"));
+        assert!(output.contains("completed with limitations"));
+        assert!(!output.contains("partiallysucceeded"));
+        assert!(!output.contains("maint-success"));
+        assert!(output.contains("maint-limited"));
+        assert!(output.contains("Cargo upgrade provenance incomplete"));
+        assert!(output.contains("failed"));
+        assert!(output.contains("Ubuntu repositories could not be reached"));
+        assert!(output.contains("Refresh software information"));
+        assert!(output.contains("Install flatpak · Ubuntu repositories"));
+        assert!(!output.contains("Orbis"));
+        assert!(!output.contains("snapd manages"));
+
+        let plain = renderer.history(&entries, true);
+        assert!(plain.contains("maint-success"));
+        assert!(plain.contains("snapd manages store awareness automatically"));
+        assert_eq!(
+            history_status("partiallyverified", renderer.theme).label,
+            "completed with limitations"
+        );
+    }
+
+    #[test]
+    fn relative_time_uses_compact_human_units() {
+        let now = 1_800_000_000_000;
+        assert_eq!(relative_time(now - 10_000, now), "just now");
+        assert_eq!(relative_time(now - 4 * 60_000, now), "4m ago");
+        assert_eq!(relative_time(now - 2 * 3_600_000, now), "2h ago");
+        assert_eq!(relative_time(now - 3 * 86_400_000, now), "3d ago");
     }
 
     #[test]

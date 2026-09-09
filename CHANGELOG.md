@@ -2,6 +2,11 @@
 
 All notable changes to Orbis are documented here.
 
+## 0.1.0-beta.1.dev.11 (development)
+
+- Refine default update and history output into grouped, human-oriented terminal views with honest coverage and relative timestamps.
+- Keep transient update checking inside one persistent command header and preserve full diagnostic records in plain and JSON output.
+
 ## 0.1.0-beta.1.dev.3 (development)
 
 - Restore the terminal before administrator authentication and prevent interactive sudo from worker execution paths.

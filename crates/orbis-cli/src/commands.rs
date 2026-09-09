@@ -16,7 +16,7 @@ use orbis_core::{
 
 use crate::{
     cli::{Cli, Command},
-    render::Renderer,
+    render::{Renderer, region::TransientRegion},
     self_update::{self, SelfUpdateReport, SilentUpdateObserver},
 };
 
@@ -123,14 +123,42 @@ pub(crate) fn dispatch(
         }
         Some(Command::Update { source, .. }) => {
             let selected_source = source.map(Into::into);
-            if !cli.json && !cli.plain {
-                print!("{}", renderer.updates_checking(&registry.sources(), selected_source));
-            }
+            let show_transient = !cli.json
+                && !cli.plain
+                && io::stdout().is_terminal()
+                && std::env::var("TERM").is_ok_and(|term| term != "dumb");
+            let transient = if show_transient {
+                print!("{}", renderer.updates_header());
+                io::stdout().flush().map_err(|error| error.to_string())?;
+                let region = TransientRegion::new(1);
+                let mut stdout = io::stdout();
+                region.reserve(&mut stdout).map_err(|error| error.to_string())?;
+                region
+                    .render(
+                        &mut stdout,
+                        &[renderer.updates_checking(&registry.sources(), selected_source)],
+                    )
+                    .map_err(|error| error.to_string())?;
+                stdout.flush().map_err(|error| error.to_string())?;
+                Some(region)
+            } else {
+                None
+            };
             let report = registry.updates(selected_source);
+            if let Some(region) = transient {
+                let mut stdout = io::stdout();
+                region
+                    .clear_and_release_at_anchor(&mut stdout)
+                    .map_err(|error| error.to_string())?;
+                stdout.flush().map_err(|error| error.to_string())?;
+                print!("{}", renderer.updates_body(&report));
+            }
             if cli.json {
                 print_json(&report)
             } else {
-                print!("{}", renderer.updates(&report));
+                if !show_transient {
+                    print!("{}", renderer.updates(&report));
+                }
                 Ok(())
             }
         }
@@ -171,7 +199,7 @@ pub(crate) fn dispatch(
             },
         ),
         Some(Command::History { operation_id, limit, source }) => {
-            run_history(renderer, cli.json, operation_id, limit, source.map(Into::into))
+            run_history(renderer, cli.json, cli.plain, operation_id, limit, source.map(Into::into))
         }
         Some(Command::Why { package, source }) => {
             run_why(registry, renderer, cli.json, package, source.map(Into::into))
@@ -844,6 +872,7 @@ fn maintenance_status(results: &[MaintenanceProviderResult]) -> MaintenanceStatu
 fn run_history(
     renderer: &Renderer,
     json: bool,
+    plain: bool,
     operation_id: Option<String>,
     limit: usize,
     source: Option<PackageSource>,
@@ -869,7 +898,7 @@ fn run_history(
         if json {
             print_json(&entries)
         } else {
-            print!("{}", renderer.history(&entries, limit));
+            print!("{}", renderer.history(&entries, plain));
             Ok(())
         }
     }
