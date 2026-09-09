@@ -7,7 +7,7 @@ use orbis_core::{models::PackageSource, transaction::InstallScope};
     version,
     about = "Your Linux software, in one place.",
     long_about = "A calm, beginner-friendly way to find, understand, update, and safely manage software on Linux.",
-    help_template = "{name} {version}\n\nCOMMON COMMANDS\n\n  find       Find software\n  show       Learn about software\n  install    Install software\n  remove     Remove software\n  update     Check for updates\n  refresh    Refresh software information\n  clean      Remove unused software safely\n  history    See previous Orbis actions\n  health     Check that everything is working\n  self-update Update Orbis safely\n\nEXAMPLES\n\n  orbis find firefox\n  orbis show btop\n  orbis install btop\n  orbis update\n  orbis health\n\nADVANCED\n\n  upgrade    Apply a reviewed update plan\n  sources    Inspect software sources\n  why        Inspect installation reasoning\n  search     Compatibility alias for find\n  doctor     Compatibility alias for health\n  --json     Use the stable machine-readable interface\n\n{about}\n\nUse 'orbis <command> --help' for command details.\n"
+    help_template = "{name} {version}\n\nCOMMON COMMANDS\n\n  find       Find software\n  show       Learn about software\n  install    Install software\n  remove     Remove software\n  update     Check for updates\n  refresh    Refresh software information\n  clean      Remove unused software safely\n  history    See previous Orbis actions\n  health     Check that everything is working\n  self-update Update Orbis safely\n\nEXAMPLES\n\n  orbis find firefox\n  orbis show btop\n  orbis install btop\n  orbis update\n  orbis refresh\n  orbis health\n\nADVANCED\n\n  ui         Open the optional full-screen interface\n  dashboard  Compatibility name for ui\n  upgrade    Apply a reviewed update plan\n  sources    Inspect software sources\n  why        Inspect installation reasoning\n  search     Compatibility alias for find\n  doctor     Compatibility alias for health\n  --json     Use the stable machine-readable interface\n\n{about}\n\nNormal commands run inline and return to your shell. Use 'orbis ui' for persistent navigation.\nUse 'orbis <command> --help' for command details.\n"
 )]
 pub(crate) struct Cli {
     /// Emit structured JSON instead of terminal presentation.
@@ -25,7 +25,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Launch the interactive Orbis dashboard.
+    /// Open the optional persistent full-screen Orbis interface.
     #[command(alias = "ui")]
     Dashboard,
     /// Inspect software sources and their capabilities (advanced).

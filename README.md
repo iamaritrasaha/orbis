@@ -19,7 +19,7 @@ orbis history
 orbis health
 ```
 
-`orbis` on its own opens the interactive dashboard in a capable terminal. Every change is reviewed before it runs unless you explicitly use `--yes` after resolving an exact plan.
+Normal Orbis commands run inline, leave their final result in scrollback, and return immediately to your shell. `orbis` opens a lightweight task-first launcher; `orbis ui` (or `orbis dashboard`) is the optional persistent full-screen interface. Every change is reviewed before it runs unless you explicitly use `--yes` after resolving an exact plan.
 
 ## Help for beginners
 
@@ -43,46 +43,50 @@ EXAMPLES
   orbis show btop
   orbis install btop
   orbis update
+  orbis refresh
   orbis health
+
+ADVANCED
+
+  orbis ui                 Open the optional full-screen interface
+  orbis sources            Inspect software sources
 ```
 
 Run `orbis <command> --help` for details. The older names `search`, `info`, `explain`, `updates`, and `doctor` remain available as compatibility aliases where applicable. `upgrade` remains the advanced compatibility command for applying an update plan.
 
-## Dashboard preview
+## Default terminal experience
 
-The home screen uses a selectable command list, aligned shortcuts, and a compact software-management pulse. Values below illustrate the layout; the running view uses discovered sources, update results, and recorded history.
+Human-facing commands use a compact Orbis identity, a brief reveal, and a scrollback-preserving result. There is no alternate screen and no close key after a command completes.
 
 ```text
-                            ◈ ORBIS
-                 Your Linux software, in one place.
+◈ ORBIS // SHOW
+────────────────────────────────────────────────────────────────────────
 
-  ──────────────────────────────────────────────────────────────────
-   ▸ FIND SOFTWARE                                             [/]
-     Search applications, tools and packages
-     UPDATES                                                   [U]
-     4 updates available
-     CLEAN                                                     [C]
-     Review unused software safely
-     HEALTH                                                    [H]
-     Everything looks good
+btop
+Interactive system monitor
 
-  ──────────────────────────────────────────────────────────────────
-  SYSTEM PULSE
-  sources 6/8 ready  /  4 updates available
-  RECENT  no Orbis changes recorded yet
+WHAT IT DOES
+It lets you watch CPU usage, memory, disks, network activity, temperatures,
+and running processes in real time.
 
-  ──────────────────────────────────────────────────────────────────
-  ↑↓ move  Enter open  / Find  U updates  A advanced  ? Help  Q Quit
+STATUS
+  Status        Available
+  Source        Ubuntu/Debian repositories
+  Version       1.4.5
 ```
 
-Use Up/Down or j/k and Enter, or the direct shortcuts. The five-line wordmark appears only during the short dashboard startup reveal; direct operations use a compact reveal of about 320 ms. Any key skips the reveal. At 80 columns the same command list and footer remain visible. Wide layouts limit the home content width instead of stretching empty cards.
+The reveal is approximately 250–450 ms and any key skips it. `REDUCE_MOTION`, `NO_COLOR`, `TERM=dumb`, `--plain`, pipes, and redirected output disable animation and cursor movement. Presentation width is capped to a tasteful terminal column width.
+
+## Optional full-screen interface
+
+Run `orbis ui` or `orbis dashboard` when you want persistent Ratatui navigation. That explicit mode may require `q` to quit; ordinary commands never do.
 
 ## Live operations
 
-Orbis restores the normal terminal before requesting administrator authentication, then returns to the live operation view. Run `orbis refresh` normally; no preparatory authorization command is needed. User-level plans do not request administrator access.
+Orbis restores the normal terminal before requesting administrator authentication, then returns to transient progress output. Run `orbis refresh` normally; no preparatory authorization command is needed. User-level plans do not request administrator access.
 
 ```text
-◈ ORBIS  /  Refreshing software information
+◈ ORBIS // REFRESH
 3 sources · staged safely
 
 SOFTWARE SOURCES
@@ -104,7 +108,7 @@ D details   L details   ? Help
 
 The summary receives real provider start, output, and completion events. Providers that need no refresh report `Not needed`; Snap refresh is managed automatically. Unsupported plans are marked `Skipped safely`. Stable APT `Hit:`, `Get:`, `Ign:`, and `Err:` lines provide a best-effort source URL and activity label. This parsing affects presentation only, and unknown lines remain available in Details.
 
-Press D or L for a separate scrolling log of the most recent 200 provider output lines, then press it again to return to the summary. The summary reserves no empty log rectangle. Exact percentages are never invented. Ctrl+C during a provider operation requests exit after the operation finishes safely. Cached administrator credentials are checked noninteractively during execution; expired credentials fail safely and require a retry.
+Transient refresh output is concise; use `orbis refresh --plan` when you want the reviewed plan. Exact percentages are never invented. Ctrl+C during a provider operation requests exit after the operation finishes safely. Cached administrator credentials are checked noninteractively during execution; expired credentials fail safely and require a retry.
 
 The active spinner advances at about 10 Hz. `REDUCE_MOTION` disables motion; `NO_COLOR` disables color and startup reveal. `TERM=dumb`, `--plain`, and non-TTY output use plain presentation. The idle interface stops animation redraws once background work and startup are finished.
 
@@ -154,7 +158,7 @@ git pull --ff-only
 cargo install --path crates/orbis-cli --locked --force
 ```
 
-The release check is bounded and quiet during normal dashboard startup. If a new public release is known, the dashboard shows a small review notice; it never updates Orbis in the background. No account, telemetry, or hosted service is required beyond the public GitHub release request.
+The release check is bounded and quiet during an explicit full-screen startup. If a new public release is known, the interface shows a small review notice; it never updates Orbis in the background. No account, telemetry, or hosted service is required beyond the public GitHub release request.
 
 ## Safety
 

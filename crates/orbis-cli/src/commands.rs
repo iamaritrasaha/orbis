@@ -75,13 +75,12 @@ pub(crate) fn dispatch(
             }
         }
         Some(Command::SelfUpdate { check, yes }) => {
-            run_self_update(renderer, cli.json, cli.plain, check, yes)
+            run_self_update(renderer.theme, cli.json, check, yes)
         }
         Some(Command::Install { package, source, scope, channel, plan, yes }) => run_transaction(
             registry,
             renderer,
             cli.json,
-            cli.plain,
             TransactionOptions {
                 action: OperationAction::Install,
                 package,
@@ -96,7 +95,6 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
-            cli.plain,
             TransactionOptions {
                 action: OperationAction::Remove,
                 package,
@@ -112,7 +110,6 @@ pub(crate) fn dispatch(
                 registry,
                 renderer,
                 cli.json,
-                cli.plain,
                 MaintenanceOptions {
                     action: MaintenanceAction::Upgrade,
                     source: source.map(Into::into),
@@ -121,13 +118,12 @@ pub(crate) fn dispatch(
                 },
             )
         }
-        Some(Command::Update { source, .. })
-            if !cli.json && !cli.plain && crate::tui::should_launch_operation() =>
-        {
-            crate::tui::run_update(registry, renderer.theme, source.map(Into::into))
-        }
         Some(Command::Update { source, .. }) => {
-            let report = registry.updates(source.map(Into::into));
+            let selected_source = source.map(Into::into);
+            if !cli.json && !cli.plain {
+                print!("{}", renderer.updates_checking(&registry.sources(), selected_source));
+            }
+            let report = registry.updates(selected_source);
             if cli.json {
                 print_json(&report)
             } else {
@@ -139,7 +135,6 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
-            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Refresh,
                 source: source.map(Into::into),
@@ -151,7 +146,6 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
-            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Upgrade,
                 source: source.map(Into::into),
@@ -163,7 +157,6 @@ pub(crate) fn dispatch(
             registry,
             renderer,
             cli.json,
-            cli.plain,
             MaintenanceOptions {
                 action: MaintenanceAction::Cleanup,
                 source: source.map(Into::into),
@@ -192,16 +185,11 @@ pub(crate) fn dispatch(
 }
 
 fn run_self_update(
-    renderer: &Renderer,
+    theme: crate::render::theme::Theme,
     json: bool,
-    plain: bool,
     check_only: bool,
     yes: bool,
 ) -> Result<(), String> {
-    if !json && !plain && crate::tui::should_launch_operation() {
-        return crate::tui::run_self_update(renderer.theme, check_only, yes);
-    }
-
     let current = self_update::current_version().map_err(|error| error.to_string())?;
     if self_update::is_development_version(&current) && !check_only {
         let report = self_update::report_for_check(&self_update::CheckReport {
@@ -209,23 +197,23 @@ fn run_self_update(
             current_is_development: true,
             latest: None,
         });
-        return print_self_update_report(json, report);
+        return print_self_update_report(theme, json, report);
     }
 
     let check = match self_update::check_current(check_only) {
         Ok(check) => check,
         Err(error) => {
-            return print_self_update_report(json, self_update::error_report_for_cli(error));
+            return print_self_update_report(theme, json, self_update::error_report_for_cli(error));
         }
     };
     let mut report = self_update::report_for_check(&check);
     if check_only || check.latest.is_none() {
-        return print_self_update_report(json, report);
+        return print_self_update_report(theme, json, report);
     }
     if !yes {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             report.message = "An update is available. Review it in an interactive terminal or pass --yes after reviewing the release details.".into();
-            return print_self_update_report(json, report);
+            return print_self_update_report(theme, json, report);
         }
         println!("Current version: {}", report.current_version);
         if let Some(version) = &report.available_version {
@@ -239,23 +227,29 @@ fn run_self_update(
         io::stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
         if !matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
             report.message = "Update cancelled. Orbis was not changed.".into();
-            return print_self_update_report(json, report);
+            return print_self_update_report(theme, json, report);
         }
     }
     report = self_update::install_current(&check, &SilentUpdateObserver);
-    print_self_update_report(json, report)
+    print_self_update_report(theme, json, report)
 }
 
-fn print_self_update_report(json: bool, report: SelfUpdateReport) -> Result<(), String> {
+fn print_self_update_report(
+    theme: crate::render::theme::Theme,
+    json: bool,
+    report: SelfUpdateReport,
+) -> Result<(), String> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?);
     } else {
-        println!("◈ ORBIS");
+        println!("{} // SELF UPDATE", theme.brand_compact());
+        println!("{}", (if theme.unicode { "─" } else { "-" }).repeat(theme.width.clamp(32, 88)));
         println!();
-        println!("{}", report.message);
-        if let Some(version) = report.available_version {
-            println!("Available release: {version}");
+        println!("Current       {}", report.current_version);
+        if let Some(version) = &report.available_version {
+            println!("Available     {version}");
         }
+        println!("{}", report.message);
     }
     Ok(())
 }
@@ -420,7 +414,6 @@ fn run_transaction(
     registry: &ProviderRegistry,
     renderer: &Renderer,
     json: bool,
-    plain: bool,
     options: TransactionOptions,
 ) -> Result<(), String> {
     let package_ref = match resolve_mutation_reference(
@@ -439,6 +432,16 @@ fn run_transaction(
         scope: options.scope,
         channel: options.channel,
     };
+    let brief = if json {
+        None
+    } else {
+        match registry.resolve(&package_ref) {
+            ResolveReport::Found { package, .. } => {
+                Some(orbis_core::explain::build_brief(*package))
+            }
+            _ => None,
+        }
+    };
     let plan = match registry.plan_transaction(&request) {
         Ok(plan) => plan,
         Err(error) => return report_error(json, error.to_string()),
@@ -447,7 +450,7 @@ fn run_transaction(
         if json {
             print_json(&plan)
         } else {
-            print!("{}", renderer.transaction_plan(&plan));
+            print!("{}", renderer.transaction_review(&plan, brief.as_ref()));
             Ok(())
         }
     } else if !plan.executable() {
@@ -464,22 +467,14 @@ fn run_transaction(
                 &plan,
             );
         }
-        if !plain && crate::tui::should_launch_operation() {
-            return crate::tui::run_transaction(
-                registry,
-                renderer.theme,
-                request,
-                plan,
-                options.yes,
-            );
-        }
         if !options.yes {
-            print!("{}", renderer.transaction_plan(&plan));
+            print!("{}", renderer.transaction_review(&plan, brief.as_ref()));
             if !confirm(&plan)? {
-                return Err("operation cancelled; no package state was changed".into());
+                println!("\nOperation cancelled.\nNothing was changed.\n");
+                return Ok(());
             }
         } else if !json {
-            print!("{}", renderer.transaction_plan(&plan));
+            print!("{}", renderer.transaction_review(&plan, brief.as_ref()));
         }
         let history = orbis_core::transaction::history::HistoryStore::default_location()
             .map_err(|e| format!("could not start transaction: {e}"))?;
@@ -575,18 +570,8 @@ fn run_maintenance(
     registry: &ProviderRegistry,
     renderer: &Renderer,
     json: bool,
-    plain: bool,
     options: MaintenanceOptions,
 ) -> Result<(), String> {
-    if !json && !plain && !options.plan_only && crate::tui::should_launch_operation() {
-        return crate::tui::run_maintenance(
-            registry,
-            renderer.theme,
-            options.action,
-            options.source,
-            options.yes,
-        );
-    }
     let plan = registry.maintenance_plan(options.action, options.source)?;
     if options.plan_only {
         if json {
@@ -607,7 +592,8 @@ fn run_maintenance(
         }
         print!("{}", renderer.maintenance_plan(&plan));
         if !confirm_maintenance(&plan)? {
-            return Err("operation cancelled; no package state was changed".into());
+            println!("\nOperation cancelled.\nNothing was changed.\n");
+            return Ok(());
         }
         if options.action == MaintenanceAction::Upgrade {
             registry.revalidate_upgrade_plan(&plan)?;

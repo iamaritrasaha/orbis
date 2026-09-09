@@ -21,11 +21,11 @@ All maintenance commands accept `--source apt`, `--source flatpak`, `--source sn
 
 `orbis self-update --check` performs a read-only check against the canonical Orbis GitHub Releases channel. `orbis self-update` reviews and, after confirmation, downloads the matching Linux x86_64 or ARM64 archive, requires its SHA-256 checksum, rejects unsafe archive entries, and atomically replaces only the user-owned executable returned by `std::env::current_exe()`. It never uses `sudo`, executes a downloaded script, or replaces another installation.
 
-Development builds contain `.dev.` and are deliberately ineligible for self-replacement. They report `git pull --ff-only` followed by `cargo install --path crates/orbis-cli --locked --force`. A normal dashboard launch may perform a bounded background release check at most once per 24 hours and only displays a subtle notice; it never mutates Orbis.
+Development builds contain `.dev.` and are deliberately ineligible for self-replacement. They report `git pull --ff-only` followed by `cargo install --path crates/orbis-cli --locked --force`. An explicit `orbis ui` launch may perform a bounded background release check at most once per 24 hours and only displays a subtle notice; it never mutates Orbis.
 
 ## Live operations
 
-Interactive TTY operations use a persistent Orbis execution view. It reports the universal stages `Preparing`, `Getting permission`, `Installing`, `Checking installation`, and `Finishing up`, along with source activity and a bounded `PROVIDER OUTPUT · DETAILS` panel.
+Human-facing commands use a transient Orbis execution view that returns to the shell after completion. It reports the universal stages `Preparing`, `Getting permission`, `Installing`, `Checking installation`, and `Finishing up`, along with source activity and bounded provider detail. The persistent execution view remains available through explicit `orbis ui` navigation.
 
 Provider activity comes from typed core events around the provider operation. A source can be waiting, working, done, or in need of attention. Update inventories are delivered to the TUI as each source finishes, while the final report is sorted for deterministic plain and JSON output. Orbis does not infer safety, counts, verification, or percentages by scraping display text. Raw stdout and stderr are retained only in memory for the details panel and are bounded before rendering.
 

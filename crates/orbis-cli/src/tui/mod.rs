@@ -31,7 +31,6 @@ use ratatui::{
 };
 
 use crate::{
-    cli::Command,
     commands,
     render::theme::{StageState, Theme, Token},
     self_update::{self, CheckReport, SelfUpdateReport, SelfUpdateStage, SelfUpdateState},
@@ -65,7 +64,6 @@ enum Screen {
 
 enum WorkerMessage {
     Snapshot(Vec<SourceInfo>, UpdateInventoryReport, orbis_core::diagnostics::DoctorReport),
-    UpdateInventory(UpdateInventoryReport),
     Search(String, orbis_core::SearchReport),
     Plan(Box<Result<(OperationRequest, OperationPlan), String>>),
     Maintenance(Result<MaintenancePlan, String>),
@@ -78,10 +76,6 @@ enum WorkerMessage {
     SelfUpdateChecked(Box<Result<CheckReport, SelfUpdateReport>>),
     SelfUpdateProgress(SelfUpdateStage),
     SelfUpdateComplete(SelfUpdateReport),
-}
-
-pub(crate) fn should_launch(command: Option<&Command>, json: bool, plain: bool) -> bool {
-    !json && !plain && command.is_none() && terminal_capable()
 }
 
 pub(crate) fn run(registry: &ProviderRegistry, theme: Theme, json: bool) -> Result<(), String> {
@@ -112,119 +106,6 @@ pub(crate) fn run(registry: &ProviderRegistry, theme: Theme, json: bool) -> Resu
             eprintln!("orbis: dashboard unavailable ({error}); showing plain status");
             Ok(())
         }
-    }
-}
-
-/// Runs the Orbis self-update flow in the same calm full-screen presentation
-/// used by package operations. The updater has its own stages and never enters
-/// the package-provider transaction boundary.
-pub(crate) fn run_self_update(theme: Theme, check_only: bool, yes: bool) -> Result<(), String> {
-    if !terminal_capable() {
-        return Err("self-update presentation requires an interactive terminal".into());
-    }
-    let registry = ProviderRegistry::system();
-    let (tx, rx) = mpsc::channel();
-    let mut app = App::new(&registry, theme, tx, rx);
-    app.request_self_update(check_only, yes);
-    app.animation = StartupAnimation::new(&theme);
-    match run_sessions(&mut app) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(format!("self-update presentation unavailable: {error}")),
-    }
-}
-
-/// Whether an operation should use the full-screen live presentation.
-pub(crate) fn should_launch_operation() -> bool {
-    terminal_capable()
-}
-
-/// Runs a reviewed maintenance operation in the live terminal presentation.
-/// The plan is still built by the core registry and execution still crosses the
-/// same typed executor/history boundary as the ordinary CLI.
-pub(crate) fn run_maintenance(
-    registry: &ProviderRegistry,
-    theme: Theme,
-    action: MaintenanceAction,
-    source: Option<PackageSource>,
-    yes: bool,
-) -> Result<(), String> {
-    if !terminal_capable() {
-        return Err("live operations require an interactive terminal".into());
-    }
-    let (tx, rx) = mpsc::channel();
-    let mut app = App::new(registry, theme, tx, rx);
-    app.maintenance_source = source;
-    app.maintenance_auto_apply = yes;
-    app.request_maintenance(action);
-    app.animation = StartupAnimation::new(&theme);
-    match run_sessions(&mut app) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(format!("live operation unavailable: {error}")),
-    }
-}
-
-/// Runs an exact, already-resolved package plan in the live operation view.
-/// Resolution and planning remain outside this presentation entry point so an
-/// explicit CLI command and a dashboard selection share the same safety checks.
-pub(crate) fn run_transaction(
-    registry: &ProviderRegistry,
-    theme: Theme,
-    request: OperationRequest,
-    plan: OperationPlan,
-    yes: bool,
-) -> Result<(), String> {
-    if !terminal_capable() {
-        return Err("live operations require an interactive terminal".into());
-    }
-    let (tx, rx) = mpsc::channel();
-    let mut app = App::new(registry, theme, tx, rx);
-    app.selected_package = Some(plan.target.clone());
-    app.plan = Some((request, plan));
-    app.screen = Screen::Confirm;
-    if yes {
-        app.start_transaction();
-    }
-    match run_sessions(&mut app) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(format!("live operation unavailable: {error}")),
-    }
-}
-
-/// Checks for updates in a focused read-only TUI view. The check uses the core
-/// registry directly and never crosses the mutation boundary.
-pub(crate) fn run_update(
-    registry: &ProviderRegistry,
-    theme: Theme,
-    source: Option<PackageSource>,
-) -> Result<(), String> {
-    if !terminal_capable() {
-        return Err("live update checks require an interactive terminal".into());
-    }
-    let (tx, rx) = mpsc::channel();
-    let mut app = App::new(registry, theme, tx, rx);
-    app.screen = Screen::Updates;
-    app.update_check_running = true;
-    app.maintenance_provider_status = registry
-        .sources()
-        .into_iter()
-        .filter(|info| source.is_none_or(|wanted| wanted == info.source))
-        .map(|info| (info.source, "Waiting".to_owned()))
-        .collect();
-    let tx = app.tx.clone();
-    std::thread::spawn(move || {
-        struct TuiObserver(Sender<WorkerMessage>);
-        impl orbis_core::progress::ProgressObserver for TuiObserver {
-            fn on_event(&self, event: &orbis_core::progress::OperationEvent) {
-                let _ = self.0.send(WorkerMessage::Progress(event.clone()));
-            }
-        }
-        let observer = TuiObserver(tx.clone());
-        let report = ProviderRegistry::system().updates_with_observer(source, &observer);
-        let _ = tx.send(WorkerMessage::UpdateInventory(report));
-    });
-    match run_sessions(&mut app) {
-        Ok(()) => Ok(()),
-        Err(error) => Err(format!("live update check unavailable: {error}")),
     }
 }
 
@@ -616,10 +497,6 @@ impl<'a> App<'a> {
                 self.doctor = Some(doctor);
                 self.snapshot_loading = false;
                 self.doctor_loading = false;
-            }
-            WorkerMessage::UpdateInventory(report) => {
-                self.updates = Some(report);
-                self.update_check_running = false;
             }
             WorkerMessage::Search(query, report) if query == self.search_query => {
                 self.search_results = report.results;
@@ -1481,51 +1358,22 @@ impl<'a> App<'a> {
 
     fn draw_brand(&mut self, frame: &mut Frame<'_>, area: Rect, compact: bool) {
         let step = self.animation.step();
-        let lines = if compact || matches!(step, AnimationStep::Finished | AnimationStep::Settled) {
-            let mark = match step {
-                AnimationStep::Diamond => "◈",
+        let mark = if compact || matches!(step, AnimationStep::Settled | AnimationStep::Finished) {
+            self.theme.brand_compact()
+        } else {
+            match step {
+                AnimationStep::Diamond => "◇",
                 AnimationStep::Reveal => "◈ ORBIS",
                 AnimationStep::Settled | AnimationStep::Finished => self.theme.brand_compact(),
-            };
-            vec![
-                Line::from(Span::styled(
-                    mark,
-                    self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(Theme::brand_tagline(), self.theme.style(Token::Muted))),
-            ]
-        } else {
-            let brand = self.theme.brand_full();
-            match step {
-                AnimationStep::Diamond => vec![Line::from(Span::styled(
-                    "◈",
-                    self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
-                ))],
-                AnimationStep::Reveal => {
-                    let rows = ((self.animation.elapsed_ms().saturating_sub(140) / 60) as usize)
-                        .clamp(1, brand.len());
-                    brand
-                        .iter()
-                        .enumerate()
-                        .map(|(index, line)| {
-                            if index < rows {
-                                Line::from(Span::styled(*line, self.theme.style(Token::Primary)))
-                            } else {
-                                Line::from("")
-                            }
-                        })
-                        .collect()
-                }
-                AnimationStep::Settled | AnimationStep::Finished => brand
-                    .iter()
-                    .map(|line| Line::from(Span::styled(*line, self.theme.style(Token::Primary))))
-                    .chain(std::iter::once(Line::from(Span::styled(
-                        Theme::brand_tagline(),
-                        self.theme.style(Token::Muted),
-                    ))))
-                    .collect(),
             }
         };
+        let lines = vec![
+            Line::from(Span::styled(
+                mark,
+                self.theme.style(Token::Primary).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(Theme::brand_tagline(), self.theme.style(Token::Muted))),
+        ];
         frame.render_widget(Paragraph::new(Text::from(lines)).alignment(Alignment::Center), area);
     }
 
@@ -3435,7 +3283,7 @@ mod tests {
     #[test]
     fn compact_80x24_uses_the_small_brand_and_keeps_footer_visible() {
         let lines = render_lines(80, 24, false);
-        assert!(lines[0].contains("@ ORBIS"));
+        assert!(lines[0].contains("* ORBIS"));
         assert!(lines.iter().any(|line| line.contains("SYSTEM PULSE")));
         assert!(lines.iter().any(|line| line.contains("FIND SOFTWARE")));
         assert!(lines[23].contains("/ Find"));
@@ -3453,7 +3301,7 @@ mod tests {
             app.screen = Screen::SelfUpdate;
             app.self_update_report = Some(SelfUpdateReport {
                 state: SelfUpdateState::DevelopmentBuild,
-                current_version: "0.1.0-beta.1.dev.3".into(),
+                current_version: "0.1.0-beta.1.dev.4".into(),
                 available_version: Some("0.1.0-beta.1".into()),
                 installed_version: None,
                 message: "This is a development build. It will not replace itself.".into(),
@@ -3739,7 +3587,7 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).expect("draw reduced-motion progress");
         let content: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content.contains("◐ Installing"));
+        assert!(content.contains("⠹ Installing"));
         assert!(!content.contains("⠋"));
     }
 
@@ -3839,13 +3687,13 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).expect("draw frame 0");
         let content0: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content0.contains('◈'));
+        assert!(content0.contains('◇'));
 
         app.animation.set_elapsed_ms(300);
         terminal.draw(|frame| app.draw(frame)).expect("draw wordmark");
         let content_wm: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content_wm.contains(" ███  ████"));
+        assert!(content_wm.contains("◈ ORBIS"));
 
         app.animation.set_elapsed_ms(650);
         terminal.draw(|frame| app.draw(frame)).expect("draw finished");

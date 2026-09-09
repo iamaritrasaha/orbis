@@ -1,4 +1,4 @@
-.TH ORBIS 1 "2026-09-08" "Orbis 0.1.0-beta.1.dev.3" "Orbis manual"
+.TH ORBIS 1 "2026-09-08" "Orbis 0.1.0-beta.1.dev.4" "Orbis manual"
 .SH NAME
 orbis \- your Linux software, in one place
 .SH SYNOPSIS
@@ -18,7 +18,7 @@ Emit structured JSON instead of terminal presentation.
 Disable ANSI styling.
 .TP
 .B --plain
-Use deterministic plain output instead of the full-screen TUI.
+Use deterministic plain output without animation or cursor movement.
 .TP
 .B -h, --help
 Print help.
@@ -56,6 +56,9 @@ Check that software systems are working.
 .TP
 .B self-update
 Check for and safely install a newer Orbis release. Development builds never replace themselves.
+.TP
+.B ui, dashboard
+Open the optional persistent full-screen interface. Ordinary commands run inline and return to the shell.
 .SH UPDATE OPTIONS
 .TP
 .B update --plan
@@ -95,7 +98,7 @@ an actual mutating operation requires an interactive terminal and explicit confi
 .B --source
 or a qualified reference. Administrator authorization is requested only for the exact reviewed system operation.
 .PP
-Interactive operations show real lifecycle and provider activity in a bounded details view. They do not invent percentages. Piped, non-TTY, JSON, and
+Transient operations show real lifecycle and provider activity in bounded inline output. The explicit full-screen interface may show a persistent details view. They do not invent percentages. Piped, non-TTY, JSON, and
 .B --plain
 output remains deterministic and contains no terminal control sequences.
 .SH FILES

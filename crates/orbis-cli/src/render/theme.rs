@@ -112,12 +112,12 @@ impl Theme {
                 Token::Primary => "◈",
                 Token::Positive => "●",
                 Token::Unavailable => "○",
-                Token::Caution => "◐",
+                Token::Caution | Token::Destructive => "!",
                 _ => "·",
             }
         } else {
             match token {
-                Token::Primary => "@",
+                Token::Primary => "*",
                 Token::Positive => "*",
                 Token::Unavailable => "o",
                 Token::Caution => "!",
@@ -126,24 +126,9 @@ impl Theme {
         }
     }
 
-    /// Returns the multi-line Orbis wordmark for dashboard and home screens.
-    pub(crate) fn brand_full(self) -> &'static [&'static str] {
-        if self.unicode {
-            &[
-                " ███  ████  ████  █████  ████ ",
-                "█   █ █   █ █   █    █   █    ",
-                "█   █ ████  ████     █    ███ ",
-                "█   █ █ █   █   █     █      █",
-                " ███  █  ██ ████   █████ ████ ",
-            ]
-        } else {
-            &[" @  ORBIS"]
-        }
-    }
-
     /// Returns a single-line compact header mark.
     pub(crate) fn brand_compact(self) -> &'static str {
-        if self.unicode { "◈ ORBIS" } else { "@ ORBIS" }
+        if self.unicode { "◈ ORBIS" } else { "* ORBIS" }
     }
 
     /// Returns the Orbis tagline.
@@ -156,7 +141,7 @@ impl Theme {
         if self.unicode {
             match state {
                 StageState::Done => "●",
-                StageState::Active => "◐",
+                StageState::Active => "⠹",
                 StageState::Pending => "○",
             }
         } else {
@@ -222,35 +207,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unicode_theme_provides_the_intended_legible_orbis_wordmark() {
+    fn unicode_theme_provides_the_compact_orbis_brand() {
         let theme = Theme { color: true, unicode: true, width: 80, mode: ColorMode::TrueColor };
-        let brand = theme.brand_full();
-        assert_eq!(
-            brand,
-            &[
-                " ███  ████  ████  █████  ████ ",
-                "█   █ █   █ █   █    █   █    ",
-                "█   █ ████  ████     █    ███ ",
-                "█   █ █ █   █   █     █      █",
-                " ███  █  ██ ████   █████ ████ ",
-            ]
-        );
-        assert_eq!(brand.len(), 5);
-        assert!(brand.iter().all(|line| line.chars().count() == 30));
         assert_eq!(theme.brand_compact(), "◈ ORBIS");
         assert_eq!(Theme::brand_tagline(), "Your Linux software, in one place.");
         assert_eq!(theme.stage_mark(StageState::Done), "●");
-        assert_eq!(theme.stage_mark(StageState::Active), "◐");
+        assert_eq!(theme.stage_mark(StageState::Active), "⠹");
         assert_eq!(theme.stage_mark(StageState::Pending), "○");
     }
 
     #[test]
     fn ascii_theme_provides_safe_ascii_fallback() {
         let theme = Theme { color: false, unicode: false, width: 80, mode: ColorMode::None };
-        let brand = theme.brand_full();
-        assert_eq!(brand.len(), 1);
-        assert!(brand[0].contains("@  ORBIS"));
-        assert_eq!(theme.brand_compact(), "@ ORBIS");
+        assert_eq!(theme.brand_compact(), "* ORBIS");
         assert_eq!(theme.stage_mark(StageState::Done), "*");
         assert_eq!(theme.stage_mark(StageState::Active), ">");
         assert_eq!(theme.stage_mark(StageState::Pending), ".");

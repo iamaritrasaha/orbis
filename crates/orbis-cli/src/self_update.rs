@@ -1006,7 +1006,7 @@ mod tests {
         let beta1 = Version::parse("0.1.0-beta.1").expect("semver");
         let beta2 = Version::parse("0.1.0-beta.2").expect("semver");
         let stable = Version::parse("0.1.0").expect("semver");
-        let dev = Version::parse("0.1.0-beta.1.dev.3").expect("semver");
+        let dev = Version::parse("0.1.0-beta.1.dev.4").expect("semver");
         assert!(beta2 > beta1);
         assert!(stable > beta2);
         assert!(is_development_version(&dev));
@@ -1061,7 +1061,7 @@ mod tests {
 
     #[test]
     fn development_build_never_becomes_eligible_for_replacement() {
-        let current = Version::parse("0.1.0-beta.1.dev.3").expect("version");
+        let current = Version::parse("0.1.0-beta.1.dev.4").expect("version");
         let check =
             CheckReport { current_version: current, current_is_development: true, latest: None };
         let report = report_for_check(&check);

@@ -3,8 +3,8 @@
 _orbis() {
     local -a commands
     commands=(
-        'dashboard:Launch the interactive Orbis dashboard'
-        'ui:Alias for dashboard'
+        'dashboard:Open the optional full-screen interface'
+        'ui:Open the optional full-screen interface'
         'sources:Show detected providers and capabilities'
         'find:Find software across supported systems'
         'show:Learn what software does and where it came from'

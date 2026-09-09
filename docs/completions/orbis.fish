@@ -1,8 +1,8 @@
-# fish completion for Orbis 0.1.0-beta.1.dev.3
+# fish completion for Orbis 0.1.0-beta.1.dev.4
 
 complete -c orbis -f
-complete -c orbis -n '__fish_use_subcommand' -a dashboard -d 'Launch the interactive dashboard'
-complete -c orbis -n '__fish_use_subcommand' -a ui -d 'Alias for dashboard'
+complete -c orbis -n '__fish_use_subcommand' -a dashboard -d 'Open the optional full-screen interface'
+complete -c orbis -n '__fish_use_subcommand' -a ui -d 'Open the optional full-screen interface'
 complete -c orbis -n '__fish_use_subcommand' -a sources -d 'Show detected providers'
 complete -c orbis -n '__fish_use_subcommand' -a find -d 'Find software'
 complete -c orbis -n '__fish_use_subcommand' -a show -d 'Learn about software'
