@@ -1,4 +1,5 @@
 use super::theme::{Theme, Token};
+use unicode_width::UnicodeWidthStr;
 
 /// The two-dimensional identity states used by the short interactive reveal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,7 +32,7 @@ impl BrandFrame {
     pub(crate) fn launcher(theme: Theme) -> Self {
         let mut lines = wordmark(theme, 5);
         lines.push(String::new());
-        lines.push(centered(theme, Theme::brand_tagline(), Token::Muted));
+        lines.push(centered(theme, Theme::brand_tagline(), wordmark_width(theme), Token::Muted));
         Self { lines }
     }
 
@@ -109,13 +110,16 @@ fn visible_width(row: &str, letters: usize) -> usize {
 }
 
 fn signature(theme: Theme) -> String {
-    centered(theme, "HRIK", Token::Muted)
+    centered(theme, "HRIK", wordmark_width(theme), Token::Muted)
 }
 
-fn centered(theme: Theme, value: &str, token: Token) -> String {
-    let width: usize = 32;
-    let left = width.saturating_sub(value.chars().count()) / 2;
+fn centered(theme: Theme, value: &str, width: usize, token: Token) -> String {
+    let left = width.saturating_sub(value.width()) / 2;
     theme.paint(&format!("{:left$}{value}", ""), token)
+}
+
+fn wordmark_width(theme: Theme) -> usize {
+    if theme.unicode { unicode_rows()[0].width() } else { ascii_rows()[0].width() }
 }
 
 #[cfg(test)]
@@ -158,5 +162,16 @@ mod tests {
     fn identity_modes_are_explicit() {
         assert_eq!(IdentityMode::Launcher, IdentityMode::Launcher);
         assert_eq!(IdentityMode::Command("HEALTH"), IdentityMode::Command("HEALTH"));
+    }
+
+    #[test]
+    fn signature_uses_the_wordmarks_display_width() {
+        let mut theme = Theme::test(80);
+        theme.unicode = true;
+        let frame = BrandFrame::animation(theme, 6);
+        let rows = frame.lines();
+        assert_eq!(rows[0].width(), rows[2].width());
+        assert_eq!(rows[3].trim(), "HRIK");
+        assert_eq!(rows[3].find('H'), Some((rows[0].width() - "HRIK".width()) / 2));
     }
 }

@@ -116,7 +116,7 @@ impl Drop for RawModeGuard {
 /// Runs the bare-command launcher. None means cancel or a non-interactive
 /// caller; the caller can then return without entering a persistent screen.
 pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
-    if !terminal_capable() || !theme.color {
+    if !terminal_capable() {
         print!("{}", launcher_text_compact(theme, 0));
         return Ok(None);
     }
