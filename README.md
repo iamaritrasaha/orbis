@@ -1,14 +1,58 @@
+<div align="center">
+
+<pre>
+╭──╮  ╭──╮  ╭──╮    ╷    ╭──╮
+│  │  ├──╯  ├──┤    │    ╰──╮
+╰──╯  ╵  ╲  ╰──╯    ╵    ╰──╯
+
+HRIK
+</pre>
+
 # Orbis
 
-Your Linux software, in one place.
+### Your Linux software, in one place.
 
-Orbis is a calm, beginner-friendly way to find, understand, update, and safely manage software on Linux. You use the software name you know; Orbis works with the local software systems already trusted by your distribution and keeps their technical details available when you need them.
+A calm, terminal-native way to **find, understand, update, and safely manage software on Linux** — across the package systems you already use.
 
-The public release is [0.1.0-beta.1](https://github.com/iamaritrasaha/orbis/releases/tag/v0.1.0-beta.1). The current `main` branch is the next development snapshot and reports a development suffix until a later release is made. Orbis is Linux-first for x86_64 and ARM64. It does not require a hosted service or telemetry.
+[![CI](https://github.com/iamaritrasaha/orbis/actions/workflows/ci.yml/badge.svg)](https://github.com/iamaritrasaha/orbis/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/iamaritrasaha/orbis?display_name=tag&sort=semver)](https://github.com/iamaritrasaha/orbis/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Linux](https://img.shields.io/badge/platform-Linux-black.svg)](#installation)
 
-## Start here
+[Install](#installation) · [Quick start](#quick-start) · [How it works](#how-orbis-works) · [Safety](#safety-by-design) · [Development](#development)
 
-```sh
+</div>
+
+---
+
+## Why Orbis?
+
+Linux software is powerful, but the experience is fragmented.
+
+A single machine may use **APT**, **Flatpak**, **Snap**, **Cargo**, **npm**, **pnpm**, **uv**, and **pipx** — each with different commands, output, terminology, privilege rules, and update behavior.
+
+Orbis gives those systems one consistent human-facing interface while keeping the native package managers underneath.
+
+```text
+You ask:                Orbis figures out:
+
+orbis find firefox      where it is available
+orbis show btop         what it is and where it came from
+orbis update            what can be updated
+orbis install btop      what will change before anything runs
+orbis history           what Orbis changed previously
+```
+
+Orbis is **not** a new package format, repository, dependency resolver, or replacement for your distribution package manager.
+
+It is a safer, clearer orchestration layer over the software systems already trusted by your machine.
+
+---
+
+## Quick start
+
+```bash
 orbis find firefox
 orbis show btop
 orbis install btop
@@ -19,198 +63,265 @@ orbis history
 orbis health
 ```
 
-Normal Orbis commands run inline, leave their final result in scrollback, and return immediately to your shell. `orbis` opens a lightweight task-first launcher; `orbis ui` (or `orbis dashboard`) is the optional persistent full-screen interface. Every change is reviewed before it runs unless you explicitly use `--yes` after resolving an exact plan.
+Run `orbis` by itself for the lightweight task launcher.
 
-## Help for beginners
+Run `orbis ui` for the optional persistent full-screen interface.
 
-```text
-COMMON COMMANDS
+### The normal terminal experience
 
-  find       Find software
-  show       Learn about software
-  install    Install software
-  remove     Remove software
-  update     Check for updates
-  refresh    Refresh software information
-  clean      Remove unused software safely
-  history    See previous Orbis actions
-  health     Check that everything is working
-  self-update Update Orbis safely
-
-EXAMPLES
-
-  orbis find firefox
-  orbis show btop
-  orbis install btop
-  orbis update
-  orbis refresh
-  orbis health
-
-ADVANCED
-
-  orbis ui                 Open the optional full-screen interface
-  orbis sources            Inspect software sources
-```
-
-Run `orbis <command> --help` for details. The older names `search`, `info`, `explain`, `updates`, and `doctor` remain available as compatibility aliases where applicable. `upgrade` remains the advanced compatibility command for applying an update plan.
-
-## Default terminal experience
-
-Human-facing commands use a compact Orbis identity, a brief reveal, and a scrollback-preserving result. There is no alternate screen and no close key after a command completes.
+Orbis commands stay in your terminal, preserve scrollback, and return naturally to your shell.
 
 ```text
-◈ ORBIS // SHOW
-────────────────────────────────────────────────────────────────────────
+◈ ORBIS // UPDATES
+────────────────────────────────────────────────────────────────
 
-btop
-Interactive system monitor
+5 updates available
 
-WHAT IT DOES
-It lets you watch CPU usage, memory, disks, network activity, temperatures,
-and running processes in real time.
+SNAP
+  code                   a44adf7f → 88e44fa0
 
-STATUS
-  Status        Available
-  Source        Ubuntu/Debian repositories
-  Version       1.4.5
+NODE.JS
+  @deepseek-ai/dsh     0.1.1-rc.2 → 0.1.2-rc.1
+  @qwen-code/qwen-code     0.22.2 → 0.23.2
+  corepack                    0.35.0 → 0.36.0
+  npm                         11.19.0 → 12.0.2
+
+Coverage
+  ◇ Ubuntu repositories    status incomplete
+  ◇ Rust tools             status incomplete
+  ◇ Optional tools         pnpm, pipx unavailable
+
+Read-only · nothing changed
+Next  orbis update --apply
 ```
 
-The reveal is approximately 250–450 ms and any key skips it. `REDUCE_MOTION`, `NO_COLOR`, `TERM=dumb`, `--plain`, pipes, and redirected output disable animation and cursor movement. Presentation width is capped to a tasteful terminal column width.
+Animations are short and skippable. `REDUCE_MOTION`, `NO_COLOR`, `TERM=dumb`, `--plain`, pipes, redirected output, and JSON mode all fall back to deterministic non-animated output.
 
-## Optional full-screen interface
+---
 
-Run `orbis ui` or `orbis dashboard` when you want persistent Ratatui navigation. That explicit mode may require `q` to quit; ordinary commands never do.
+## One interface, many software systems
 
-## Live operations
+| Orbis view | Native software system | Typical scope |
+| --- | --- | --- |
+| **Ubuntu repositories** | APT / Nala-compatible Debian packaging | System |
+| **Flatpak** | Flatpak | System or user |
+| **Snap Store** | Snap | System |
+| **Rust tools** | Cargo | User-wide |
+| **Node.js tools** | npm / pnpm | User/global tooling |
+| **Python tools** | uv tools / pipx | User-wide tooling |
 
-Orbis restores the normal terminal before requesting administrator authentication, then returns to transient progress output. Run `orbis refresh` normally; no preparatory authorization command is needed. User-level plans do not request administrator access.
+Orbis keeps provider provenance available whenever it matters.
 
-```text
-◈ ORBIS // REFRESH
-3 sources · staged safely
+You can always be explicit:
 
-SOFTWARE SOURCES
-●  Ubuntu repositories Done
-⠹  Flatpak apps        Working…
-○  Snap Store          Waiting
-
-STAGE
-● Preparing
-● Permission granted
-⠹ Refreshing software information …
-○ Checking software information
-○ Finishing up
-
-1 done   1 active   1 waiting   0 problems
-──────────────────────────────────────────────────────────────────
-D details   L details   ? Help
+```bash
+orbis show apt:btop
+orbis install cargo:ripgrep
+orbis info flatpak:org.gimp.GIMP
 ```
 
-The summary receives real provider start, output, and completion events. Providers that need no refresh report `Not needed`; Snap refresh is managed automatically. Unsupported plans are marked `Skipped safely`. Stable APT `Hit:`, `Get:`, `Ign:`, and `Err:` lines provide a best-effort source URL and activity label. This parsing affects presentation only, and unknown lines remain available in Details.
+If the same software name exists in multiple ecosystems, Orbis does **not** silently choose one for you.
 
-Transient refresh output is concise; use `orbis refresh --plan` when you want the reviewed plan. Exact percentages are never invented. Ctrl+C during a provider operation requests exit after the operation finishes safely. Cached administrator credentials are checked noninteractively during execution; expired credentials fail safely and require a retry.
+---
 
-The active spinner advances at about 10 Hz. `REDUCE_MOTION` disables motion; `NO_COLOR` disables color and startup reveal. `TERM=dumb`, `--plain`, and non-TTY output use plain presentation. The idle interface stops animation redraws once background work and startup are finished.
+## What Orbis does
 
-## Finding and understanding software
+### Find software
 
-```sh
+```bash
 orbis find btop
+```
+
+Search across supported software systems without memorizing each backend command.
+
+### Understand software
+
+```bash
 orbis show btop
 ```
 
-Search results lead with the package name and purpose. The Orbis Brief explains what software does, why it may be useful, whether it is installed, and where it came from. Explanations are evidence-aware: when Orbis cannot establish a fact, it says so instead of guessing.
+Orbis explains:
 
-If the same name is available from several places, Orbis never silently chooses. Interactive terminals show a source chooser with a reasoned recommendation; scripts and other non-interactive callers must use `--source` or a qualified reference such as `apt:btop`.
+- what the software does;
+- why it may be useful;
+- whether it is installed;
+- which source provides it;
+- what Orbis knows with confidence;
+- what remains unknown.
 
-## Updates and software information
+When Orbis cannot establish a fact reliably, it says so instead of inventing an answer.
 
-`orbis update` is a read-only check. It reports available updates and offers a clear route to review and apply them. It does not refresh catalogs and does not change installed software.
+### Check updates
 
-```sh
-orbis update                 # check only
-orbis update --plan          # build a read-only application plan
-orbis update --apply         # review, confirm, execute, and verify
-orbis refresh                # refresh software information
-orbis refresh --plan         # inspect the refresh plan only
-orbis upgrade --plan         # advanced compatibility spelling
+```bash
+orbis update
 ```
 
-`orbis update --yes` applies the exact reviewed update operation without the second confirmation prompt. `--yes` never bypasses provider safeguards or administrator authorization.
+This is read-only. It checks supported sources and groups the result by software family.
 
-## Updating Orbis itself
+No package state or software catalog is changed.
 
-Orbis can check and update a user-local Orbis installation from the official GitHub Releases channel:
+### Review and apply updates
 
-```sh
-orbis self-update --check
-orbis self-update
+```bash
+orbis update --apply
 ```
 
-The normal flow shows the current and available versions, asks before downloading, verifies the SHA-256 checksum and archive structure, and atomically replaces only the executable that is actually running. The existing binary remains untouched if any check fails. `--yes` skips only the Orbis confirmation after the exact release has been selected; it never bypasses checksum verification, archive safety, or provider authorization.
+Orbis builds the latest executable plan, shows only actionable changes, separates **coverage limitations** from **execution risk**, and asks for confirmation before mutation.
 
-Self-update does not use `sudo`, does not run a downloaded installer script, and cannot replace a system-owned installation or another `orbis` found on `PATH`. For those installations, use the original install method. The supported release channel is the current Beta channel, with Linux x86_64 and ARM64 archives.
+```text
+◈ ORBIS // UPDATE
+────────────────────────────────────────────────────────────────
 
-Development builds contain `.dev.` in their version and never replace themselves. They report the safe source workflow instead:
+5 updates ready
 
-```sh
-git pull --ff-only
-cargo install --path crates/orbis-cli --locked --force
+SNAP · admin
+  code                   a44adf7f → 88e44fa0
+
+NODE.JS
+  @deepseek-ai/dsh     0.1.1-rc.2 → 0.1.2-rc.1
+  @qwen-code/qwen-code     0.22.2 → 0.23.2
+  corepack                    0.35.0 → 0.36.0
+  npm                         11.19.0 → 12.0.2
+
+Coverage
+  ◇ Ubuntu repositories    status incomplete
+  ◇ Rust tools             update unavailable
+  ◇ Optional tools         pnpm, pipx unavailable
+
+Risk  normal
+Only the updates listed above will be changed.
+
+Continue? [Y/n]
 ```
 
-The release check is bounded and quiet during an explicit full-screen startup. If a new public release is known, the interface shows a small review notice; it never updates Orbis in the background. No account, telemetry, or hosted service is required beyond the public GitHub release request.
+Genuinely high-impact plans require literal `YES`. A blocked plan cannot cross the execution boundary.
 
-## Safety
+### Refresh software information
 
-Orbis separates discovery, planning, confirmation, execution, verification, and history:
+```bash
+orbis refresh
+```
 
-- ambiguous software names are stopped rather than guessed;
-- plans are read-only and show the intended changes, scope, privilege, warnings, and confidence;
-- incomplete or blocked plans cannot cross into execution;
-- system changes use a narrow typed administrator boundary and never expose passwords;
-- process arguments remain structured and never pass through a shell;
-- cleanup is conservative and does not purge configuration, package caches, application data, or Snap revisions;
-- every attempted change is recorded without command output, credentials, or tokens.
+Refreshes only the sources that actually require refresh work. Sources managed automatically or on demand remain visible without pretending to perform work.
 
-JSON output is a stable machine-readable interface. It remains provider-precise and is not rewritten to imitate the beginner presentation.
+### Keep a useful history
 
-## Software systems Orbis can use
+```bash
+orbis history
+```
 
-The normal interface uses friendly names. Advanced views and `--source` expose exact provenance when it matters.
+Human output is intentionally quiet:
 
-| Beginner-facing name | What Orbis can do |
-| --- | --- |
-| Ubuntu/Debian repositories | Find, show, install, remove, refresh, update, and conservative cleanup |
-| Flatpak apps | Find, show, install, remove, refresh, and update where safe |
-| Snap Store | Find, show, install, remove, and report pending updates |
-| Rust tools | Find, show, install, remove, and inspect user-wide Cargo tools |
-| Node.js tools | Find, show, install, remove, and inspect global npm/pnpm tools |
-| Python tools | Show, install, remove, and inspect persistent uv/pipx tools |
+```text
+◈ ORBIS // HISTORY
+────────────────────────────────────────────────────────────────
 
-Provider-specific source names, capabilities, limitations, and raw metadata are available under `orbis sources`, `orbis health`, and the Advanced area of the dashboard. Developer-tool operations are user-local; Orbis does not edit project manifests, lockfiles, `node_modules`, virtual environments, or arbitrary Python environments.
+●  4m ago      Refresh software information
+               completed
+
+◐  2d ago      Refresh software information
+               completed with limitations
+               Cargo upgrade provenance is incomplete
+
+●  3d ago      Install flatpak · Ubuntu repositories
+               completed
+```
+
+Full operation IDs and structured records remain available in plain, JSON, and detail views.
+
+---
+
+## How Orbis works
+
+Orbis follows a simple boundary:
+
+```text
+              human intent
+                   │
+                   ▼
+            ┌─────────────┐
+            │    Orbis    │
+            │  CLI / UI   │
+            └──────┬──────┘
+                   │
+          resolve + inspect
+                   │
+                   ▼
+            typed operation plan
+                   │
+            review / confirm
+                   │
+                   ▼
+       narrow provider execution
+                   │
+       ┌───────────┼───────────┐
+       ▼           ▼           ▼
+      APT       Flatpak      Snap       ...
+       │           │           │
+       └───────────┴───────────┘
+                   │
+             verification
+                   │
+                   ▼
+                history
+```
+
+The native package managers remain the source of truth for their ecosystems.
+
+Orbis adds a consistent planning, explanation, confirmation, progress, verification, and history layer around them.
+
+---
+
+## Safety by design
+
+Orbis is conservative on purpose.
+
+- **No shell execution path** — provider commands remain structured arguments.
+- **Plan before mutation** — intended changes are resolved before execution.
+- **Ambiguity is stopped** — Orbis never silently chooses between conflicting package sources.
+- **Privilege is narrow** — administrator access is requested only when the selected operation requires it.
+- **No fake dry-runs** — Orbis does not claim certainty when a provider cannot supply it.
+- **Blocked means blocked** — non-executable plans cannot be confirmed into execution.
+- **Risk and coverage are separate** — an unavailable optional provider does not make unrelated normal updates “high impact”.
+- **Developer ecosystems stay global/user-wide** — Orbis does not rewrite project manifests, lockfiles, `node_modules`, `.venv`, or arbitrary Python environments.
+- **History is sanitized** — credentials, tokens, and raw command output are not persisted.
+- **No telemetry or hosted service** — normal Orbis operation is local and deterministic.
+
+`--yes` skips only the interactive confirmation for an already reviewed executable plan. It does not bypass provider safeguards, plan validation, or administrator authorization.
+
+---
 
 ## Installation
 
-### Release installer
+### Install the current public Beta
 
-The Beta 1 installer installs to the user-owned `~/.local/bin` directory and does not need `sudo`:
+The public release is **v0.1.0-beta.1**.
 
-```sh
+It installs into the user-owned `~/.local/bin` directory and does not require `sudo`.
+
+```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/iamaritrasaha/orbis/releases/download/v0.1.0-beta.1/orbis-installer.sh | sh
 ```
 
-Restart the shell or follow the installer’s PATH instruction if `orbis` is not immediately found. Installing Orbis is separate from a later system software operation requesting administrator authorization.
+Then verify:
+
+```bash
+orbis --version
+orbis health
+```
+
+> `main` contains newer development snapshots and may report a `.dev.*` version until the next public release is published.
 
 ### Manual archive
 
-Download the matching Linux archive and checksum from the [Beta 1 release](https://github.com/iamaritrasaha/orbis/releases/tag/v0.1.0-beta.1), verify it, then install locally:
-
-```sh
+```bash
 version=0.1.0-beta.1
 target=x86_64-unknown-linux-gnu
 base=https://github.com/iamaritrasaha/orbis/releases/download/v${version}
 archive=orbis-${target}.tar.xz
+
 curl --proto '=https' --tlsv1.2 -fL -o "${archive}" "${base}/${archive}"
 curl --proto '=https' --tlsv1.2 -fL -o "${archive}.sha256" "${base}/${archive}.sha256"
 sha256sum --check "${archive}.sha256"
@@ -222,41 +333,134 @@ Use `aarch64-unknown-linux-gnu` for ARM64.
 
 ### Build from source
 
-Requires stable Rust and the locked workspace dependencies:
+Requires stable Rust and the locked workspace dependencies.
 
-```sh
+```bash
+git clone https://github.com/iamaritrasaha/orbis.git
+cd orbis
 cargo install --path crates/orbis-cli --locked
 ```
 
-Use `--offline` when all locked dependencies are already cached. A source build installs to Cargo's user bin directory; a release installer uses `~/.local/bin`. If more than one `orbis` is installed, run `command -v orbis` and `type -a orbis`, then invoke the path you intended. Orbis self-update only considers the executable returned by `current_exe`, not whichever copy happens to appear first on `PATH`.
+Or run without installing:
 
-Or run a release build without installing:
-
-```sh
+```bash
 cargo build --workspace --release
 ./target/release/orbis
 ```
 
-## Advanced usage
+---
 
-```sh
-orbis sources
-orbis health
-orbis search ripgrep
-orbis info apt:libssl-dev
-orbis explain apt:libssl3
-orbis why apt:libssl3
-orbis upgrade --plan
-orbis clean --plan
-orbis install cargo:ripgrep --plan
+## Updating Orbis itself
+
+A user-local release installation can safely check the official GitHub Releases channel:
+
+```bash
+orbis self-update --check
+orbis self-update
+```
+
+The updater:
+
+1. selects an official Orbis release;
+2. asks before downloading;
+3. verifies the SHA-256 checksum;
+4. validates the archive layout;
+5. atomically replaces only the executable that is currently running.
+
+It does not use `sudo`, does not execute downloaded installer scripts, and does not update in the background.
+
+Development builds containing `.dev.` never replace themselves through the release updater.
+
+---
+
+## CLI map
+
+### Everyday commands
+
+```text
+find         Find software
+show         Understand software
+install      Install software
+remove       Remove software
+update       Check for updates
+refresh      Refresh software information
+clean        Remove unused software conservatively
+history      Review previous Orbis actions
+health       Check provider readiness
+self-update  Update Orbis itself safely
+```
+
+### Advanced / compatibility commands
+
+```text
+sources      Inspect provider capabilities and provenance
+why          Explain why an installed package is present
+ui           Open the persistent full-screen interface
+dashboard    Alias for the full-screen interface
+search       Compatibility alias for find
+info         Provider-oriented package metadata
+explain      Compatibility explanation command
+upgrade      Advanced compatibility update command
+```
+
+Use `orbis --help` or `orbis <command> --help` for the exact current options.
+
+---
+
+## Human, plain, and JSON output
+
+Orbis intentionally has three presentation modes.
+
+### Human mode
+
+Designed for interactive terminals:
+
+- grouped provider families;
+- compact explanations;
+- transient progress;
+- semantic color;
+- short animation;
+- friendly status language.
+
+### Plain mode
+
+```bash
+orbis --plain update
+```
+
+Deterministic, sequential, ANSI-free output with more implementation detail.
+
+### JSON mode
+
+```bash
 orbis --json search btop
 ```
 
-Compatibility commands remain useful for existing scripts. Use `orbis --help` and each command’s help for the exact current options.
+Pure structured data for scripts and integrations. No branding, animation, or human reinterpretation is injected into JSON.
+
+---
+
+## Project structure
+
+```text
+orbis/
+├── crates/
+│   ├── orbis-core/       models, providers, plans, safety, execution, history
+│   └── orbis-cli/        commands, rendering, transient UI, full-screen TUI
+├── docs/                 architecture, maintenance, transactions, releases
+├── .github/workflows/    CI and release automation
+├── CONTRIBUTING.md
+├── CHANGELOG.md
+└── README.md
+```
+
+The architecture is intentionally split so rendering cannot become an arbitrary privileged execution path.
+
+---
 
 ## Development
 
-```sh
+```bash
 cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -265,16 +469,38 @@ cargo build --workspace --release
 git diff --check
 ```
 
-Tests use provider fixtures, TestBackend rendering, mocked command runners, and fake operation executors. They do not install or remove software, refresh catalogs, require `sudo`, or need a graphical desktop.
+Tests use fixtures, mocked runners, fake executors, terminal screen reconstruction, and pseudo-TTY coverage. They do not install or remove real software.
 
-The workspace is organized as:
+Useful project docs:
 
-```text
-crates/orbis-core/    models, providers, planning, execution, history, safety
-crates/orbis-cli/     parser, commands, plain output, live TUI, shared theme
-docs/                 architecture, maintenance, transactions, providers, releases
-```
+- [Architecture](docs/architecture.md)
+- [Maintenance model](docs/maintenance.md)
+- [Contributing](CONTRIBUTING.md)
+- [Release history](docs/releases.md)
+- [Changelog](CHANGELOG.md)
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md), [docs/architecture.md](docs/architecture.md), and [docs/maintenance.md](docs/maintenance.md) before changing provider or transaction behavior. Historical release notes remain in [docs/releases.md](docs/releases.md).
+---
 
-Orbis is released under the MIT license.
+## Current status
+
+- **Public release:** `v0.1.0-beta.1`
+- **Development branch:** `main`
+- **Current development line:** `0.1.0-beta.1.dev.*`
+- **Platforms:** Linux x86_64 and ARM64
+- **License:** MIT
+
+Orbis is still evolving. The focus is not on supporting every possible package ecosystem at any cost; it is on making the supported ones **clear, predictable, safe, and pleasant to use**.
+
+---
+
+<div align="center">
+
+### ◈ ORBIS
+
+**Your Linux software, in one place.**
+
+Built for people who like Linux — but do not want package management to feel fragmented.
+
+[Releases](https://github.com/iamaritrasaha/orbis/releases) · [Issues](https://github.com/iamaritrasaha/orbis/issues) · [Contributing](CONTRIBUTING.md)
+
+</div>
