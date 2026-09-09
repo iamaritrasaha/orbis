@@ -281,10 +281,47 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          TAG="${{ needs.plan.outputs.tag }}"
+          CURATED_NOTE="docs/release-notes/${TAG}.md"
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          RELEASE_TITLE_FILE="$RUNNER_TEMP/release-title.txt"
+          RELEASE_NOTES_FILE="$RUNNER_TEMP/release-notes.txt"
+
+          if [ -f "$CURATED_NOTE" ]; then
+            echo "Curated release note found: $CURATED_NOTE"
+
+            # Validate that the first line is an H1
+            FIRST_LINE="$(head -n 1 "$CURATED_NOTE")"
+            case "$FIRST_LINE" in
+              "# "*)
+                ;;
+              *)
+                echo "ERROR: curated release note '$CURATED_NOTE' does not start with '# '" >&2
+                echo "ERROR: first line was: $FIRST_LINE" >&2
+                exit 1
+                ;;
+            esac
+
+            # Extract title (strip leading "# ")
+            printf '%s' "${FIRST_LINE#"# "}" > "$RELEASE_TITLE_FILE"
+
+            # Extract body (everything after the first line)
+            tail -n +2 "$CURATED_NOTE" > "$RELEASE_NOTES_FILE"
+
+            echo "Curated release title: $(cat "$RELEASE_TITLE_FILE")"
+          else
+            echo "No curated release note for $TAG — using cargo-dist generated announcement"
+
+            printf '%s' "$ANNOUNCEMENT_TITLE" > "$RELEASE_TITLE_FILE"
+            printf '%s' "$ANNOUNCEMENT_BODY"  > "$RELEASE_NOTES_FILE"
+          fi
+
+          gh release create "$TAG" \
+            --target "$RELEASE_COMMIT" \
+            $PRERELEASE_FLAG \
+            --title "$(cat "$RELEASE_TITLE_FILE")" \
+            --notes-file "$RELEASE_NOTES_FILE" \
+            artifacts/*
 
   announce:
     needs:
