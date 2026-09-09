@@ -626,7 +626,7 @@ fn run_maintenance(
         return report_error(json, "no executable provider plan is available; unsupported or blocked providers were not changed".into());
     }
     if options.action == MaintenanceAction::Upgrade {
-        registry.revalidate_upgrade_plan(&plan)?;
+        revalidate_upgrade_for_review(registry, renderer, json, preserve_raw_output, &plan)?;
     }
     if plan.mutates && !options.yes {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -638,7 +638,7 @@ fn run_maintenance(
             return Ok(());
         }
         if options.action == MaintenanceAction::Upgrade {
-            registry.revalidate_upgrade_plan(&plan)?;
+            revalidate_upgrade_for_review(registry, renderer, json, preserve_raw_output, &plan)?;
         }
     } else if !json {
         print!("{}", renderer.maintenance_plan(&plan, preserve_raw_output));
@@ -745,6 +745,28 @@ fn run_maintenance(
             print!("{}", renderer.maintenance_result(&result, &result_plans, preserve_raw_output));
         }
         Ok(())
+    }
+}
+
+fn revalidate_upgrade_for_review(
+    registry: &ProviderRegistry,
+    renderer: &Renderer,
+    json: bool,
+    diagnostic: bool,
+    plan: &MaintenancePlan,
+) -> Result<(), String> {
+    match registry.revalidate_upgrade_plan(plan) {
+        Ok(()) => Ok(()),
+        Err(error) if json => report_error(
+            true,
+            format!("Update information changed while reviewing; latest plan required: {error}"),
+        ),
+        Err(error) => {
+            let latest = registry.maintenance_plan(MaintenanceAction::Upgrade, plan.source)?;
+            println!("\nUpdate information changed while reviewing. Showing the latest plan.\n");
+            print!("{}", renderer.maintenance_plan(&latest, diagnostic));
+            Err(format!("update information changed while reviewing; nothing was changed: {error}"))
+        }
     }
 }
 
@@ -984,11 +1006,18 @@ fn confirm_maintenance(plan: &MaintenancePlan) -> Result<bool, String> {
     }
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).map_err(|e| e.to_string())?;
-    Ok(if plan.risk >= orbis_core::transaction::RiskLevel::HighImpact {
-        answer.trim() == "YES"
+    Ok(maintenance_confirmation_accepts(plan.risk, answer.trim()))
+}
+
+fn maintenance_confirmation_accepts(
+    risk: orbis_core::transaction::RiskLevel,
+    answer: &str,
+) -> bool {
+    if risk >= orbis_core::transaction::RiskLevel::HighImpact {
+        answer == "YES"
     } else {
-        matches!(answer.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
-    })
+        matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes")
+    }
 }
 fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     println!("{}", serde_json::to_string_pretty(value).map_err(|e| e.to_string())?);
@@ -1005,4 +1034,25 @@ fn report_transaction_error(json: bool, message: &str, plan: &OperationPlan) -> 
         print_json(&serde_json::json!({"status":"blocked","plan":plan,"message":message}))?;
     }
     Err(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maintenance_confirmation_accepts;
+    use orbis_core::transaction::RiskLevel;
+
+    #[test]
+    fn normal_maintenance_confirmation_accepts_common_affirmative_answers() {
+        for answer in ["", "y", "Y", "yes", "YES"] {
+            assert!(maintenance_confirmation_accepts(RiskLevel::Normal, answer), "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn high_impact_maintenance_confirmation_requires_literal_yes() {
+        assert!(maintenance_confirmation_accepts(RiskLevel::HighImpact, "YES"));
+        for answer in ["", "y", "Y", "yes"] {
+            assert!(!maintenance_confirmation_accepts(RiskLevel::HighImpact, answer));
+        }
+    }
 }

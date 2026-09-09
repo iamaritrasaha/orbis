@@ -1,5 +1,5 @@
 use crossterm::{
-    cursor::{MoveDown, MoveToColumn, MoveUp},
+    cursor::{MoveDown, MoveToColumn, MoveUp, RestorePosition, SavePosition},
     execute,
     style::Print,
     terminal::{Clear, ClearType},
@@ -8,9 +8,9 @@ use std::io::{self, Write};
 
 /// A terminal region with a fixed anchor and height.
 ///
-/// Once reserved, rendering never moves below the region.  Every operation
-/// restores the cursor to the anchor at column zero, so callers can safely
-/// enter raw mode and redraw without relying on newline translation.
+/// Once reserved, rendering never moves below the region. The terminal's
+/// saved cursor position is the anchor: this keeps redraws correct even when
+/// work performed between frames moves the cursor elsewhere.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TransientRegion {
     height: usize,
@@ -38,7 +38,7 @@ impl TransientRegion {
         for _ in 0..self.height {
             writer.write_all(b"\r\n")?;
         }
-        execute!(writer, MoveUp(count), MoveToColumn(0))
+        execute!(writer, MoveUp(count), MoveToColumn(0), SavePosition)
     }
 
     pub(crate) fn render<W: Write>(&self, writer: &mut W, frame: &[String]) -> io::Result<()> {
@@ -53,6 +53,7 @@ impl TransientRegion {
             return Ok(());
         }
 
+        execute!(writer, RestorePosition)?;
         for index in 0..self.height {
             execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
             if let Some(line) = frame.get(index) {
@@ -62,7 +63,7 @@ impl TransientRegion {
                 execute!(writer, MoveDown(1))?;
             }
         }
-        execute!(writer, MoveUp(count - 1), MoveToColumn(0))
+        execute!(writer, MoveUp(count - 1), MoveToColumn(0), RestorePosition)
     }
 
     /// Clears the owned canvas and returns to its anchor for the next view.
@@ -96,6 +97,7 @@ impl TransientRegion {
             return Ok(());
         }
 
+        execute!(writer, RestorePosition)?;
         let unused = self.height - meaningful_height;
         if unused == 0 {
             execute!(writer, MoveDown(count), MoveToColumn(0))
@@ -130,13 +132,14 @@ impl TransientRegion {
         if count == 0 {
             return Ok(());
         }
+        execute!(writer, RestorePosition)?;
         for index in 0..self.height {
             execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
             if index + 1 < self.height {
                 execute!(writer, MoveDown(1))?;
             }
         }
-        execute!(writer, MoveUp(count - 1), MoveToColumn(0))
+        execute!(writer, MoveUp(count - 1), MoveToColumn(0), RestorePosition)
     }
 
     fn cursor_count(&self) -> io::Result<u16> {
@@ -242,7 +245,27 @@ mod tests {
         let screen = replay(&output);
         assert_eq!(screen.first().map(String::as_str), Some("final"));
         assert!(screen.iter().skip(1).all(|line| line.is_empty()), "screen: {screen:?}");
-        assert!(output.ends_with(b"\x1b[3A\x1b[1G"));
+        assert!(output.ends_with(b"\x1b8"));
+    }
+
+    #[test]
+    fn displaced_cursor_during_provider_work_does_not_corrupt_replacement() {
+        let mut output = Cursor::new(Vec::new());
+        let region = TransientRegion::new(1);
+        region.reserve(&mut output).expect("reserve row");
+        region
+            .render(&mut output, &frame(&["⠹ Checking software sources…"]))
+            .expect("render checking state");
+
+        // Model a graphical terminal or provider-side output displacing the
+        // cursor while the transient region is active.
+        execute!(&mut output, MoveDown(4), MoveToColumn(0)).expect("displace cursor");
+        region.clear_and_release_at_anchor(&mut output).expect("clear displaced transient state");
+        write!(output, "FINAL_RESULT").expect("write final result");
+
+        let screen = replay(&output.into_inner());
+        assert_eq!(screen.first().map(String::as_str), Some("FINAL_RESULT"));
+        assert!(screen.iter().skip(1).all(|line| line.is_empty()), "screen: {screen:?}");
     }
 
     #[test]
@@ -363,9 +386,19 @@ mod tests {
     fn replay(bytes: &[u8]) -> Vec<String> {
         let mut rows: Vec<Vec<char>> = vec![Vec::new()];
         let (mut row, mut column) = (0usize, 0usize);
+        let mut saved_position = (0usize, 0usize);
         let mut index = 0usize;
         while index < bytes.len() {
-            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'7') {
+                saved_position = (row, column);
+                index += 2;
+            } else if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'8') {
+                (row, column) = saved_position;
+                while rows.len() <= row {
+                    rows.push(Vec::new());
+                }
+                index += 2;
+            } else if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
                 let mut end = index + 2;
                 while end < bytes.len() && !bytes[end].is_ascii_alphabetic() {
                     end += 1;

@@ -392,6 +392,9 @@ impl Renderer {
     }
 
     pub(crate) fn maintenance_plan(&self, plan: &MaintenancePlan, diagnostic: bool) -> String {
+        if plan.action == orbis_core::maintenance::MaintenanceAction::Upgrade {
+            return self.upgrade_maintenance_plan(plan, diagnostic);
+        }
         let title = maintenance_title(plan.action);
         let mut output = self.heading(title, "");
         output.push_str("SOFTWARE SOURCES\n\n");
@@ -453,6 +456,93 @@ impl Renderer {
         };
         output.push_str(&summary);
         output.push_str(&format!("Risk  {}\n", plan.risk.label()));
+        if diagnostic {
+            output.push_str(&format!("Maintenance ID  {}\n", plan.operation_id));
+            for provider in &plan.providers {
+                for warning in &provider.warnings {
+                    output.push_str(&format!(
+                        "  {} {}\n",
+                        warning_marker(warning.level),
+                        warning.message
+                    ));
+                }
+            }
+        }
+        output
+    }
+
+    fn upgrade_maintenance_plan(&self, plan: &MaintenancePlan, diagnostic: bool) -> String {
+        let candidates = plan
+            .providers
+            .iter()
+            .filter(|provider| provider.executable() && !provider.candidates.is_empty())
+            .flat_map(|provider| provider.candidates.clone())
+            .collect::<Vec<_>>();
+        let mut output = self.heading("Update", "");
+        output.push_str(&format!(
+            "{} update{} ready\n",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        ));
+
+        for (label, group) in grouped_update_candidates(&candidates) {
+            output.push('\n');
+            let admin = if plan
+                .providers
+                .iter()
+                .filter(|provider| provider.executable() && !provider.candidates.is_empty())
+                .filter(|provider| {
+                    provider
+                        .candidates
+                        .iter()
+                        .any(|candidate| update_group_label(candidate) == label)
+                })
+                .any(|provider| {
+                    provider.privilege
+                        == orbis_core::transaction::PrivilegeRequirement::Administrator
+                }) {
+                " · admin"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "{}{}\n",
+                self.theme.paint(&label, Token::Muted),
+                self.theme.paint(admin, Token::Muted)
+            ));
+            output.push_str(&render_update_group(self, &group));
+        }
+
+        let coverage = maintenance_upgrade_coverage(plan);
+        if !coverage.is_empty() {
+            output.push_str("\nCoverage\n");
+            for (label, detail) in coverage {
+                output.push_str(&format!(
+                    "  {} {:<23} {}\n",
+                    self.theme.mark(Token::Unavailable),
+                    self.theme.paint(&label, Token::Muted),
+                    self.theme.paint(&detail, Token::Caution)
+                ));
+            }
+            output.push_str(&format!(
+                "  {}\n",
+                self.theme
+                    .paint("Incomplete sources are excluded from the update count.", Token::Muted)
+            ));
+            output
+                .push_str(&format!("Coverage  {}\n", self.theme.paint("limited", Token::Caution)));
+        }
+
+        output.push_str(&format!(
+            "\nRisk  {}\n",
+            self.theme.paint(plan.risk.label(), risk_token(plan.risk))
+        ));
+        if !candidates.is_empty() {
+            output.push_str(&format!(
+                "{}\n",
+                self.theme.paint("Only the updates listed above will be changed.", Token::Muted)
+            ));
+        }
         if diagnostic {
             output.push_str(&format!("Maintenance ID  {}\n", plan.operation_id));
             for provider in &plan.providers {
@@ -718,7 +808,7 @@ impl Renderer {
     }
 
     fn heading(&self, title: &str, subtitle: &str) -> String {
-        let divider_width = self.theme.width.clamp(40, 72);
+        let divider_width = self.theme.width.clamp(40, 64);
         let mut output = format!(
             "{} // {}\n{}\n",
             self.theme.paint(self.theme.brand_compact(), Token::Primary),
@@ -869,7 +959,7 @@ fn render_update_group(
         .map(|candidate| UnicodeWidthStr::width(candidate.name.as_str()))
         .max()
         .unwrap_or(0);
-    let content_width = renderer.theme.width.saturating_sub(2).min(72);
+    let content_width = renderer.theme.width.saturating_sub(2).min(64);
     let versions = candidates
         .iter()
         .map(|candidate| {
@@ -911,6 +1001,49 @@ fn render_update_group(
         }
     }
     output
+}
+
+fn risk_token(risk: orbis_core::transaction::RiskLevel) -> Token {
+    match risk {
+        orbis_core::transaction::RiskLevel::Normal => Token::Positive,
+        orbis_core::transaction::RiskLevel::Caution => Token::Caution,
+        orbis_core::transaction::RiskLevel::HighImpact
+        | orbis_core::transaction::RiskLevel::Blocked => Token::Destructive,
+    }
+}
+
+fn maintenance_upgrade_coverage(plan: &MaintenancePlan) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut optional = Vec::new();
+    for provider in &plan.providers {
+        if provider.executable() && !provider.candidates.is_empty() {
+            continue;
+        }
+        let unavailable =
+            !provider.supported || provider.risk == orbis_core::transaction::RiskLevel::Blocked;
+        let detail = if unavailable {
+            "update unavailable"
+        } else if provider.completeness != orbis_core::transaction::PlanCompleteness::Complete {
+            "status incomplete"
+        } else {
+            "up to date"
+        };
+        match provider.source {
+            PackageSource::Npm | PackageSource::Pnpm | PackageSource::Uv | PackageSource::Pipx
+                if unavailable =>
+            {
+                optional.push(provider.source.label().to_ascii_lowercase())
+            }
+            _ => rows
+                .push((maintenance_source_label(provider.source, provider.scope), detail.into())),
+        }
+    }
+    if !optional.is_empty() {
+        optional.sort();
+        optional.dedup();
+        rows.push(("Optional tools".into(), format!("{} unavailable", optional.join(", "))));
+    }
+    rows
 }
 
 struct Coverage {
@@ -1470,6 +1603,90 @@ mod tests {
         };
         let output = renderer.updates(&report);
         assert!(output.contains(&format!("  {long_name}\n    1.0.0 -> 2.0.0")));
+    }
+
+    #[test]
+    fn upgrade_review_shows_only_actionable_candidates_and_separates_coverage() {
+        let renderer = renderer();
+        let provider = |source, candidates, supported, completeness, risk, privilege| {
+            ProviderMaintenancePlan {
+                operation_id: "maintenance-plan".into(),
+                source,
+                action: MaintenanceAction::Upgrade,
+                scope: None,
+                candidates,
+                cleanup_candidates: Vec::new(),
+                privilege,
+                completeness,
+                confidence: orbis_core::transaction::PlanConfidence::High,
+                authoritative_simulation: true,
+                risk,
+                supported,
+                mutates: true,
+                warnings: Vec::new(),
+                notes: Vec::new(),
+                download_size_bytes: None,
+                disk_delta_bytes: None,
+            }
+        };
+        let plan = MaintenancePlan {
+            operation_id: "maintenance".into(),
+            action: MaintenanceAction::Upgrade,
+            source: None,
+            providers: vec![
+                provider(
+                    PackageSource::Snap,
+                    vec![update_candidate(PackageSource::Snap, "code")],
+                    true,
+                    orbis_core::transaction::PlanCompleteness::Complete,
+                    orbis_core::transaction::RiskLevel::Normal,
+                    orbis_core::transaction::PrivilegeRequirement::Administrator,
+                ),
+                provider(
+                    PackageSource::Npm,
+                    vec![update_candidate(PackageSource::Npm, "npm")],
+                    true,
+                    orbis_core::transaction::PlanCompleteness::Complete,
+                    orbis_core::transaction::RiskLevel::Normal,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Flatpak,
+                    Vec::new(),
+                    true,
+                    orbis_core::transaction::PlanCompleteness::Complete,
+                    orbis_core::transaction::RiskLevel::Normal,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                ProviderMaintenancePlan::blocked(
+                    PackageSource::Cargo,
+                    MaintenanceAction::Upgrade,
+                    "Cargo update provenance is incomplete",
+                ),
+                ProviderMaintenancePlan::blocked(
+                    PackageSource::Pipx,
+                    MaintenanceAction::Upgrade,
+                    "pipx is unavailable",
+                ),
+            ],
+            risk: orbis_core::transaction::RiskLevel::Normal,
+            completeness: orbis_core::transaction::PlanCompleteness::Unknown,
+            privilege: orbis_core::transaction::PrivilegeRequirement::Administrator,
+            warnings: Vec::new(),
+            mutates: true,
+        };
+
+        let output = renderer.maintenance_plan(&plan, false);
+        assert!(output.contains("2 updates ready"));
+        assert!(output.contains("SNAP"));
+        assert!(output.contains("NODE.JS"));
+        assert!(output.contains("Optional tools"));
+        assert!(output.contains("pipx unavailable"));
+        assert!(output.contains("Risk  normal"));
+        assert!(output.contains("Coverage  limited"));
+        assert!(output.contains("Only the updates listed above will be changed."));
+        assert!(!output.contains("Flatpak · user update"));
+        assert!(!output.contains("across 5 sources"));
     }
 
     #[allow(clippy::too_many_arguments)]

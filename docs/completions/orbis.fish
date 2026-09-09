@@ -1,4 +1,4 @@
-# fish completion for Orbis 0.1.0-beta.1.dev.11
+# fish completion for Orbis 0.1.0-beta.1.dev.12
 
 complete -c orbis -f
 complete -c orbis -n '__fish_use_subcommand' -a dashboard -d 'Open the optional full-screen interface'

@@ -147,6 +147,7 @@ impl ProviderMaintenancePlan {
         self.supported
             && self.risk != RiskLevel::Blocked
             && self.completeness != PlanCompleteness::Unknown
+            && (self.action != MaintenanceAction::Upgrade || !self.candidates.is_empty())
     }
 
     pub fn blocked(
@@ -200,7 +201,21 @@ impl MaintenancePlan {
         source: Option<PackageSource>,
         providers: Vec<ProviderMaintenancePlan>,
     ) -> Self {
-        let risk = providers.iter().map(|plan| plan.risk).max().unwrap_or(RiskLevel::Normal);
+        // Confirmation risk describes only mutations that can cross the
+        // execution boundary. An unavailable optional provider belongs in
+        // completeness/coverage, not in the risk of executable work.
+        let risk = providers
+            .iter()
+            .filter(|plan| plan.mutates && plan.executable())
+            .map(|plan| plan.risk)
+            .max()
+            .or_else(|| {
+                providers
+                    .iter()
+                    .any(|plan| plan.risk == RiskLevel::Blocked && !plan.executable())
+                    .then_some(RiskLevel::Blocked)
+            })
+            .unwrap_or(RiskLevel::Normal);
         let completeness =
             if providers.iter().any(|plan| plan.completeness == PlanCompleteness::Unknown) {
                 PlanCompleteness::Unknown
@@ -478,6 +493,82 @@ mod tests {
         );
         assert!(!plan.executable());
         assert_eq!(plan.completeness, PlanCompleteness::Unknown);
+    }
+
+    fn executable_plan(source: PackageSource, risk: RiskLevel) -> ProviderMaintenancePlan {
+        ProviderMaintenancePlan {
+            operation_id: format!("maint-{source:?}"),
+            source,
+            action: MaintenanceAction::Upgrade,
+            scope: None,
+            candidates: vec![candidate(source, None, "example")],
+            cleanup_candidates: Vec::new(),
+            privilege: PrivilegeRequirement::None,
+            completeness: PlanCompleteness::Complete,
+            confidence: PlanConfidence::High,
+            authoritative_simulation: true,
+            risk,
+            supported: true,
+            mutates: true,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        }
+    }
+
+    #[test]
+    fn execution_risk_ignores_blocked_optional_provider() {
+        let blocked = ProviderMaintenancePlan::blocked(
+            PackageSource::Pipx,
+            MaintenanceAction::Upgrade,
+            "pipx is unavailable",
+        );
+        let normal = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            None,
+            vec![executable_plan(PackageSource::Snap, RiskLevel::Normal), blocked.clone()],
+        );
+        let caution = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            None,
+            vec![executable_plan(PackageSource::Snap, RiskLevel::Caution), blocked.clone()],
+        );
+        let high = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            None,
+            vec![executable_plan(PackageSource::Snap, RiskLevel::HighImpact), blocked],
+        );
+
+        assert_eq!(normal.risk, RiskLevel::Normal);
+        assert_eq!(caution.risk, RiskLevel::Caution);
+        assert_eq!(high.risk, RiskLevel::HighImpact);
+        assert!(normal.executable());
+        assert!(caution.executable());
+        assert!(high.executable());
+    }
+
+    #[test]
+    fn all_blocked_plan_is_blocked_and_not_executable() {
+        let plan = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            None,
+            vec![ProviderMaintenancePlan::blocked(
+                PackageSource::Pipx,
+                MaintenanceAction::Upgrade,
+                "pipx is unavailable",
+            )],
+        );
+
+        assert_eq!(plan.risk, RiskLevel::Blocked);
+        assert!(!plan.executable());
+    }
+
+    #[test]
+    fn upgrade_without_candidates_is_not_executable() {
+        let mut plan = executable_plan(PackageSource::Snap, RiskLevel::Normal);
+        plan.candidates.clear();
+        assert!(!plan.executable());
     }
 
     #[test]

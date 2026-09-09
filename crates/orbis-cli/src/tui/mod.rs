@@ -3301,7 +3301,7 @@ mod tests {
             app.screen = Screen::SelfUpdate;
             app.self_update_report = Some(SelfUpdateReport {
                 state: SelfUpdateState::DevelopmentBuild,
-                current_version: "0.1.0-beta.1.dev.11".into(),
+                current_version: "0.1.0-beta.1.dev.12".into(),
                 available_version: Some("0.1.0-beta.1".into()),
                 installed_version: None,
                 message: "This is a development build. It will not replace itself.".into(),

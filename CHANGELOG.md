@@ -2,6 +2,10 @@
 
 All notable changes to Orbis are documented here.
 
+## 0.1.0-beta.1.dev.12 (development)
+
+- Make update checking cursor-safe and align apply review with executable update candidates and risk.
+
 ## 0.1.0-beta.1.dev.11 (development)
 
 - Refine default update and history output into grouped, human-oriented terminal views with honest coverage and relative timestamps.

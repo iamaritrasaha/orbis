@@ -431,6 +431,10 @@ impl MaintenanceProvider for AptProvider {
 
     fn upgrade_plan(&self) -> Result<Vec<ProviderMaintenancePlan>, ProviderError> {
         let inventory = self.update_inventory()?;
+        let metadata_incomplete = inventory
+            .metadata_state
+            .as_deref()
+            .is_some_and(|state| state.contains("unknown") || state.contains("incomplete"));
         let output = execute(
             &self.runner,
             PackageSource::Apt,
@@ -447,6 +451,13 @@ impl MaintenanceProvider for AptProvider {
             warnings.push(crate::transaction::PlanWarning {
                 level: WarningLevel::Info,
                 message: format!("APT will keep back: {}.", kept_back.join(", ")),
+            });
+        }
+        if metadata_incomplete {
+            warnings.push(crate::transaction::PlanWarning {
+                level: WarningLevel::Caution,
+                message: "APT repository freshness is unknown; the update coverage is incomplete."
+                    .into(),
             });
         }
         let (risk, supported) = if removals.is_empty() {
@@ -473,7 +484,11 @@ impl MaintenanceProvider for AptProvider {
             candidates: inventory.candidates,
             cleanup_candidates: Vec::new(),
             privilege: PrivilegeRequirement::Administrator,
-            completeness: PlanCompleteness::Complete,
+            completeness: if metadata_incomplete {
+                PlanCompleteness::Partial
+            } else {
+                PlanCompleteness::Complete
+            },
             confidence: PlanConfidence::High,
             authoritative_simulation: true,
             risk,
