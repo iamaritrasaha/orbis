@@ -5,8 +5,10 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use orbis_core::{
+    maintenance::{MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult},
     models::PackageSource,
     progress::{ExecutionStage, OperationEvent, OperationHeader, OutputStream, ProgressObserver},
+    transaction::InstallScope,
 };
 use std::{
     collections::VecDeque,
@@ -18,6 +20,34 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+#[derive(Clone)]
+struct MaintenanceRowMeta {
+    sources: Vec<PackageSource>,
+    label: String,
+    scope: Option<InstallScope>,
+    mutates: bool,
+    executable: bool,
+    provider_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderViewState {
+    Waiting,
+    Active,
+    Refreshed,
+    PartiallyRefreshed,
+    ManagedAutomatically,
+    OnDemand,
+    Skipped,
+    Failed,
+}
+
+#[derive(Clone)]
+enum RenderMode {
+    Standard { header: OperationHeader, stages: &'static [ExecutionStage], refresh: bool },
+    Maintenance { rows: Vec<MaintenanceRowMeta> },
+}
 
 struct ActivityLine {
     key: String,
@@ -32,12 +62,14 @@ struct ProgressState {
     spinner_index: usize,
     running: bool,
     rendered_line_count: usize,
+    provider_states: Vec<ProviderViewState>,
+    active_provider: Option<usize>,
+    final_summary: Option<String>,
 }
 
 pub(crate) struct PlainProgressRenderer {
     theme: Theme,
-    header: OperationHeader,
-    stages: &'static [ExecutionStage],
+    mode: RenderMode,
     state: Arc<Mutex<ProgressState>>,
     // Kept as a small inspection surface for tests and future plain renderers.
     output_lines: Mutex<VecDeque<String>>,
@@ -46,7 +78,6 @@ pub(crate) struct PlainProgressRenderer {
     is_tty: bool,
     animate: bool,
     max_output_lines: usize,
-    refresh: bool,
     preserve_raw_output: bool,
 }
 
@@ -59,7 +90,7 @@ impl PlainProgressRenderer {
         is_tty: bool,
         max_output_lines: usize,
     ) -> Self {
-        Self::with_mode(theme, header, stages, is_tty, max_output_lines, false, true)
+        Self::new_with_output_policy(theme, header, stages, is_tty, max_output_lines, true)
     }
 
     pub(crate) fn new_with_output_policy(
@@ -70,37 +101,56 @@ impl PlainProgressRenderer {
         max_output_lines: usize,
         preserve_raw_output: bool,
     ) -> Self {
-        Self::with_mode(theme, header, stages, is_tty, max_output_lines, false, preserve_raw_output)
+        let mode = RenderMode::Standard { header, stages, refresh: false };
+        Self::with_mode(theme, mode, is_tty, max_output_lines, preserve_raw_output)
     }
 
-    pub(crate) fn new_refresh_with_output_policy(
+    pub(crate) fn new_maintenance_with_output_policy(
         theme: Theme,
-        header: OperationHeader,
-        stages: &'static [ExecutionStage],
+        plan: &MaintenancePlan,
         is_tty: bool,
-        max_output_lines: usize,
         preserve_raw_output: bool,
     ) -> Self {
-        Self::with_mode(theme, header, stages, is_tty, max_output_lines, true, preserve_raw_output)
+        let rows = maintenance_rows(plan);
+        Self::with_mode(theme, RenderMode::Maintenance { rows }, is_tty, 5, preserve_raw_output)
     }
 
     fn with_mode(
         theme: Theme,
-        header: OperationHeader,
-        stages: &'static [ExecutionStage],
+        mode: RenderMode,
         is_tty: bool,
         max_output_lines: usize,
-        refresh: bool,
         preserve_raw_output: bool,
     ) -> Self {
-        let current_stage = stages.first().copied().unwrap_or(ExecutionStage::Preparing);
+        let (current_stage, provider_states) = match &mode {
+            RenderMode::Standard { stages, .. } => {
+                (stages.first().copied().unwrap_or(ExecutionStage::Preparing), Vec::new())
+            }
+            RenderMode::Maintenance { rows } => (
+                ExecutionStage::Preparing,
+                rows.iter()
+                    .map(|row| {
+                        if !row.executable {
+                            ProviderViewState::Skipped
+                        } else if !row.mutates {
+                            if row.sources.contains(&PackageSource::Snap) {
+                                ProviderViewState::ManagedAutomatically
+                            } else {
+                                ProviderViewState::OnDemand
+                            }
+                        } else {
+                            ProviderViewState::Waiting
+                        }
+                    })
+                    .collect(),
+            ),
+        };
         let animate = is_tty
             && std::env::var_os("REDUCE_MOTION").is_none()
             && std::env::var("TERM").map(|term| term != "dumb").unwrap_or(true);
         Self {
             theme,
-            header,
-            stages,
+            mode,
             state: Arc::new(Mutex::new(ProgressState {
                 current_stage,
                 output_lines: VecDeque::new(),
@@ -109,6 +159,9 @@ impl PlainProgressRenderer {
                 spinner_index: 0,
                 running: true,
                 rendered_line_count: 0,
+                provider_states,
+                active_provider: None,
+                final_summary: None,
             })),
             output_lines: Mutex::new(VecDeque::new()),
             spinner_started: AtomicBool::new(false),
@@ -116,40 +169,22 @@ impl PlainProgressRenderer {
             is_tty,
             animate,
             max_output_lines,
-            refresh,
             preserve_raw_output,
         }
     }
 
     pub(crate) fn print_header(&self) {
-        {
-            let _guard = output_lock();
-            let privilege = if self.header.privileged { "administrator" } else { "user" };
-            eprintln!(
-                "{} {}",
-                self.theme.paint(self.theme.mark(Token::Primary), Token::Primary),
-                self.theme.paint(&self.header.title, Token::Primary)
-            );
-            eprintln!(
-                "  {:<13} {} · {}",
-                "Source",
-                self.theme.paint(friendly_source(self.header.source), Token::Provider),
-                self.header.scope
-            );
-            eprintln!("  {:<13} {}\n", "Privilege", privilege);
-
-            if self.is_tty {
-                draw_tty(
-                    self.theme,
-                    self.stages,
-                    &self.state,
-                    self.header.privileged,
-                    self.refresh,
-                );
-            }
-        }
         if self.is_tty {
-            self.start_spinner();
+            self.redraw();
+            let has_active_animation = match &self.mode {
+                RenderMode::Standard { .. } => true,
+                RenderMode::Maintenance { rows } => {
+                    rows.iter().any(|row| row.executable && row.mutates)
+                }
+            };
+            if has_active_animation {
+                self.start_spinner();
+            }
         }
     }
 
@@ -159,9 +194,7 @@ impl PlainProgressRenderer {
         }
         let state = Arc::clone(&self.state);
         let theme = self.theme;
-        let stages = self.stages;
-        let privileged = self.header.privileged;
-        let refresh = self.refresh;
+        let mode = self.mode.clone();
         let handle = thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_millis(100));
@@ -184,7 +217,7 @@ impl PlainProgressRenderer {
                 if !still_running {
                     break;
                 }
-                draw_tty(theme, stages, &state, privileged, refresh);
+                draw_tty(theme, &mode, &state);
             }
         });
         *self.spinner_thread.lock().expect("spinner thread lock poisoned") = Some(handle);
@@ -195,13 +228,10 @@ impl PlainProgressRenderer {
             return;
         }
         let _guard = output_lock();
-        draw_tty(self.theme, self.stages, &self.state, self.header.privileged, self.refresh);
+        draw_tty(self.theme, &self.mode, &self.state);
     }
 
-    fn finish(&self, stage: ExecutionStage) {
-        // Stop the ticker before taking ownership of the final frame. The ticker
-        // checks this flag again after taking the output lock, so it cannot paint
-        // an old frame after the final one.
+    fn finish_standard(&self, stage: ExecutionStage) {
         if let Ok(mut state) = self.state.lock() {
             state.current_stage = stage;
             state.output_lines.clear();
@@ -210,13 +240,60 @@ impl PlainProgressRenderer {
             state.running = false;
         }
         self.output_lines.lock().expect("output lines lock poisoned").clear();
-
         if self.is_tty {
             let _guard = output_lock();
-            draw_tty(self.theme, self.stages, &self.state, self.header.privileged, self.refresh);
+            draw_tty(self.theme, &self.mode, &self.state);
             drop(_guard);
         }
+        self.join_spinner();
+    }
 
+    pub(crate) fn finish_maintenance(&self, result: &MaintenanceResult) {
+        let RenderMode::Maintenance { rows } = &self.mode else { return };
+        if let Ok(mut state) = self.state.lock() {
+            for (row_index, row) in rows.iter().enumerate() {
+                state.provider_states[row_index] = maintenance_row_state(row, &result.providers);
+            }
+            state.active_provider = None;
+            state.activity_lines.clear();
+            state.final_summary = Some(maintenance_summary(&state.provider_states));
+            state.running = false;
+        }
+        if self.is_tty {
+            let _guard = output_lock();
+            draw_tty(self.theme, &self.mode, &self.state);
+            drop(_guard);
+        }
+        self.join_spinner();
+    }
+
+    pub(crate) fn mark_provider_failure(&self, source: PackageSource) {
+        let RenderMode::Maintenance { rows } = &self.mode else { return };
+        if let Ok(mut state) = self.state.lock()
+            && let Some((row_index, _)) = rows.iter().enumerate().find(|(row_index, row)| {
+                row.sources.contains(&source)
+                    && !matches!(
+                        state.provider_states[*row_index],
+                        ProviderViewState::Failed
+                            | ProviderViewState::Refreshed
+                            | ProviderViewState::PartiallyRefreshed
+                            | ProviderViewState::ManagedAutomatically
+                            | ProviderViewState::OnDemand
+                    )
+            })
+        {
+            state.provider_states[row_index] = ProviderViewState::Failed;
+            state.active_provider = None;
+            state.activity_lines.clear();
+        }
+        self.redraw();
+    }
+
+    pub(crate) fn is_tty(&self) -> bool {
+        self.is_tty
+    }
+
+    fn join_spinner(&self) {
         if let Some(handle) =
             self.spinner_thread.lock().expect("spinner thread lock poisoned").take()
         {
@@ -234,7 +311,6 @@ impl Drop for PlainProgressRenderer {
         } else {
             false
         };
-
         if self.is_tty && was_running {
             let _guard = output_lock();
             let mut stderr = io::stderr();
@@ -243,12 +319,7 @@ impl Drop for PlainProgressRenderer {
                 state.rendered_line_count = 0;
             }
         }
-
-        if let Some(handle) =
-            self.spinner_thread.get_mut().expect("spinner thread lock poisoned").take()
-        {
-            let _ = handle.join();
-        }
+        self.join_spinner();
     }
 }
 
@@ -259,6 +330,20 @@ impl ProgressObserver for PlainProgressRenderer {
         {
             return;
         }
+        if matches!(&self.mode, RenderMode::Maintenance { .. }) {
+            self.on_maintenance_event(event);
+            return;
+        }
+        self.on_standard_event(event);
+    }
+}
+
+impl PlainProgressRenderer {
+    fn on_standard_event(&self, event: &OperationEvent) {
+        let (refresh, header_source) = match &self.mode {
+            RenderMode::Standard { header, refresh, .. } => (*refresh, header.source),
+            RenderMode::Maintenance { .. } => return,
+        };
         match event {
             OperationEvent::StageChanged { stage } => {
                 if let Ok(mut state) = self.state.lock() {
@@ -268,40 +353,30 @@ impl ProgressObserver for PlainProgressRenderer {
                     state.activity_lines.clear();
                 }
                 self.output_lines.lock().expect("output lines lock poisoned").clear();
-
                 if self.is_tty {
                     self.redraw();
                 } else {
                     let state =
                         if stage.is_terminal() { StageState::Done } else { StageState::Active };
-                    let token = match state {
-                        StageState::Done => Token::Positive,
-                        StageState::Active => Token::Caution,
-                        StageState::Pending => Token::Muted,
-                    };
+                    let token =
+                        if state == StageState::Done { Token::Positive } else { Token::Caution };
                     let _guard = output_lock();
                     eprintln!(
                         "  {} {}",
                         self.theme.paint(self.theme.stage_mark(state), token),
-                        self.theme
-                            .paint(display_stage_label(*stage, self.refresh), Token::Foreground)
+                        self.theme.paint(display_stage_label(*stage, refresh), Token::Foreground)
                     );
                 }
             }
             OperationEvent::ProviderOutput(line) => {
                 let content = sanitize_output(&line.content);
                 if let Ok(mut state) = self.state.lock() {
-                    if state.output_lines.len() >= self.max_output_lines {
-                        state.output_lines.pop_front();
-                        state.output_streams.pop_front();
-                    }
-                    state.output_lines.push_back(content.clone());
-                    state.output_streams.push_back(line.stream);
+                    push_raw_line(&mut state, content.clone(), line.stream, self.max_output_lines);
                     add_activity_line(
                         &mut state.activity_lines,
-                        self.header.source,
+                        header_source,
                         &content,
-                        self.refresh,
+                        refresh,
                         self.max_output_lines,
                     );
                 }
@@ -311,16 +386,15 @@ impl ProgressObserver for PlainProgressRenderer {
                 }
                 inspected.push_back(content.clone());
                 drop(inspected);
-
                 if self.is_tty {
                     self.redraw();
                 } else {
-                    let pipe = if self.theme.unicode { "┊" } else { "|" };
                     let display_content = if self.preserve_raw_output {
-                        content.clone()
+                        content
                     } else {
-                        compact_activity(self.header.source, &content, self.refresh)
+                        compact_activity(header_source, &content, refresh)
                     };
+                    let pipe = if self.theme.unicode { "┊" } else { "|" };
                     let _guard = output_lock();
                     eprintln!(
                         "  {} {}",
@@ -329,34 +403,31 @@ impl ProgressObserver for PlainProgressRenderer {
                     );
                 }
             }
-            OperationEvent::ProviderStarted { .. }
-            | OperationEvent::ProviderFinished { .. }
-            | OperationEvent::ProviderInventory { .. } => {}
             OperationEvent::Finished { stage, message, .. } => {
-                self.finish(*stage);
-                if let Some(msg) = message {
+                self.finish_standard(*stage);
+                if let Some(message) = message {
                     let _guard = output_lock();
                     eprintln!(
                         "\n  {} {}",
                         self.theme.paint("Result", Token::Primary),
-                        sanitize_output(msg)
+                        sanitize_output(message)
                     );
                 }
             }
             OperationEvent::Warning { message } => {
                 let message = sanitize_output(message);
                 if let Ok(mut state) = self.state.lock() {
-                    if state.output_lines.len() >= self.max_output_lines {
-                        state.output_lines.pop_front();
-                        state.output_streams.pop_front();
-                    }
-                    state.output_lines.push_back(format!("! {message}"));
-                    state.output_streams.push_back(OutputStream::Stderr);
+                    push_raw_line(
+                        &mut state,
+                        format!("! {message}"),
+                        OutputStream::Stderr,
+                        self.max_output_lines,
+                    );
                     add_activity_line(
                         &mut state.activity_lines,
-                        self.header.source,
+                        header_source,
                         &format!("! {message}"),
-                        self.refresh,
+                        refresh,
                         self.max_output_lines,
                     );
                 }
@@ -373,6 +444,104 @@ impl ProgressObserver for PlainProgressRenderer {
                     eprintln!("  {} {}", self.theme.paint("Warning", Token::Caution), message);
                 }
             }
+            OperationEvent::ProviderStarted { .. }
+            | OperationEvent::ProviderFinished { .. }
+            | OperationEvent::ProviderInventory { .. } => {}
+        }
+    }
+
+    fn on_maintenance_event(&self, event: &OperationEvent) {
+        let RenderMode::Maintenance { rows } = &self.mode else { return };
+        match event {
+            OperationEvent::ProviderStarted { source } => {
+                if let Ok(mut state) = self.state.lock()
+                    && let Some((row_index, _)) =
+                        rows.iter().enumerate().find(|(row_index, row)| {
+                            row.sources.contains(source)
+                                && row.mutates
+                                && state.provider_states[*row_index] == ProviderViewState::Waiting
+                        })
+                {
+                    state.provider_states[row_index] = ProviderViewState::Active;
+                    state.active_provider = Some(row_index);
+                    state.activity_lines.clear();
+                }
+                self.redraw();
+            }
+            OperationEvent::ProviderOutput(line) => {
+                let content = sanitize_output(&line.content);
+                if let Ok(mut state) = self.state.lock()
+                    && let Some(row_index) = state.active_provider
+                {
+                    let source = rows[row_index].sources[0];
+                    add_activity_line(
+                        &mut state.activity_lines,
+                        source,
+                        &content,
+                        true,
+                        self.max_output_lines,
+                    );
+                }
+                if !self.is_tty {
+                    let display_content = if self.preserve_raw_output {
+                        content
+                    } else {
+                        compact_activity(PackageSource::Apt, &content, true)
+                    };
+                    let pipe = if self.theme.unicode { "┊" } else { "|" };
+                    let _guard = output_lock();
+                    eprintln!(
+                        "  {} {}",
+                        self.theme.paint(pipe, Token::Muted),
+                        self.theme.paint(&display_content, Token::Muted)
+                    );
+                }
+                self.redraw();
+            }
+            OperationEvent::ProviderFinished { source, success } => {
+                if let Ok(mut state) = self.state.lock()
+                    && let Some((row_index, _)) =
+                        rows.iter().enumerate().find(|(row_index, row)| {
+                            row.sources.contains(source)
+                                && state.provider_states[*row_index] == ProviderViewState::Active
+                        })
+                {
+                    state.provider_states[row_index] = if *success {
+                        ProviderViewState::Refreshed
+                    } else {
+                        ProviderViewState::Failed
+                    };
+                    state.active_provider = None;
+                    state.activity_lines.clear();
+                }
+                self.redraw();
+            }
+            OperationEvent::Finished { stage, message, .. } => {
+                if *stage == ExecutionStage::Failed
+                    && let Ok(mut state) = self.state.lock()
+                {
+                    if let Some(row_index) = state.active_provider {
+                        state.provider_states[row_index] = ProviderViewState::Failed;
+                    }
+                    state.final_summary =
+                        message.as_deref().map(|_| "1 source needs attention".into());
+                }
+                self.redraw();
+            }
+            OperationEvent::StageChanged { .. } => self.redraw(),
+            OperationEvent::Warning { message } => {
+                if let Ok(mut state) = self.state.lock() {
+                    add_activity_line(
+                        &mut state.activity_lines,
+                        PackageSource::Apt,
+                        &format!("! {}", sanitize_output(message)),
+                        true,
+                        self.max_output_lines,
+                    );
+                }
+                self.redraw();
+            }
+            OperationEvent::ProviderInventory { .. } => {}
         }
     }
 }
@@ -382,27 +551,24 @@ fn output_lock() -> MutexGuard<'static, ()> {
     OUTPUT_LOCK.get_or_init(|| Mutex::new(())).lock().expect("output lock poisoned")
 }
 
-fn draw_tty(
-    theme: Theme,
-    stages: &'static [ExecutionStage],
-    state: &Arc<Mutex<ProgressState>>,
-    privileged: bool,
-    refresh: bool,
-) {
+fn draw_tty(theme: Theme, mode: &RenderMode, state: &Arc<Mutex<ProgressState>>) {
     let mut stderr = io::stderr();
     let Ok(mut state) = state.lock() else { return };
-    draw_tty_to(&mut stderr, theme, stages, &mut state, privileged, refresh);
+    draw_tty_to(&mut stderr, theme, mode, &mut state);
 }
 
 fn draw_tty_to<W: Write>(
     writer: &mut W,
     theme: Theme,
-    stages: &'static [ExecutionStage],
+    mode: &RenderMode,
     state: &mut ProgressState,
-    privileged: bool,
-    refresh: bool,
 ) {
-    let frame = frame_lines(theme, stages, state, privileged, refresh);
+    let frame = match mode {
+        RenderMode::Standard { header, stages, refresh } => {
+            standard_frame_lines(theme, header.privileged, stages, *refresh, state)
+        }
+        RenderMode::Maintenance { rows } => maintenance_frame_lines(theme, rows, state),
+    };
     clear_owned_frame(writer, state.rendered_line_count);
     for line in &frame {
         let _ = writeln!(writer, "{line}");
@@ -425,12 +591,12 @@ fn clear_owned_frame<W: Write>(writer: &mut W, line_count: usize) {
     let _ = execute!(writer, MoveUp(count.saturating_sub(1)), MoveToColumn(0));
 }
 
-fn frame_lines(
+fn standard_frame_lines(
     theme: Theme,
-    stages: &'static [ExecutionStage],
-    state: &ProgressState,
     privileged: bool,
+    stages: &'static [ExecutionStage],
     refresh: bool,
+    state: &ProgressState,
 ) -> Vec<String> {
     let effective_current = match state.current_stage {
         ExecutionStage::Authenticating => ExecutionStage::Executing,
@@ -439,7 +605,6 @@ fn frame_lines(
     let current_index = stages.iter().position(|stage| *stage == effective_current);
     let terminal = state.current_stage.is_terminal();
     let mut lines = Vec::with_capacity(stages.len() + state.activity_lines.len() + 1);
-
     for (index, &stage) in stages.iter().enumerate() {
         if stage == ExecutionStage::Authenticating && !privileged {
             continue;
@@ -463,16 +628,14 @@ fn frame_lines(
         } else {
             theme.stage_mark(stage_state)
         };
-        let label = display_stage_label(stage, refresh);
         let label_token =
             if stage_state == StageState::Pending { Token::Muted } else { Token::Foreground };
         lines.push(format!(
             "  {} {}{}",
             theme.paint(mark, token),
-            theme.paint(label, label_token),
+            theme.paint(display_stage_label(stage, refresh), label_token),
             if stage_state == StageState::Active { " …" } else { "" }
         ));
-
         if stage_state == StageState::Active {
             for activity in &state.activity_lines {
                 let pipe = if theme.unicode { "┊" } else { "|" };
@@ -484,26 +647,222 @@ fn frame_lines(
             }
         }
     }
-
     if terminal {
         let label = if state.current_stage == ExecutionStage::Completed {
             "Done"
         } else {
             "Could not finish"
         };
-        let token = if state.current_stage == ExecutionStage::Completed {
-            Token::Positive
-        } else {
-            Token::Caution
-        };
         lines.push(format!(
             "  {} {}",
-            theme.paint(theme.stage_mark(StageState::Done), token),
+            theme.paint(theme.stage_mark(StageState::Done), Token::Positive),
             theme.paint(label, Token::Foreground)
         ));
     }
-
     lines
+}
+
+fn maintenance_frame_lines(
+    theme: Theme,
+    rows: &[MaintenanceRowMeta],
+    state: &ProgressState,
+) -> Vec<String> {
+    let label_width = theme.width.saturating_sub(25).clamp(24, 34);
+    let mut lines = Vec::with_capacity(rows.len() + state.activity_lines.len() + 3);
+    for (index, row) in rows.iter().enumerate() {
+        let row_state = state.provider_states[index];
+        let (mark, token, status) = provider_view(row_state, theme, state.spinner_index);
+        lines.push(format!(
+            "  {} {:<label_width$} {}",
+            theme.paint(mark, token),
+            theme.paint(&row.label, token),
+            theme.paint(status, token),
+            label_width = label_width
+        ));
+        if state.active_provider == Some(index) {
+            for activity in &state.activity_lines {
+                let pipe = if theme.unicode { "┊" } else { "|" };
+                lines.push(format!(
+                    "  {} {}",
+                    theme.paint(pipe, Token::Muted),
+                    theme.paint(&activity.text, Token::Muted)
+                ));
+            }
+        }
+    }
+    lines.push(String::new());
+    let rule = if theme.unicode { "─" } else { "-" };
+    lines.push(theme.paint(&rule.repeat(theme.width.clamp(40, 72)), Token::Divider));
+    let summary = state
+        .final_summary
+        .clone()
+        .unwrap_or_else(|| maintenance_live_summary(&state.provider_states));
+    lines.push(format!("  {}", theme.paint(&summary, Token::Muted)));
+    lines
+}
+
+fn provider_view(
+    state: ProviderViewState,
+    theme: Theme,
+    spinner_index: usize,
+) -> (&'static str, Token, &'static str) {
+    match state {
+        ProviderViewState::Waiting => {
+            (if theme.unicode { "○" } else { "o" }, Token::Muted, "waiting")
+        }
+        ProviderViewState::Active => (spinner(theme, spinner_index), Token::Primary, "refreshing"),
+        ProviderViewState::Refreshed => {
+            (if theme.unicode { "●" } else { "*" }, Token::Positive, "refreshed")
+        }
+        ProviderViewState::PartiallyRefreshed => {
+            (if theme.unicode { "●" } else { "*" }, Token::Caution, "partially refreshed")
+        }
+        ProviderViewState::ManagedAutomatically => {
+            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "managed by snapd")
+        }
+        ProviderViewState::OnDemand => {
+            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "metadata on demand")
+        }
+        ProviderViewState::Skipped => {
+            (if theme.unicode { "○" } else { "o" }, Token::Muted, "unavailable")
+        }
+        ProviderViewState::Failed => {
+            (if theme.unicode { "×" } else { "x" }, Token::Destructive, "failed")
+        }
+    }
+}
+
+fn maintenance_rows(plan: &MaintenancePlan) -> Vec<MaintenanceRowMeta> {
+    let mut rows = Vec::new();
+    for (index, provider) in plan.providers.iter().enumerate() {
+        let family = provider_family(provider.source);
+        let row_index = rows.iter().position(|row: &MaintenanceRowMeta| {
+            provider_family(row.sources[0]) == family
+                && (provider.source != PackageSource::Flatpak || row.scope == provider.scope)
+        });
+        if let Some(row_index) = row_index {
+            let row = &mut rows[row_index];
+            row.sources.push(provider.source);
+            row.mutates |= provider.mutates;
+            row.executable &= provider.executable();
+            row.provider_indices.push(index);
+        } else {
+            rows.push(MaintenanceRowMeta {
+                sources: vec![provider.source],
+                label: maintenance_source_label(provider.source, provider.scope),
+                scope: provider.scope,
+                mutates: provider.mutates,
+                executable: provider.executable(),
+                provider_indices: vec![index],
+            });
+        }
+    }
+    rows
+}
+
+fn maintenance_row_state(
+    row: &MaintenanceRowMeta,
+    providers: &[orbis_core::maintenance::MaintenanceProviderResult],
+) -> ProviderViewState {
+    let mut partial = false;
+    let mut failed = false;
+    let mut skipped = false;
+    for index in &row.provider_indices {
+        match providers.get(*index).map(|provider| &provider.status) {
+            Some(MaintenanceProviderStatus::Failed) => failed = true,
+            Some(MaintenanceProviderStatus::PartiallySucceeded) => partial = true,
+            Some(MaintenanceProviderStatus::Skipped | MaintenanceProviderStatus::Blocked)
+            | None => skipped = true,
+            _ => {}
+        }
+    }
+    if failed {
+        ProviderViewState::Failed
+    } else if skipped {
+        ProviderViewState::Skipped
+    } else if !row.mutates {
+        if row.sources.contains(&PackageSource::Snap) {
+            ProviderViewState::ManagedAutomatically
+        } else {
+            ProviderViewState::OnDemand
+        }
+    } else if partial {
+        ProviderViewState::PartiallyRefreshed
+    } else {
+        ProviderViewState::Refreshed
+    }
+}
+
+fn maintenance_live_summary(states: &[ProviderViewState]) -> String {
+    let refreshed = states
+        .iter()
+        .filter(|state| {
+            matches!(state, ProviderViewState::Refreshed | ProviderViewState::PartiallyRefreshed)
+        })
+        .count();
+    let active = states.iter().filter(|state| **state == ProviderViewState::Active).count();
+    let waiting = states.iter().filter(|state| **state == ProviderViewState::Waiting).count();
+    format!("{refreshed} refreshed   {active} active   {waiting} waiting")
+}
+
+fn maintenance_summary(states: &[ProviderViewState]) -> String {
+    let checked = states.len();
+    let refreshed = states
+        .iter()
+        .filter(|state| {
+            matches!(state, ProviderViewState::Refreshed | ProviderViewState::PartiallyRefreshed)
+        })
+        .count();
+    let no_refresh = states
+        .iter()
+        .filter(|state| {
+            matches!(state, ProviderViewState::ManagedAutomatically | ProviderViewState::OnDemand)
+        })
+        .count();
+    let failed = states.iter().filter(|state| **state == ProviderViewState::Failed).count();
+    if failed > 0 {
+        format!("{failed} source{} need attention", if failed == 1 { "" } else { "s" })
+    } else {
+        format!(
+            "{checked} source{} checked · {refreshed} refreshed · {no_refresh} require no refresh",
+            if checked == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn provider_family(source: PackageSource) -> PackageSource {
+    match source {
+        PackageSource::Pnpm => PackageSource::Npm,
+        PackageSource::Pipx => PackageSource::Uv,
+        source => source,
+    }
+}
+
+fn maintenance_source_label(source: PackageSource, scope: Option<InstallScope>) -> String {
+    match source {
+        PackageSource::Apt => "Ubuntu repositories".into(),
+        PackageSource::Flatpak => scope
+            .map(|scope| format!("Flatpak · {}", scope.label()))
+            .unwrap_or_else(|| "Flatpak".into()),
+        PackageSource::Snap => "Snap Store".into(),
+        PackageSource::Cargo => "Rust tools".into(),
+        PackageSource::Npm | PackageSource::Pnpm => "Node.js tools".into(),
+        PackageSource::Uv | PackageSource::Pipx => "Python tools".into(),
+    }
+}
+
+fn push_raw_line(
+    state: &mut ProgressState,
+    content: String,
+    stream: OutputStream,
+    max_lines: usize,
+) {
+    if state.output_lines.len() >= max_lines {
+        state.output_lines.pop_front();
+        state.output_streams.pop_front();
+    }
+    state.output_lines.push_back(content);
+    state.output_streams.push_back(stream);
 }
 
 fn add_activity_line(
@@ -590,22 +949,14 @@ fn sanitize_output(value: &str) -> String {
         .collect()
 }
 
-fn friendly_source(source: PackageSource) -> &'static str {
-    match source {
-        PackageSource::Apt => "Ubuntu/Debian repositories",
-        PackageSource::Flatpak => "Flatpak apps",
-        PackageSource::Snap => "Snap Store",
-        PackageSource::Cargo => "Rust tools",
-        PackageSource::Npm | PackageSource::Pnpm => "Node.js tools",
-        PackageSource::Uv | PackageSource::Pipx => "Python tools",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orbis_core::models::PackageSource;
     use orbis_core::progress::{OutputLine, OutputStream};
+    use orbis_core::{
+        maintenance::{MaintenanceAction, ProviderMaintenancePlan},
+        transaction::PrivilegeRequirement,
+    };
 
     fn create_header() -> OperationHeader {
         OperationHeader {
@@ -626,33 +977,39 @@ mod tests {
             spinner_index: 0,
             running: true,
             rendered_line_count: 0,
+            provider_states: Vec::new(),
+            active_provider: None,
+            final_summary: None,
         }
     }
 
     #[test]
     fn test_print_header_non_tty() {
-        let theme = Theme::test(80);
-        let header = create_header();
-        let stages = ExecutionStage::transaction_stages();
-        let renderer = PlainProgressRenderer::new(theme, header, stages, false, 8);
+        let renderer = PlainProgressRenderer::new(
+            Theme::test(80),
+            create_header(),
+            ExecutionStage::transaction_stages(),
+            false,
+            8,
+        );
         renderer.print_header();
     }
 
     #[test]
     fn test_stage_progression() {
-        let theme = Theme::test(80);
-        let header = create_header();
-        let stages = ExecutionStage::transaction_stages();
-        let renderer = PlainProgressRenderer::new(theme, header, stages, true, 8);
-
+        let renderer = PlainProgressRenderer::new(
+            Theme::test(80),
+            create_header(),
+            ExecutionStage::transaction_stages(),
+            true,
+            8,
+        );
         renderer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Authenticating });
         renderer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Executing });
-
         renderer.on_event(&OperationEvent::ProviderOutput(OutputLine {
             stream: OutputStream::Stdout,
             content: "Reading package lists...".into(),
         }));
-
         renderer.on_event(&OperationEvent::Finished {
             stage: ExecutionStage::Completed,
             message: Some("Successfully installed btop".into()),
@@ -662,20 +1019,20 @@ mod tests {
 
     #[test]
     fn test_output_bounding() {
-        let theme = Theme::test(80);
-        let header = create_header();
-        let stages = ExecutionStage::transaction_stages();
-        let renderer = PlainProgressRenderer::new(theme, header, stages, false, 2);
-
+        let renderer = PlainProgressRenderer::new(
+            Theme::test(80),
+            create_header(),
+            ExecutionStage::transaction_stages(),
+            false,
+            2,
+        );
         renderer.on_event(&OperationEvent::StageChanged { stage: ExecutionStage::Executing });
-
         for content in ["Line 1", "Line 2", "Line 3"] {
             renderer.on_event(&OperationEvent::ProviderOutput(OutputLine {
                 stream: OutputStream::Stdout,
                 content: content.into(),
             }));
         }
-
         let lines = renderer.output_lines.lock().unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "Line 2");
@@ -728,15 +1085,18 @@ mod tests {
         let mut capture = Vec::new();
         let mut visible = Vec::new();
         let mut owned_lines = 0;
-
         for index in 0..20 {
             progress.spinner_index = index;
-            let frame = frame_lines(theme, stages, &progress, true, false);
+            let frame = standard_frame_lines(theme, true, stages, false, &progress);
             visible.splice(0..owned_lines, frame.clone());
             owned_lines = frame.len();
-            draw_tty_to(&mut capture, theme, stages, &mut progress, true, false);
+            draw_tty_to(
+                &mut capture,
+                theme,
+                &RenderMode::Standard { header: create_header(), stages, refresh: false },
+                &mut progress,
+            );
         }
-
         assert_eq!(owned_lines, visible.len());
         assert!(String::from_utf8_lossy(&capture).matches("\x1b[").count() >= 19);
         assert_eq!(visible.iter().filter(|line| line.contains("Preparing")).count(), 1);
@@ -749,8 +1109,12 @@ mod tests {
         let stages = ExecutionStage::transaction_stages();
         let mut progress = state();
         let mut capture = Vec::new();
-
-        draw_tty_to(&mut capture, theme, stages, &mut progress, true, false);
+        draw_tty_to(
+            &mut capture,
+            theme,
+            &RenderMode::Standard { header: create_header(), stages, refresh: false },
+            &mut progress,
+        );
         add_activity_line(
             &mut progress.activity_lines,
             PackageSource::Apt,
@@ -758,7 +1122,12 @@ mod tests {
             true,
             8,
         );
-        draw_tty_to(&mut capture, theme, stages, &mut progress, true, true);
+        draw_tty_to(
+            &mut capture,
+            theme,
+            &RenderMode::Standard { header: create_header(), stages, refresh: true },
+            &mut progress,
+        );
         add_activity_line(
             &mut progress.activity_lines,
             PackageSource::Apt,
@@ -766,13 +1135,27 @@ mod tests {
             true,
             8,
         );
-        draw_tty_to(&mut capture, theme, stages, &mut progress, true, true);
+        draw_tty_to(
+            &mut capture,
+            theme,
+            &RenderMode::Standard { header: create_header(), stages, refresh: true },
+            &mut progress,
+        );
         progress.activity_lines.clear();
-        draw_tty_to(&mut capture, theme, stages, &mut progress, true, true);
+        draw_tty_to(
+            &mut capture,
+            theme,
+            &RenderMode::Standard { header: create_header(), stages, refresh: true },
+            &mut progress,
+        );
         progress.current_stage = ExecutionStage::Completed;
         progress.running = false;
-        draw_tty_to(&mut capture, theme, stages, &mut progress, true, true);
-
+        draw_tty_to(
+            &mut capture,
+            theme,
+            &RenderMode::Standard { header: create_header(), stages, refresh: true },
+            &mut progress,
+        );
         assert_eq!(progress.rendered_line_count, stages.len() + 1);
         let ansi = String::from_utf8_lossy(&capture);
         assert!(ansi.contains("\x1b[5A") || ansi.contains("\x1b[6A"));
@@ -786,13 +1169,12 @@ mod tests {
         let stages = ExecutionStage::maintenance_stages();
         let mut user = state();
         user.current_stage = ExecutionStage::Executing;
-        let labels = frame_lines(theme, stages, &user, false, true).join("\n");
+        let labels = standard_frame_lines(theme, false, stages, true, &user).join("\n");
         assert!(!labels.contains("Permission granted"));
         assert!(labels.contains("Refreshing information"));
         assert!(labels.contains("Checking result"));
-
         let admin = state();
-        let labels = frame_lines(theme, stages, &admin, true, false).join("\n");
+        let labels = standard_frame_lines(theme, true, stages, false, &admin).join("\n");
         assert!(labels.contains("Permission granted"));
         assert!(!labels.contains("Getting permission"));
     }
@@ -805,5 +1187,123 @@ mod tests {
         assert_eq!(host, "archive.ubuntu.com");
         assert!(activity.ends_with("up to date"));
         assert!(apt_activity("Reading package lists...").is_none());
+    }
+
+    #[test]
+    fn maintenance_rows_compose_families_and_scopes() {
+        let plan = MaintenancePlan {
+            operation_id: "maintenance".into(),
+            action: MaintenanceAction::Refresh,
+            source: None,
+            providers: vec![
+                ProviderMaintenancePlan::blocked(
+                    PackageSource::Flatpak,
+                    MaintenanceAction::Refresh,
+                    "blocked",
+                ),
+                ProviderMaintenancePlan::blocked(
+                    PackageSource::Cargo,
+                    MaintenanceAction::Refresh,
+                    "blocked",
+                ),
+            ],
+            risk: orbis_core::transaction::RiskLevel::Blocked,
+            completeness: orbis_core::transaction::PlanCompleteness::Unknown,
+            privilege: PrivilegeRequirement::None,
+            warnings: Vec::new(),
+            mutates: false,
+        };
+        let rows = maintenance_rows(&plan);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Flatpak");
+        assert_eq!(rows[1].label, "Rust tools");
+    }
+
+    #[test]
+    fn aggregate_frame_contains_one_row_per_composed_source() {
+        let provider = |source, scope, mutates, privilege| ProviderMaintenancePlan {
+            operation_id: "maintenance-plan".into(),
+            source,
+            action: MaintenanceAction::Refresh,
+            scope,
+            candidates: Vec::new(),
+            cleanup_candidates: Vec::new(),
+            privilege,
+            completeness: orbis_core::transaction::PlanCompleteness::Complete,
+            confidence: orbis_core::transaction::PlanConfidence::High,
+            authoritative_simulation: false,
+            risk: orbis_core::transaction::RiskLevel::Normal,
+            supported: true,
+            mutates,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        };
+        let plan = MaintenancePlan {
+            operation_id: "maintenance".into(),
+            action: MaintenanceAction::Refresh,
+            source: None,
+            providers: vec![
+                provider(PackageSource::Apt, None, true, PrivilegeRequirement::Administrator),
+                provider(
+                    PackageSource::Flatpak,
+                    Some(InstallScope::System),
+                    true,
+                    PrivilegeRequirement::Administrator,
+                ),
+                provider(
+                    PackageSource::Flatpak,
+                    Some(InstallScope::User),
+                    true,
+                    PrivilegeRequirement::None,
+                ),
+                provider(PackageSource::Snap, None, false, PrivilegeRequirement::None),
+                provider(PackageSource::Cargo, None, false, PrivilegeRequirement::None),
+                provider(PackageSource::Npm, None, false, PrivilegeRequirement::None),
+                provider(PackageSource::Pnpm, None, false, PrivilegeRequirement::None),
+                provider(PackageSource::Uv, None, false, PrivilegeRequirement::None),
+                provider(PackageSource::Pipx, None, false, PrivilegeRequirement::None),
+            ],
+            risk: orbis_core::transaction::RiskLevel::Normal,
+            completeness: orbis_core::transaction::PlanCompleteness::Complete,
+            privilege: PrivilegeRequirement::Administrator,
+            warnings: Vec::new(),
+            mutates: true,
+        };
+        let rows = maintenance_rows(&plan);
+        assert_eq!(rows.len(), 7);
+        assert_eq!(rows[0].label, "Ubuntu repositories");
+        assert_eq!(rows[1].label, "Flatpak · system");
+        assert_eq!(rows[2].label, "Flatpak · user");
+        assert_eq!(rows[5].label, "Node.js tools");
+        assert_eq!(rows[6].label, "Python tools");
+
+        let mut state = state();
+        state.provider_states =
+            rows.iter()
+                .map(|row| {
+                    if row.mutates {
+                        ProviderViewState::Active
+                    } else {
+                        ProviderViewState::OnDemand
+                    }
+                })
+                .collect();
+        state.active_provider = Some(0);
+        let frame = maintenance_frame_lines(Theme::test(80), &rows, &state).join("\n");
+        for label in [
+            "Ubuntu repositories",
+            "Flatpak · system",
+            "Flatpak · user",
+            "Snap Store",
+            "Rust tools",
+            "Node.js tools",
+            "Python tools",
+        ] {
+            assert_eq!(frame.matches(label).count(), 1, "{label} should have one row");
+        }
+        assert!(!frame.contains("Preparing"));
+        assert!(!frame.contains("Permission granted"));
     }
 }

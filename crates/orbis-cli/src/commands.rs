@@ -508,7 +508,10 @@ fn run_transaction(
                 renderer.theme,
                 header,
                 orbis_core::progress::ExecutionStage::transaction_stages(),
-                io::stderr().is_terminal() && !preserve_raw_output,
+                io::stdin().is_terminal()
+                    && io::stdout().is_terminal()
+                    && io::stderr().is_terminal()
+                    && !preserve_raw_output,
                 8,
                 preserve_raw_output,
             );
@@ -588,7 +591,7 @@ fn run_maintenance(
         if json {
             return print_json(&plan);
         }
-        print!("{}", renderer.maintenance_plan(&plan));
+        print!("{}", renderer.maintenance_plan(&plan, preserve_raw_output));
         return Ok(());
     }
     if !plan.executable() {
@@ -601,7 +604,7 @@ fn run_maintenance(
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return report_error(json, "confirmation is required: use an interactive terminal or pass --yes after reviewing the plan".into());
         }
-        print!("{}", renderer.maintenance_plan(&plan));
+        print!("{}", renderer.maintenance_plan(&plan, preserve_raw_output));
         if !confirm_maintenance(&plan)? {
             println!("\nOperation cancelled.\nNothing was changed.\n");
             return Ok(());
@@ -610,7 +613,7 @@ fn run_maintenance(
             registry.revalidate_upgrade_plan(&plan)?;
         }
     } else if !json {
-        print!("{}", renderer.maintenance_plan(&plan));
+        print!("{}", renderer.maintenance_plan(&plan, preserve_raw_output));
     }
     let executor = RealOperationExecutor::new(registry.runner());
     if plan.providers.iter().any(|provider| {
@@ -636,6 +639,22 @@ fn run_maintenance(
     } else {
         None
     };
+    let progress = if json {
+        None
+    } else {
+        Some(crate::render::progress::PlainProgressRenderer::new_maintenance_with_output_policy(
+            renderer.theme,
+            &plan,
+            io::stdin().is_terminal()
+                && io::stdout().is_terminal()
+                && io::stderr().is_terminal()
+                && !preserve_raw_output,
+            preserve_raw_output,
+        ))
+    };
+    if let Some(progress) = &progress {
+        progress.print_header();
+    }
     let mut providers = Vec::new();
     for provider_plan in &plan.providers {
         if !provider_plan.executable() {
@@ -645,34 +664,17 @@ fn run_maintenance(
         let exec_res = if json {
             registry.execute_maintenance(provider_plan, &executor)
         } else {
-            let candidate_count =
-                provider_plan.candidates.len().max(provider_plan.cleanup_candidates.len());
-            let header = orbis_core::progress::OperationHeader {
-                title: format!("{} {}", provider_plan.action.label(), provider_plan.source.label()),
-                target: format!(
-                    "{candidate_count} planned change{}",
-                    if candidate_count == 1 { "" } else { "s" }
-                ),
-                source: provider_plan.source,
-                scope: provider_plan
-                    .scope
-                    .map(|s| s.label().to_string())
-                    .unwrap_or_else(|| "scope not reported".into()),
-                privileged: provider_plan.privilege
-                    == orbis_core::transaction::PrivilegeRequirement::Administrator,
-            };
-            let progress =
-                crate::render::progress::PlainProgressRenderer::new_refresh_with_output_policy(
-                    renderer.theme,
-                    header,
-                    orbis_core::progress::ExecutionStage::maintenance_stages(),
-                    io::stderr().is_terminal() && !preserve_raw_output,
-                    8,
-                    preserve_raw_output,
-                );
-            progress.print_header();
-            registry.execute_maintenance_with_progress(provider_plan, &executor, &progress)
+            registry.execute_maintenance_with_progress(
+                provider_plan,
+                &executor,
+                progress.as_ref().expect("maintenance progress renderer"),
+            )
         };
+        if exec_res.is_err()
+            && let Some(progress) = &progress
+        {
+            progress.mark_provider_failure(provider_plan.source);
+        }
         match exec_res {
             Ok(result) => providers.extend(result.providers),
             Err(error) => providers.push(MaintenanceProviderResult {
@@ -709,7 +711,11 @@ fn run_maintenance(
     if json {
         print_json(&result)
     } else {
-        print!("{}", renderer.maintenance_result(&result, &result_plans));
+        let progress = progress.expect("maintenance progress renderer");
+        progress.finish_maintenance(&result);
+        if !progress.is_tty() {
+            print!("{}", renderer.maintenance_result(&result, &result_plans, preserve_raw_output));
+        }
         Ok(())
     }
 }
@@ -945,7 +951,7 @@ fn confirm_maintenance(plan: &MaintenancePlan) -> Result<bool, String> {
     if plan.risk >= orbis_core::transaction::RiskLevel::HighImpact {
         eprint!("This maintenance plan contains high-impact changes. Type YES to continue: ");
     } else {
-        eprint!("Continue with this maintenance plan? [Y/n] ");
+        eprint!("Continue? [Y/n] ");
     }
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).map_err(|e| e.to_string())?;

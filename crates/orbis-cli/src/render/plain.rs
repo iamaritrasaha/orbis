@@ -3,8 +3,8 @@ use orbis_core::{
     SearchReport,
     diagnostics::DoctorReport,
     maintenance::{
-        MaintenancePlan, MaintenanceProviderResult, MaintenanceProviderStatus, MaintenanceResult,
-        MaintenanceStatus, ProviderMaintenancePlan, UpdateInventoryReport, WhyReport,
+        MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult, MaintenanceStatus,
+        ProviderMaintenancePlan, UpdateInventoryReport, WhyReport,
     },
     models::{Package, PackageSource, SourceInfo},
     transaction::{OperationPlan, TransactionResult, TransactionStatus, VerificationResult},
@@ -238,65 +238,38 @@ impl Renderer {
         brief: Option<&orbis_core::explain::PackageBrief>,
     ) -> String {
         let verb = plan.action.label();
-        let mut output = self.heading(verb, "Review before anything changes.");
+        let mut output = self.heading(verb, "");
         if let Some(brief) = brief {
-            output.push_str(&format!(
-                "{}\n\n",
-                self.theme.paint(&brief.package.name, Token::Primary)
-            ));
+            output
+                .push_str(&format!("{}\n", self.theme.paint(&brief.package.name, Token::Primary)));
             output.push_str(&format!("{}\n\n", brief.headline));
-            output.push_str("WHAT IT DOES\n");
-            if brief.paragraphs.is_empty() {
-                output.push_str("Orbis does not have enough reliable information to describe this software yet.\n");
-            } else {
-                output.push_str(&format!("{}\n", wrap(&brief.paragraphs[0], self.theme.width)));
-            }
-            if !brief.examples.is_empty() {
-                output.push_str("\nWHY IT'S USEFUL\n");
-                for example in &brief.examples {
-                    output.push_str(&format!("  {} {example}\n", self.theme.mark(Token::Positive)));
-                }
-            }
-            output.push_str("\nSTATUS\n");
-            self.field(&mut output, "Status", installed_state(brief.package.installed));
-            self.field(&mut output, "Source", friendly_source(brief.package.source));
-            if let Some(version) = &brief.package.version {
-                self.field(&mut output, "Version", version);
-            }
-        }
-        if plan.action == orbis_core::transaction::OperationAction::Remove {
-            output.push_str("\nRemoving this software will remove the selected application; unrelated application data is not part of this plan.\n");
-        }
-        output.push_str("\nTHIS WILL\n");
-        if !plan.changes.is_empty() {
-            let branch = if self.theme.unicode { "├─" } else { "+-" };
-            for change in &plan.changes {
-                output.push_str(&format!(
-                    "  {branch} {}{}\n",
-                    change.name.as_deref().unwrap_or(&change.package_id),
-                    change.version.as_deref().map(|v| format!(" · {v}")).unwrap_or_default()
-                ));
-            }
         } else {
-            let branch = if self.theme.unicode { "└─" } else { "\\-" };
-            output.push_str(&format!("  {branch} Change the selected software\n"));
+            output.push_str(&format!("{}\n", self.theme.paint(&plan.target.name, Token::Primary)));
         }
-        output.push_str("\nFROM\n");
+        output.push('\n');
         self.field(&mut output, "Source", friendly_source(plan.target.source));
         self.field(
             &mut output,
             "Version",
             plan.target.version.as_deref().unwrap_or("Not confirmed"),
         );
-        self.field(&mut output, "Permission", privilege_label(plan.privilege));
-        if let Some(bytes) = plan.disk_delta_bytes {
-            self.field(&mut output, "Disk change", &format_size_delta(bytes));
+        self.field(&mut output, verb, plan.scope.label());
+        if plan.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator {
+            self.field(&mut output, "Admin", "required");
         }
-        output.push_str("\nREVIEW\n");
-        self.field(&mut output, "Risk", plan.risk.label());
-        self.field(&mut output, "Confidence", confidence_label(plan.confidence));
+        output.push_str(&format!(
+            "\nThis will {} {}.\n",
+            verb.to_ascii_lowercase(),
+            plan.target.name
+        ));
+        output.push_str(&format!("Risk  {}\n", plan.risk.label()));
         for warning in &plan.warnings {
             output.push_str(&format!("  {} {}\n", warning_marker(warning.level), warning.message));
+        }
+        if plan.action == orbis_core::transaction::OperationAction::Remove {
+            output.push_str(
+                "Removing the selected software does not remove unrelated application data.\n",
+            );
         }
         output.push_str("\nNo package state has been changed by this review.\n");
         output
@@ -384,82 +357,80 @@ impl Renderer {
         output
     }
 
-    pub(crate) fn maintenance_plan(&self, plan: &MaintenancePlan) -> String {
-        let title = match plan.action {
-            orbis_core::maintenance::MaintenanceAction::Refresh => "Refresh",
-            orbis_core::maintenance::MaintenanceAction::Upgrade => "Update",
-            orbis_core::maintenance::MaintenanceAction::Cleanup => "Clean",
-        };
-        let mut output = self.heading(title, "Review the read-only plan before applying changes.");
-        let total: usize =
-            plan.providers.iter().map(|p| p.candidates.len().max(p.cleanup_candidates.len())).sum();
+    pub(crate) fn maintenance_plan(&self, plan: &MaintenancePlan, diagnostic: bool) -> String {
+        let title = maintenance_title(plan.action);
+        let mut output = self.heading(title, "");
+        output.push_str("SOFTWARE SOURCES\n\n");
+        for row in maintenance_review_rows(plan) {
+            let action = match plan.action {
+                orbis_core::maintenance::MaintenanceAction::Refresh => {
+                    if !row.executable {
+                        "unavailable"
+                    } else if row.mutates {
+                        "refresh"
+                    } else if row.managed {
+                        "managed"
+                    } else {
+                        "on demand"
+                    }
+                }
+                orbis_core::maintenance::MaintenanceAction::Upgrade => "update",
+                orbis_core::maintenance::MaintenanceAction::Cleanup => "clean",
+            };
+            let admin = if row.admin { "admin" } else { "" };
+            output.push_str(&format!(
+                "  {:<32} {:<12} {}\n",
+                self.theme.paint(&row.label, Token::Provider),
+                self.theme.paint(action, if row.mutates { Token::Primary } else { Token::Muted }),
+                self.theme.paint(admin, Token::Muted)
+            ));
+            if diagnostic && row.scope_unknown {
+                output.push_str("    scope not reported\n");
+            }
+        }
+        let refreshable = plan
+            .providers
+            .iter()
+            .filter(|provider| provider.mutates && provider.executable())
+            .count();
+        let total = plan
+            .providers
+            .iter()
+            .map(|provider| provider.candidates.len().max(provider.cleanup_candidates.len()))
+            .sum::<usize>();
         let summary = match plan.action {
             orbis_core::maintenance::MaintenanceAction::Refresh => format!(
-                "\n  Refreshing information from {} software source{}\n",
-                plan.providers.len(),
-                if plan.providers.len() == 1 { "" } else { "s" }
+                "\n{} source{} will be refreshed.\n",
+                refreshable,
+                if refreshable == 1 { "" } else { "s" }
             ),
             orbis_core::maintenance::MaintenanceAction::Upgrade => format!(
-                "\n  {total} update{} across {} software source{}\n",
+                "\n{total} update{} across {} source{}\n",
                 if total == 1 { "" } else { "s" },
                 plan.providers.len(),
                 if plan.providers.len() == 1 { "" } else { "s" }
             ),
             orbis_core::maintenance::MaintenanceAction::Cleanup => format!(
-                "\n  {total} cleanup item{} across {} software source{}\n",
+                "\n{total} cleanup item{} across {} source{}\n",
                 if total == 1 { "" } else { "s" },
                 plan.providers.len(),
                 if plan.providers.len() == 1 { "" } else { "s" }
             ),
         };
         output.push_str(&summary);
-        for provider in &plan.providers {
-            output.push_str(&format!(
-                "\n{}  {}\n",
-                self.theme.paint(friendly_source(provider.source), Token::Provider),
-                provider.scope.map(|s| s.label()).unwrap_or("scope not reported")
-            ));
-            for candidate in &provider.candidates {
-                output.push_str(&format!(
-                    "  {}  {} {} {}\n",
-                    candidate.name,
-                    candidate.current_version.as_deref().unwrap_or("current"),
-                    if self.theme.unicode { "→" } else { "->" },
-                    candidate.available_version.as_deref().unwrap_or("latest")
-                ));
-            }
-            if provider.candidates.is_empty() {
-                let explanation = match plan.action {
-                    orbis_core::maintenance::MaintenanceAction::Refresh if !provider.mutates => {
-                        match provider.source {
-                            PackageSource::Snap => {
-                                "  Managed automatically.\n  snapd handles store refresh awareness.\n"
-                            }
-                            _ => {
-                                "  No refresh needed.\n  Provider metadata is queried on demand.\n"
-                            }
-                        }
-                    }
-                    orbis_core::maintenance::MaintenanceAction::Refresh => {
-                        "  Software information will be refreshed.\n"
-                    }
-                    _ => "  No changes reported.\n",
-                };
-                output.push_str(explanation);
-            }
-            for warning in &provider.warnings {
-                output.push_str(&format!(
-                    "  {} {}\n",
-                    warning_marker(warning.level),
-                    warning.message
-                ));
+        output.push_str(&format!("Risk  {}\n", plan.risk.label()));
+        if diagnostic {
+            output.push_str(&format!("Maintenance ID  {}\n", plan.operation_id));
+            for provider in &plan.providers {
+                for warning in &provider.warnings {
+                    output.push_str(&format!(
+                        "  {} {}\n",
+                        warning_marker(warning.level),
+                        warning.message
+                    ));
+                }
             }
         }
-        output.push_str(&format!(
-            "\nRisk          {}\nPlan ID       {}\n",
-            plan.risk.label(),
-            plan.operation_id
-        ));
         output
     }
 
@@ -467,7 +438,75 @@ impl Renderer {
         &self,
         result: &MaintenanceResult,
         plans: &[ProviderMaintenancePlan],
+        diagnostic: bool,
     ) -> String {
+        if result.action == orbis_core::maintenance::MaintenanceAction::Refresh {
+            let failed = result.status != MaintenanceStatus::Succeeded;
+            let mut output: String = if failed { "\nATTENTION\n".into() } else { "\n".into() };
+            let rows = maintenance_review_rows_from_plans(plans);
+            for row in &rows {
+                let state = maintenance_result_state(row, result);
+                let (mark, token, status) = refresh_row_view(state, self.theme);
+                output.push_str(&format!(
+                    "  {} {:<32} {}\n",
+                    self.theme.paint(mark, token),
+                    self.theme.paint(&row.label, token),
+                    self.theme.paint(status, token)
+                ));
+            }
+            let refreshed = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        maintenance_result_state(row, result),
+                        RefreshRowState::Refreshed | RefreshRowState::Partial
+                    )
+                })
+                .count();
+            let no_refresh = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        maintenance_result_state(row, result),
+                        RefreshRowState::Managed | RefreshRowState::OnDemand
+                    )
+                })
+                .count();
+            let failed = rows
+                .iter()
+                .filter(|row| {
+                    matches!(maintenance_result_state(row, result), RefreshRowState::Failed)
+                })
+                .count();
+            output.push('\n');
+            if failed > 0 {
+                output.push_str(&format!(
+                    "  {} source{} need attention\n",
+                    failed,
+                    if failed == 1 { "" } else { "s" }
+                ));
+                for row in rows.iter().filter(|row| {
+                    matches!(maintenance_result_state(row, result), RefreshRowState::Failed)
+                }) {
+                    if let Some(message) = row_failure_message(row, result) {
+                        output.push_str(&format!("\n  {}\n  {}\n", row.label, message));
+                    }
+                }
+                output.push_str("\n  See orbis history or --plain for details.\n");
+            } else {
+                output.push_str(&format!(
+                    "  {} sources checked · {} refreshed · {} require no refresh\n",
+                    rows.len(),
+                    refreshed,
+                    no_refresh
+                ));
+            }
+            if diagnostic || failed > 0 {
+                output.push_str(&format!("\n  Maintenance ID  {}\n", result.operation_id));
+            }
+            return output;
+        }
+
         let title = match result.status {
             MaintenanceStatus::Succeeded => "Completed",
             MaintenanceStatus::PartiallySucceeded => "Partially completed",
@@ -477,47 +516,7 @@ impl Renderer {
         };
         let mut output =
             self.heading(title, &format!("{} across available sources", result.action.label()));
-        let mut occurrences = std::collections::BTreeMap::new();
         for provider in &result.providers {
-            let occurrence = occurrences.entry(provider.source).or_insert(0);
-            let matching_plan =
-                plans.iter().filter(|plan| plan.source == provider.source).nth(*occurrence);
-            *occurrence += 1;
-
-            if result.action == orbis_core::maintenance::MaintenanceAction::Refresh {
-                let has_duplicate_scope = result
-                    .providers
-                    .iter()
-                    .filter(|candidate| candidate.source == provider.source)
-                    .count()
-                    > 1;
-                let source_label = if provider.source == PackageSource::Flatpak {
-                    matching_plan
-                        .and_then(|plan| plan.scope)
-                        .map(|scope| {
-                            format!("{} · {}", friendly_source(provider.source), scope.label())
-                        })
-                        .or_else(|| {
-                            has_duplicate_scope.then(|| {
-                                format!("{} · scope not reported", friendly_source(provider.source))
-                            })
-                        })
-                        .unwrap_or_else(|| friendly_source(provider.source).to_string())
-                } else {
-                    friendly_source(provider.source).to_string()
-                };
-                let outcome = refresh_outcome(provider);
-                output.push_str(&format!("  {source_label}\n    {outcome}\n"));
-                if let Some(explanation) =
-                    refresh_explanation(provider.source, provider.status.clone())
-                {
-                    output.push_str(&format!("    {explanation}\n"));
-                } else if let Some(message) = &provider.message {
-                    output.push_str(&format!("    {message}\n"));
-                }
-                continue;
-            }
-
             let status = match provider.status {
                 MaintenanceProviderStatus::Succeeded => "succeeded",
                 MaintenanceProviderStatus::PartiallySucceeded => "partially succeeded",
@@ -526,8 +525,8 @@ impl Renderer {
                 MaintenanceProviderStatus::Blocked => "blocked",
             };
             output.push_str(&format!(
-                "  {:<24} {:<22} {} change{}\n",
-                friendly_source(provider.source),
+                "  {:<24} {:<22} {} item{}\n",
+                maintenance_source_label(provider.source, None),
                 status,
                 provider.candidate_count,
                 if provider.candidate_count == 1 { "" } else { "s" }
@@ -536,7 +535,9 @@ impl Renderer {
                 output.push_str(&format!("    {message}\n"));
             }
         }
-        output.push_str(&format!("\n  Maintenance ID  {}\n", result.operation_id));
+        if diagnostic || result.status != MaintenanceStatus::Succeeded {
+            output.push_str(&format!("\n  Maintenance ID  {}\n", result.operation_id));
+        }
         output
     }
 
@@ -670,17 +671,21 @@ impl Renderer {
     }
 
     fn heading(&self, title: &str, subtitle: &str) -> String {
-        let divider_width = self.theme.width.clamp(32, 88);
-        format!(
-            "{} // {}\n{}\n{}\n\n",
+        let divider_width = self.theme.width.clamp(40, 72);
+        let mut output = format!(
+            "{} // {}\n{}\n",
             self.theme.paint(self.theme.brand_compact(), Token::Primary),
             self.theme.paint(&title.to_ascii_uppercase(), Token::Primary),
             self.theme.paint(
                 &(if self.theme.unicode { "─" } else { "-" }).repeat(divider_width),
                 Token::Divider,
             ),
-            self.theme.paint(subtitle, Token::Muted),
-        )
+        );
+        if !subtitle.is_empty() {
+            output.push_str(&format!("{}\n", self.theme.paint(subtitle, Token::Muted)));
+        }
+        output.push('\n');
+        output
     }
     fn field(&self, output: &mut String, label: &str, value: &str) {
         output.push_str(&format!("  {label:<14}{value}\n"));
@@ -761,40 +766,164 @@ fn friendly_source(source: PackageSource) -> &'static str {
     }
 }
 
-fn refresh_outcome(provider: &MaintenanceProviderResult) -> &'static str {
-    match provider.status {
-        MaintenanceProviderStatus::Failed => "failed",
-        MaintenanceProviderStatus::Skipped | MaintenanceProviderStatus::Blocked => "unavailable",
-        MaintenanceProviderStatus::PartiallySucceeded => "partially refreshed",
-        MaintenanceProviderStatus::Succeeded => match provider.source {
-            PackageSource::Cargo
-            | PackageSource::Npm
-            | PackageSource::Pnpm
-            | PackageSource::Uv
-            | PackageSource::Pipx => "no refresh needed",
-            PackageSource::Snap => "managed automatically",
-            PackageSource::Apt | PackageSource::Flatpak => "refreshed",
-        },
+#[derive(Clone)]
+struct MaintenanceReviewRow {
+    label: String,
+    scope_unknown: bool,
+    mutates: bool,
+    managed: bool,
+    executable: bool,
+    admin: bool,
+    provider_indices: Vec<usize>,
+}
+
+fn maintenance_title(action: orbis_core::maintenance::MaintenanceAction) -> &'static str {
+    match action {
+        orbis_core::maintenance::MaintenanceAction::Refresh => "Refresh",
+        orbis_core::maintenance::MaintenanceAction::Upgrade => "Update",
+        orbis_core::maintenance::MaintenanceAction::Cleanup => "Clean",
     }
 }
 
-fn refresh_explanation(
-    source: PackageSource,
-    status: MaintenanceProviderStatus,
-) -> Option<&'static str> {
-    if status != MaintenanceProviderStatus::Succeeded {
-        return None;
-    }
-    match source {
-        PackageSource::Cargo => Some("Cargo metadata is queried live."),
-        PackageSource::Npm | PackageSource::Pnpm => {
-            Some("Package registry metadata is queried live.")
+fn maintenance_review_rows(plan: &MaintenancePlan) -> Vec<MaintenanceReviewRow> {
+    maintenance_review_rows_from_plans(&plan.providers)
+}
+
+fn maintenance_review_rows_from_plans(
+    plans: &[ProviderMaintenancePlan],
+) -> Vec<MaintenanceReviewRow> {
+    let mut rows = Vec::new();
+    for (index, provider) in plans.iter().enumerate() {
+        let family = provider_family(provider.source);
+        let row_index = rows.iter().position(|row: &MaintenanceReviewRow| {
+            provider_family(row_source(row, plans)) == family
+                && (provider.source != PackageSource::Flatpak
+                    || row_scope(row, plans) == provider.scope)
+        });
+        if let Some(row_index) = row_index {
+            let row = &mut rows[row_index];
+            row.mutates |= provider.mutates;
+            row.executable &= provider.executable();
+            row.admin |=
+                provider.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator;
+            row.provider_indices.push(index);
+        } else {
+            rows.push(MaintenanceReviewRow {
+                label: maintenance_source_label(provider.source, provider.scope),
+                scope_unknown: provider.scope.is_none(),
+                mutates: provider.mutates,
+                managed: provider.source == PackageSource::Snap,
+                executable: provider.executable(),
+                admin: provider.privilege
+                    == orbis_core::transaction::PrivilegeRequirement::Administrator,
+                provider_indices: vec![index],
+            });
         }
-        PackageSource::Uv => Some("uv tool metadata is resolved on demand."),
-        PackageSource::Pipx => Some("pipx package metadata is resolved on demand."),
-        PackageSource::Snap => Some("snapd handles store refresh awareness."),
-        PackageSource::Apt | PackageSource::Flatpak => None,
     }
+    rows
+}
+
+fn row_source(row: &MaintenanceReviewRow, plans: &[ProviderMaintenancePlan]) -> PackageSource {
+    plans[row.provider_indices[0]].source
+}
+
+fn row_scope(
+    row: &MaintenanceReviewRow,
+    plans: &[ProviderMaintenancePlan],
+) -> Option<orbis_core::transaction::InstallScope> {
+    plans[row.provider_indices[0]].scope
+}
+
+fn provider_family(source: PackageSource) -> PackageSource {
+    match source {
+        PackageSource::Pnpm => PackageSource::Npm,
+        PackageSource::Pipx => PackageSource::Uv,
+        source => source,
+    }
+}
+
+fn maintenance_source_label(
+    source: PackageSource,
+    scope: Option<orbis_core::transaction::InstallScope>,
+) -> String {
+    match source {
+        PackageSource::Apt => "Ubuntu repositories".into(),
+        PackageSource::Flatpak => scope
+            .map(|scope| format!("Flatpak · {}", scope.label()))
+            .unwrap_or_else(|| "Flatpak".into()),
+        PackageSource::Snap => "Snap Store".into(),
+        PackageSource::Cargo => "Rust tools".into(),
+        PackageSource::Npm | PackageSource::Pnpm => "Node.js tools".into(),
+        PackageSource::Uv | PackageSource::Pipx => "Python tools".into(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RefreshRowState {
+    Refreshed,
+    Partial,
+    Managed,
+    OnDemand,
+    Failed,
+    Unavailable,
+}
+
+fn maintenance_result_state(
+    row: &MaintenanceReviewRow,
+    result: &MaintenanceResult,
+) -> RefreshRowState {
+    let mut partial = false;
+    for index in &row.provider_indices {
+        match result.providers.get(*index).map(|provider| &provider.status) {
+            Some(MaintenanceProviderStatus::Failed) => return RefreshRowState::Failed,
+            Some(MaintenanceProviderStatus::PartiallySucceeded) => partial = true,
+            Some(MaintenanceProviderStatus::Skipped | MaintenanceProviderStatus::Blocked)
+            | None => return RefreshRowState::Unavailable,
+            _ => {}
+        }
+    }
+    if row.mutates {
+        if partial { RefreshRowState::Partial } else { RefreshRowState::Refreshed }
+    } else if row.managed {
+        RefreshRowState::Managed
+    } else {
+        RefreshRowState::OnDemand
+    }
+}
+
+fn refresh_row_view(state: RefreshRowState, theme: Theme) -> (&'static str, Token, &'static str) {
+    match state {
+        RefreshRowState::Refreshed => {
+            (if theme.unicode { "●" } else { "*" }, Token::Positive, "refreshed")
+        }
+        RefreshRowState::Partial => {
+            (if theme.unicode { "●" } else { "*" }, Token::Caution, "partially refreshed")
+        }
+        RefreshRowState::Managed => {
+            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "managed by snapd")
+        }
+        RefreshRowState::OnDemand => {
+            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "metadata on demand")
+        }
+        RefreshRowState::Failed => {
+            (if theme.unicode { "×" } else { "x" }, Token::Destructive, "failed")
+        }
+        RefreshRowState::Unavailable => {
+            (if theme.unicode { "○" } else { "o" }, Token::Muted, "unavailable")
+        }
+    }
+}
+
+fn row_failure_message(row: &MaintenanceReviewRow, result: &MaintenanceResult) -> Option<String> {
+    row.provider_indices.iter().filter_map(|index| result.providers.get(*index)).find_map(
+        |provider| {
+            if matches!(provider.status, MaintenanceProviderStatus::Failed) {
+                provider.message.clone()
+            } else {
+                None
+            }
+        },
+    )
 }
 
 fn friendly_area(area: &str) -> &'static str {
@@ -808,28 +937,6 @@ fn friendly_area(area: &str) -> &'static str {
         "uv" => friendly_source(PackageSource::Uv),
         "pipx" => friendly_source(PackageSource::Pipx),
         _ => "Software tools",
-    }
-}
-
-fn format_size_delta(bytes: i64) -> String {
-    let sign = if bytes >= 0 { "+" } else { "-" };
-    let value = bytes.unsigned_abs();
-    if value < 1024 {
-        format!("{sign}{value} B")
-    } else if value < 1024 * 1024 {
-        format!("{sign}{:.1} KB", value as f64 / 1024.0)
-    } else if value < 1024 * 1024 * 1024 {
-        format!("{sign}{:.1} MB", value as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{sign}{:.1} GB", value as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-fn confidence_label(value: orbis_core::transaction::PlanConfidence) -> &'static str {
-    match value {
-        orbis_core::transaction::PlanConfidence::High => "high",
-        orbis_core::transaction::PlanConfidence::Medium => "medium",
-        orbis_core::transaction::PlanConfidence::Low => "low",
     }
 }
 
@@ -940,7 +1047,7 @@ mod tests {
         );
         let maintenance =
             MaintenancePlan::new(MaintenanceAction::Cleanup, Some(PackageSource::Apt), Vec::new());
-        assert!(renderer.maintenance_plan(&maintenance).contains("CLEAN"));
+        assert!(renderer.maintenance_plan(&maintenance, false).contains("CLEAN"));
         let why = WhyReport {
             package: target,
             installed_as: "Required by other installed software.".into(),
@@ -967,6 +1074,108 @@ mod tests {
             read_only: true,
         };
         assert!(renderer.health(&doctor).contains("HEALTH"));
+    }
+
+    #[test]
+    fn maintenance_review_is_a_compact_source_matrix() {
+        let renderer = renderer();
+        let provider = |source, scope, mutates, privilege| ProviderMaintenancePlan {
+            operation_id: "maintenance-plan".into(),
+            source,
+            action: MaintenanceAction::Refresh,
+            scope,
+            candidates: Vec::new(),
+            cleanup_candidates: Vec::new(),
+            privilege,
+            completeness: orbis_core::transaction::PlanCompleteness::Complete,
+            confidence: orbis_core::transaction::PlanConfidence::High,
+            authoritative_simulation: false,
+            risk: orbis_core::transaction::RiskLevel::Normal,
+            supported: true,
+            mutates,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        };
+        let plan = MaintenancePlan {
+            operation_id: "maintenance".into(),
+            action: MaintenanceAction::Refresh,
+            source: None,
+            providers: vec![
+                provider(
+                    PackageSource::Apt,
+                    None,
+                    true,
+                    orbis_core::transaction::PrivilegeRequirement::Administrator,
+                ),
+                provider(
+                    PackageSource::Flatpak,
+                    Some(InstallScope::System),
+                    true,
+                    orbis_core::transaction::PrivilegeRequirement::Administrator,
+                ),
+                provider(
+                    PackageSource::Flatpak,
+                    Some(InstallScope::User),
+                    true,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Snap,
+                    None,
+                    false,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Cargo,
+                    None,
+                    false,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Npm,
+                    None,
+                    false,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Pnpm,
+                    None,
+                    false,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Uv,
+                    None,
+                    false,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+                provider(
+                    PackageSource::Pipx,
+                    None,
+                    false,
+                    orbis_core::transaction::PrivilegeRequirement::None,
+                ),
+            ],
+            risk: orbis_core::transaction::RiskLevel::Normal,
+            completeness: orbis_core::transaction::PlanCompleteness::Complete,
+            privilege: orbis_core::transaction::PrivilegeRequirement::Administrator,
+            warnings: Vec::new(),
+            mutates: true,
+        };
+        let output = renderer.maintenance_plan(&plan, false);
+        assert_eq!(output.matches("ORBIS // REFRESH").count(), 1);
+        assert!(output.contains("Ubuntu repositories"));
+        assert!(output.contains("Flatpak · system"));
+        assert!(output.contains("Flatpak · user"));
+        assert!(output.contains("Node.js tools"));
+        assert!(output.contains("Python tools"));
+        assert!(output.contains("admin"));
+        assert!(!output.contains("scope not reported"));
+        assert!(!output.contains("Privilege     user"));
+        assert!(!output.contains("Maintenance ID"));
+        assert!(!output.contains("Review the read-only plan"));
     }
 
     #[test]
@@ -1022,31 +1231,52 @@ mod tests {
                 },
             ],
         };
-        let plan = |scope| ProviderMaintenancePlan {
+        let plan = |source, scope, mutates, privilege| ProviderMaintenancePlan {
             operation_id: "refresh-plan".into(),
-            source: PackageSource::Flatpak,
+            source,
             action: MaintenanceAction::Refresh,
-            scope: Some(scope),
+            scope,
             candidates: Vec::new(),
             cleanup_candidates: Vec::new(),
-            privilege: orbis_core::transaction::PrivilegeRequirement::None,
+            privilege,
             completeness: orbis_core::transaction::PlanCompleteness::Complete,
             confidence: orbis_core::transaction::PlanConfidence::High,
             authoritative_simulation: false,
             risk: orbis_core::transaction::RiskLevel::Normal,
             supported: true,
-            mutates: false,
+            mutates,
             warnings: Vec::new(),
             notes: Vec::new(),
             download_size_bytes: None,
             disk_delta_bytes: None,
         };
-        let output = renderer
-            .maintenance_result(&result, &[plan(InstallScope::System), plan(InstallScope::User)]);
-        assert!(output.contains("Rust tools\n    no refresh needed"));
-        assert!(output.contains("Cargo metadata is queried live."));
-        assert!(output.contains("Flatpak apps · system"));
-        assert!(output.contains("Flatpak apps · user"));
+        let plans = vec![
+            plan(
+                PackageSource::Cargo,
+                None,
+                false,
+                orbis_core::transaction::PrivilegeRequirement::None,
+            ),
+            plan(
+                PackageSource::Flatpak,
+                Some(InstallScope::System),
+                true,
+                orbis_core::transaction::PrivilegeRequirement::Administrator,
+            ),
+            plan(
+                PackageSource::Flatpak,
+                Some(InstallScope::User),
+                true,
+                orbis_core::transaction::PrivilegeRequirement::None,
+            ),
+        ];
+        let output = renderer.maintenance_result(&result, &plans, false);
+        assert!(output.contains("Rust tools"));
+        assert!(output.contains("metadata on demand"));
+        assert!(output.contains("Flatpak · system"));
+        assert!(output.contains("Flatpak · user"));
+        assert!(!output.contains("scope not reported"));
+        assert!(!output.contains("Maintenance ID"));
         assert!(!output.contains("0 changes"));
     }
 }
@@ -1055,12 +1285,6 @@ fn installed_label(installed: Option<bool>) -> &'static str {
         Some(true) => "Yes",
         Some(false) => "No",
         None => "Unknown",
-    }
-}
-fn privilege_label(privilege: orbis_core::transaction::PrivilegeRequirement) -> &'static str {
-    match privilege {
-        orbis_core::transaction::PrivilegeRequirement::None => "none / user scope",
-        orbis_core::transaction::PrivilegeRequirement::Administrator => "administrator",
     }
 }
 fn verification_label(value: VerificationResult) -> &'static str {

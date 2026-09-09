@@ -89,12 +89,10 @@ pub(crate) fn reveal(theme: Theme, label: &str) {
     if raw {
         let _ = terminal::disable_raw_mode();
     }
-    let _ = writeln!(
-        stdout,
-        "\r\x1b[2K{} // {}",
-        theme.paint(theme.brand_compact(), Token::Primary),
-        theme.paint(label, Token::Primary)
-    );
+    // Leave the reveal's owned line empty. The command renderer owns the
+    // settled heading, so the reveal cannot append a second copy of it.
+    let _ = write!(stdout, "\r\x1b[2K");
+    let _ = stdout.flush();
 }
 
 /// Runs the bare-command launcher. None means cancel or a non-interactive
