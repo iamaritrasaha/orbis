@@ -1,9 +1,4 @@
 use crate::render::theme::{StageState, Theme, Token};
-use crossterm::{
-    cursor::{MoveDown, MoveToColumn, MoveUp},
-    execute,
-    terminal::{Clear, ClearType},
-};
 use orbis_core::{
     maintenance::{MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult},
     models::PackageSource,
@@ -20,6 +15,8 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+use super::region::{clear_owned_frame, write_owned_frame};
 
 #[derive(Clone)]
 struct MaintenanceRowMeta {
@@ -569,26 +566,7 @@ fn draw_tty_to<W: Write>(
         }
         RenderMode::Maintenance { rows } => maintenance_frame_lines(theme, rows, state),
     };
-    clear_owned_frame(writer, state.rendered_line_count);
-    for line in &frame {
-        let _ = writeln!(writer, "{line}");
-    }
-    state.rendered_line_count = frame.len();
-}
-
-fn clear_owned_frame<W: Write>(writer: &mut W, line_count: usize) {
-    if line_count == 0 {
-        return;
-    }
-    let count = line_count.min(u16::MAX as usize) as u16;
-    let _ = execute!(writer, MoveUp(count), MoveToColumn(0));
-    for index in 0..line_count {
-        let _ = execute!(writer, Clear(ClearType::CurrentLine));
-        if index + 1 < line_count {
-            let _ = execute!(writer, MoveDown(1), MoveToColumn(0));
-        }
-    }
-    let _ = execute!(writer, MoveUp(count.saturating_sub(1)), MoveToColumn(0));
+    state.rendered_line_count = write_owned_frame(writer, state.rendered_line_count, &frame);
 }
 
 fn standard_frame_lines(

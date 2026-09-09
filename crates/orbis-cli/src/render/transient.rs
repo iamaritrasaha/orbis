@@ -9,7 +9,11 @@ use std::time::Duration;
 
 use crossterm::{event, terminal};
 
-use super::theme::{Theme, Token};
+use super::{
+    brand::{BrandFrame, IdentityMode},
+    region::{clear_owned_frame, write_owned_frame},
+    theme::{Theme, Token},
+};
 use crate::cli::Command;
 
 const LAUNCHER_OPTIONS: [&str; 8] = [
@@ -22,12 +26,10 @@ const LAUNCHER_OPTIONS: [&str; 8] = [
     "History",
     "Full interface",
 ];
-const LAUNCHER_LINES: u16 = 13;
-
 /// Returns the compact command identity used by the transient reveal.
 pub(crate) fn command_label(command: Option<&Command>) -> Option<&'static str> {
     Some(match command? {
-        Command::Dashboard => return None,
+        Command::Dashboard => "UI",
         Command::Sources => "SOURCES",
         Command::Find { .. } => "FIND",
         Command::Show { .. } => "SHOW",
@@ -52,7 +54,7 @@ pub(crate) fn command_label(command: Option<&Command>) -> Option<&'static str> {
     })
 }
 
-/// Shows a bounded 250–450 ms identity reveal in one terminal area.
+/// Shows a bounded identity reveal in one terminal area.
 pub(crate) fn reveal(theme: Theme, label: &str) {
     if !theme.color
         || !theme.unicode
@@ -65,41 +67,57 @@ pub(crate) fn reveal(theme: Theme, label: &str) {
         return;
     }
 
-    let raw = terminal::enable_raw_mode().is_ok();
-    let frames = ["◇", "◈", "◈ ORBIS"];
+    let raw_guard = RawModeGuard::new();
     let mut stdout = io::stdout();
-    for (index, frame) in frames.iter().enumerate() {
-        let _ = write!(
-            stdout,
-            "\r\x1b[2K{} // {}",
-            theme.paint(frame, Token::Primary),
-            theme.paint(label, Token::Primary)
-        );
+    let mut rendered_line_count = 0;
+    let mut skipped = false;
+    for step in 0..=6 {
+        let frame = BrandFrame::animation(theme, step);
+        rendered_line_count = write_owned_frame(&mut stdout, rendered_line_count, frame.lines());
         let _ = stdout.flush();
-        let wait = match index {
-            0 => 70,
-            1 => 90,
-            _ => 140,
-        };
-        if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
+        let wait = [45, 55, 55, 65, 65, 75, 0][step];
+        if wait > 0 && event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             let _ = event::read();
+            skipped = true;
             break;
         }
     }
-    if raw {
-        let _ = terminal::disable_raw_mode();
+    if skipped {
+        let frame = BrandFrame::animation(theme, usize::MAX);
+        rendered_line_count = write_owned_frame(&mut stdout, rendered_line_count, frame.lines());
+        let _ = stdout.flush();
     }
-    // Leave the reveal's owned line empty. The command renderer owns the
-    // settled heading, so the reveal cannot append a second copy of it.
-    let _ = write!(stdout, "\r\x1b[2K");
+    let collapse = BrandFrame::settled(theme, IdentityMode::Command(label));
+    rendered_line_count = write_owned_frame(&mut stdout, rendered_line_count, collapse.lines());
     let _ = stdout.flush();
+    // The command renderer owns the permanent compact identity. Clear the
+    // reveal's copy so the following heading rewrites the same region once.
+    clear_owned_frame(&mut stdout, rendered_line_count);
+    let _ = stdout.flush();
+    drop(raw_guard);
+}
+
+struct RawModeGuard(bool);
+
+impl RawModeGuard {
+    fn new() -> Self {
+        Self(terminal::enable_raw_mode().is_ok())
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
 }
 
 /// Runs the bare-command launcher. None means cancel or a non-interactive
 /// caller; the caller can then return without entering a persistent screen.
 pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
-    if !terminal_capable() {
-        print!("{}", launcher_text(theme, 0));
+    if !terminal_capable() || !theme.color {
+        print!("{}", launcher_text_compact(theme, 0));
         return Ok(None);
     }
 
@@ -164,16 +182,15 @@ fn prompt(label: &str) -> Result<String, String> {
 }
 
 fn redraw_launcher(theme: Theme, selected: usize) -> Result<(), String> {
-    print!("\x1b[{}A{}", LAUNCHER_LINES, launcher_text(theme, selected));
-    io::stdout().flush().map_err(|error| error.to_string())
+    let mut stdout = io::stdout();
+    clear_owned_frame(&mut stdout, launcher_line_count(theme));
+    write!(stdout, "{}", launcher_text(theme, selected)).map_err(|error| error.to_string())?;
+    stdout.flush().map_err(|error| error.to_string())
 }
 
 pub(crate) fn launcher_text(theme: Theme, selected: usize) -> String {
-    let mut output = format!(
-        "{}\n  {}\n\n",
-        theme.paint(theme.brand_compact(), Token::Primary),
-        theme.paint(Theme::brand_tagline(), Token::Muted)
-    );
+    let mut output = BrandFrame::settled(theme, IdentityMode::Launcher).text();
+    output.push('\n');
     for (index, option) in LAUNCHER_OPTIONS.iter().enumerate() {
         let marker = if index == selected { if theme.unicode { "▸" } else { ">" } } else { " " };
         let token = if index == selected { Token::Selected } else { Token::Foreground };
@@ -192,6 +209,29 @@ pub(crate) fn launcher_text(theme: Theme, selected: usize) -> String {
     output
 }
 
+fn launcher_text_compact(theme: Theme, selected: usize) -> String {
+    let mut output = format!(
+        "{}\n  {}\n\n",
+        theme.paint(theme.brand_compact(), Token::Primary),
+        theme.paint(Theme::brand_tagline(), Token::Muted)
+    );
+    for (index, option) in LAUNCHER_OPTIONS.iter().enumerate() {
+        let marker = if index == selected { if theme.unicode { "▸" } else { ">" } } else { " " };
+        let token = if index == selected { Token::Selected } else { Token::Foreground };
+        output.push_str(&format!(
+            "  {} {}\n",
+            theme.paint(marker, Token::Primary),
+            theme.paint(option, token)
+        ));
+    }
+    output.push_str("\n  j/k move  Enter choose  q cancel\n");
+    output
+}
+
+fn launcher_line_count(theme: Theme) -> usize {
+    launcher_text(theme, 0).bytes().filter(|byte| *byte == b'\n').count()
+}
+
 fn terminal_capable() -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -205,16 +245,17 @@ mod tests {
     #[test]
     fn launcher_is_task_first_and_has_no_boxed_ui() {
         let text = launcher_text(Theme::test(80), 0);
-        assert!(text.contains("* ORBIS") || text.contains("◈ ORBIS"));
+        assert!(text.contains("╭──╮") || text.contains("+--+"));
+        assert!(text.contains("HRIK"));
         assert!(text.contains("Find software"));
         assert!(text.contains("Show software"));
         assert!(text.contains("Full interface"));
-        assert!(!text.contains("╭"));
+        assert!(!text.contains("╭────"));
     }
 
     #[test]
     fn command_labels_are_compact_and_explicit() {
         assert_eq!(command_label(Some(&Command::Health)), Some("HEALTH"));
-        assert_eq!(command_label(Some(&Command::Dashboard)), None);
+        assert_eq!(command_label(Some(&Command::Dashboard)), Some("UI"));
     }
 }
