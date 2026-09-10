@@ -95,9 +95,6 @@ impl RealOperationExecutor {
                 ));
             })
             .map_err(|error| PrivilegeError::Execution(source, error.to_string()))?;
-        if requirement == PrivilegeRequirement::Administrator && !output.success() {
-            self.verify_administrator()?;
-        }
         Ok(output)
     }
 }
@@ -119,9 +116,6 @@ impl OperationExecutor for RealOperationExecutor {
             .runner
             .run(&command)
             .map_err(|error| PrivilegeError::Execution(source, error.to_string()))?;
-        if requirement == PrivilegeRequirement::Administrator && !output.success() {
-            self.verify_administrator()?;
-        }
         Ok(output)
     }
 
