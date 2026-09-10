@@ -630,6 +630,20 @@ impl ProviderRegistry {
             transaction::ProviderOperation::Maintenance { operation } => operation,
             _ => return Err("provider returned a non-maintenance operation".into()),
         };
+        if plan.action == MaintenanceAction::Upgrade
+            && matches!(
+                &operation,
+                transaction::MaintenanceOperation::FlatpakUpgrade { refs, .. }
+                    | transaction::MaintenanceOperation::SnapUpgrade { package_ids: refs }
+                    | transaction::MaintenanceOperation::NpmUpgrade { package_ids: refs }
+                    | transaction::MaintenanceOperation::PnpmUpgrade { package_ids: refs }
+                    | transaction::MaintenanceOperation::UvUpgrade { package_ids: refs }
+                    | transaction::MaintenanceOperation::PipxUpgrade { package_ids: refs }
+                    if refs.is_empty()
+            )
+        {
+            return Err(format!("{} upgrade plan has no reviewed candidates", plan.source));
+        }
 
         observer.on_event(&progress::OperationEvent::ProviderStarted { source: plan.source });
 

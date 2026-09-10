@@ -349,6 +349,7 @@ fn scope_flag(scope: InstallScope) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction::MaintenanceOperation;
 
     #[test]
     fn typed_apt_operation_has_no_shell_interpretation() {
@@ -495,6 +496,67 @@ mod tests {
         assert_eq!(command.program, "snap");
         assert_eq!(command.args, ["refresh", "--list"]);
         assert_eq!(command.timeout, None);
+    }
+
+    #[test]
+    fn maintenance_upgrade_commands_reach_runner_with_exact_targets() {
+        let runner = std::sync::Arc::new(RecordingRunner::default());
+        let executor = RealOperationExecutor::new(runner.clone());
+        for (operation, requirement, expected_program, expected_args) in [
+            (
+                MaintenanceOperation::NpmUpgrade {
+                    package_ids: vec!["one@1.2.0".into(), "two@2.3.0".into()],
+                },
+                PrivilegeRequirement::None,
+                "npm",
+                vec!["install", "--global", "--", "one@1.2.0", "two@2.3.0"],
+            ),
+            (
+                MaintenanceOperation::SnapUpgrade {
+                    package_ids: vec!["snap-one".into(), "snap-two".into()],
+                },
+                PrivilegeRequirement::Administrator,
+                "sudo",
+                vec!["-n", "snap", "refresh", "snap-one", "snap-two"],
+            ),
+        ] {
+            let operation = ProviderOperation::Maintenance { operation };
+            executor.execute(&operation, requirement).expect("mutation command succeeds");
+            let command = runner.commands.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(command.program, expected_program);
+            assert_eq!(command.args, expected_args);
+        }
+    }
+
+    #[test]
+    fn elevated_apt_upgrade_reaches_runner_through_sudo() {
+        let runner = std::sync::Arc::new(RecordingRunner::default());
+        let executor = RealOperationExecutor::new(runner.clone());
+        let operation =
+            ProviderOperation::Maintenance { operation: MaintenanceOperation::AptUpgrade };
+        executor
+            .execute(&operation, PrivilegeRequirement::Administrator)
+            .expect("apt mutation command succeeds");
+        let command = runner.commands.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(command.program, "sudo");
+        assert_eq!(
+            command.args,
+            ["-n", "apt-get", "upgrade", "--assume-yes", "--no-remove", "-o", "Dpkg::Use-Pty=0"]
+        );
+    }
+
+    #[test]
+    fn failed_mutation_command_returns_failure() {
+        let runner =
+            std::sync::Arc::new(RecordingRunner { reject_auth: true, ..Default::default() });
+        let executor = RealOperationExecutor::new(runner);
+        let operation = ProviderOperation::Maintenance {
+            operation: MaintenanceOperation::NpmUpgrade { package_ids: vec!["one@1.2.0".into()] },
+        };
+        let output = executor
+            .execute(&operation, PrivilegeRequirement::None)
+            .expect("provider command was invoked");
+        assert!(!output.success());
     }
     #[derive(Default)]
     struct RecordingRunner {

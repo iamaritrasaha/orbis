@@ -395,16 +395,45 @@ pub fn maintenance_operation_for(plan: &ProviderMaintenancePlan) -> Option<Maint
             })
         }
         (PackageSource::Npm, MaintenanceAction::Upgrade, _) => {
-            Some(MaintenanceOperation::NpmUpgrade { package_ids: Vec::new() })
+            Some(MaintenanceOperation::NpmUpgrade {
+                package_ids: plan
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| {
+                        candidate
+                            .available_version
+                            .as_ref()
+                            .map(|version| format!("{}@{}", candidate.provider_id, version))
+                    })
+                    .collect(),
+            })
         }
         (PackageSource::Pnpm, MaintenanceAction::Upgrade, _) => {
-            Some(MaintenanceOperation::PnpmUpgrade { package_ids: Vec::new() })
+            Some(MaintenanceOperation::PnpmUpgrade {
+                package_ids: plan
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.provider_id.clone())
+                    .collect(),
+            })
         }
         (PackageSource::Uv, MaintenanceAction::Upgrade, _) => {
-            Some(MaintenanceOperation::UvUpgrade { package_ids: Vec::new() })
+            Some(MaintenanceOperation::UvUpgrade {
+                package_ids: plan
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.provider_id.clone())
+                    .collect(),
+            })
         }
         (PackageSource::Pipx, MaintenanceAction::Upgrade, _) => {
-            Some(MaintenanceOperation::PipxUpgrade { package_ids: Vec::new() })
+            Some(MaintenanceOperation::PipxUpgrade {
+                package_ids: plan
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.provider_id.clone())
+                    .collect(),
+            })
         }
         _ => None,
     }
@@ -593,5 +622,26 @@ mod tests {
             disk_delta_bytes: None,
         };
         assert_eq!(maintenance_operation_for(&plan), Some(MaintenanceOperation::AptUpgrade));
+    }
+
+    #[test]
+    fn maintenance_operation_preserves_reviewed_developer_targets() {
+        let mut plan = executable_plan(PackageSource::Npm, RiskLevel::Normal);
+        plan.candidates.push(candidate(PackageSource::Npm, None, "second"));
+        plan.candidates[0].available_version = Some("2.1".into());
+        plan.candidates[1].available_version = Some("3.4".into());
+        assert_eq!(
+            maintenance_operation_for(&plan),
+            Some(MaintenanceOperation::NpmUpgrade {
+                package_ids: vec!["example@2.1".into(), "second@3.4".into()]
+            })
+        );
+        plan.source = PackageSource::Snap;
+        assert_eq!(
+            maintenance_operation_for(&plan),
+            Some(MaintenanceOperation::SnapUpgrade {
+                package_ids: vec!["example".into(), "second".into()]
+            })
+        );
     }
 }
