@@ -159,7 +159,6 @@ where
         self.as_ref().run(command)
     }
 
-    #[cfg(not(unix))]
     fn run_streaming(
         &self,
         command: &CommandSpec,
@@ -808,5 +807,133 @@ mod tests {
             "runner waited for an inherited pipe (took {:?})",
             elapsed
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_streaming_does_not_wait_for_descendant_pipe_lifetime() {
+        let runner: SharedRunner = Arc::new(RealCommandRunner::new());
+        let start = Instant::now();
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new("sh", ["-c", "sleep 2 & printf 'parent\\n'; exit 0"]),
+                &|_line, _stream| {},
+            )
+            .expect("shell parent exits successfully");
+        let elapsed = start.elapsed();
+        assert_eq!(output.status, Some(0));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shared runner waited for an inherited pipe (took {:?})",
+            elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_delegates_streaming_to_inner_runner() {
+        struct StreamingOnlyRunner(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl CommandRunner for StreamingOnlyRunner {
+            fn is_available(&self, _program: &str) -> bool {
+                true
+            }
+
+            fn run(&self, _command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
+                panic!("shared runner used the non-streaming method")
+            }
+
+            fn run_streaming(
+                &self,
+                _command: &CommandSpec,
+                on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+            ) -> Result<CommandOutput, ProcessError> {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                on_line("delegated", crate::progress::OutputStream::Stdout);
+                Ok(CommandOutput {
+                    stdout: "delegated".into(),
+                    stderr: String::new(),
+                    status: Some(0),
+                })
+            }
+        }
+
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner: SharedRunner = Arc::new(StreamingOnlyRunner(called.clone()));
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new("ignored", std::iter::empty::<String>()),
+                &|line, stream| {
+                    assert_eq!(line, "delegated");
+                    assert_eq!(stream, crate::progress::OutputStream::Stdout);
+                },
+            )
+            .expect("streaming delegation succeeds");
+        assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(output.stdout, "delegated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_does_not_wait_for_stdout_descendant() {
+        let runner: SharedRunner = Arc::new(RealCommandRunner::new());
+        let start = Instant::now();
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new("sh", ["-c", "sleep 2 2>/dev/null & printf 'stdout\\n'; exit 0"]),
+                &|_, _| {},
+            )
+            .expect("shell parent exits successfully");
+        assert_eq!(output.status, Some(0));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_does_not_wait_for_stderr_descendant() {
+        let runner: SharedRunner = Arc::new(RealCommandRunner::new());
+        let start = Instant::now();
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new(
+                    "sh",
+                    ["-c", "sleep 2 >/dev/null & printf 'stderr\\n' >&2; exit 0"],
+                ),
+                &|_, _| {},
+            )
+            .expect("shell parent exits successfully");
+        assert_eq!(output.status, Some(0));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_preserves_output_status_and_timeout() {
+        let runner: SharedRunner = Arc::new(RealCommandRunner::new());
+        let delivered = std::sync::Mutex::new(Vec::new());
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new("sh", ["-c", "printf 'out'; printf 'err' >&2; exit 7"]),
+                &|line, stream| delivered.lock().unwrap().push((stream, line.to_owned())),
+            )
+            .expect("provider process started");
+        assert_eq!(output.status, Some(7));
+        assert!(!output.success());
+        assert!(
+            delivered
+                .lock()
+                .unwrap()
+                .contains(&(crate::progress::OutputStream::Stdout, "out".into()))
+        );
+        assert!(
+            delivered
+                .lock()
+                .unwrap()
+                .contains(&(crate::progress::OutputStream::Stderr, "err".into()))
+        );
+
+        let mut command = CommandSpec::new("sleep", ["2"]);
+        command.timeout = Some(Duration::from_millis(50));
+        let result = runner.run_streaming(&command, &|_, _| {});
+        assert!(matches!(result, Err(ProcessError::Timeout { .. })));
     }
 }
