@@ -653,32 +653,17 @@ fn run_maintenance(
         })?;
     }
     let history = if plan.mutates {
-        match orbis_core::transaction::history::HistoryStore::default_location() {
-            Ok(store) => {
-                match store.write_maintenance(
-                    &orbis_core::transaction::history::MaintenanceRecord::execution_started(
-                        plan.clone(),
-                    ),
-                    &plan.operation_id,
-                ) {
-                    Ok(_path) => Some(store),
-                    Err(e) => {
-                        if !json && !preserve_raw_output {
-                            eprintln!("Warning: could not write history record: {e}");
-                            eprintln!("Proceeding with execution, but results will not be saved to history.");
-                        }
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                if !json && !preserve_raw_output {
-                    eprintln!("Warning: could not open history store: {e}");
-                    eprintln!("Proceeding with execution, but results will not be saved to history.");
-                }
-                None
-            }
-        }
+        let history = orbis_core::transaction::history::HistoryStore::default_location()
+            .map_err(|e| format!("could not open history: {e}"))?;
+        history
+            .write_maintenance(
+                &orbis_core::transaction::history::MaintenanceRecord::execution_started(
+                    plan.clone(),
+                ),
+                &plan.operation_id,
+            )
+            .map_err(|e| format!("could not start maintenance record: {e}"))?;
+        Some(history)
     } else {
         None
     };
@@ -741,18 +726,15 @@ fn run_maintenance(
     };
     let result_plans = plan.providers.clone();
     if let Some(history) = history {
-        if let Err(e) = history.write_maintenance(
-            &orbis_core::transaction::history::MaintenanceRecord::completed(
-                plan,
-                result.clone(),
-            ),
-            &result.operation_id,
-        ) {
-            if !json && !preserve_raw_output {
-                eprintln!("Warning: could not write completed history record: {e}");
-            }
-            // Continue without failing - the operation succeeded, just history is incomplete
-        }
+        history
+            .write_maintenance(
+                &orbis_core::transaction::history::MaintenanceRecord::completed(
+                    plan,
+                    result.clone(),
+                ),
+                &result.operation_id,
+            )
+            .map_err(|e| format!("could not record maintenance: {e}"))?;
     }
     if json {
         print_json(&result)
@@ -805,26 +787,17 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
 
     let executor = RealOperationExecutor::new(registry.runner());
     let history = if plan.mutates {
-        match orbis_core::transaction::history::HistoryStore::default_location() {
-            Ok(store) => {
-                match store.write_maintenance(
-                    &orbis_core::transaction::history::MaintenanceRecord::execution_started(
-                        plan.clone(),
-                    ),
-                    &plan.operation_id,
-                ) {
-                    Ok(_path) => Some(store),
-                    Err(_e) => {
-                        // Silently skip history for TUI/observer path to avoid breaking the flow
-                        None
-                    }
-                }
-            }
-            Err(_e) => {
-                // Silently skip history for TUI/observer path to avoid breaking the flow
-                None
-            }
-        }
+        let history = orbis_core::transaction::history::HistoryStore::default_location()
+            .map_err(|e| format!("could not open history: {e}"))?;
+        history
+            .write_maintenance(
+                &orbis_core::transaction::history::MaintenanceRecord::execution_started(
+                    plan.clone(),
+                ),
+                &plan.operation_id,
+            )
+            .map_err(|e| format!("could not start maintenance record: {e}"))?;
+        Some(history)
     } else {
         None
     };
@@ -857,13 +830,15 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
         providers,
     };
     if let Some(history) = history {
-        let _ = history.write_maintenance(
-            &orbis_core::transaction::history::MaintenanceRecord::completed(
-                plan,
-                result.clone(),
-            ),
-            &result.operation_id,
-        );
+        history
+            .write_maintenance(
+                &orbis_core::transaction::history::MaintenanceRecord::completed(
+                    plan,
+                    result.clone(),
+                ),
+                &result.operation_id,
+            )
+            .map_err(|e| format!("could not record maintenance: {e}"))?;
     }
     Ok(result)
 }
