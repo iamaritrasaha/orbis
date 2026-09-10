@@ -4,9 +4,9 @@ use std::{
     collections::BTreeMap,
     io::{self, Read},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -159,6 +159,7 @@ where
         self.as_ref().run(command)
     }
 
+    #[cfg(not(unix))]
     fn run_streaming(
         &self,
         command: &CommandSpec,
@@ -238,6 +239,7 @@ impl CommandRunner for RealCommandRunner {
         Ok(CommandOutput { stdout, stderr, status: status.code() })
     }
 
+    #[cfg(not(unix))]
     fn run_streaming(
         &self,
         command: &CommandSpec,
@@ -345,6 +347,310 @@ impl CommandRunner for RealCommandRunner {
         let status = status_result.expect("status_result populated in scope")?;
         Ok(CommandOutput { stdout: stdout_output, stderr: stderr_output, status: status.code() })
     }
+
+    #[cfg(unix)]
+    fn run_streaming(
+        &self,
+        command: &CommandSpec,
+        on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+    ) -> Result<CommandOutput, ProcessError> {
+        let mut child = Command::new(&command.program)
+            .args(&command.args)
+            .envs(&command.env)
+            .stdin(to_stdio(command.stdin))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    ProcessError::NotFound { program: command.program.clone() }
+                } else {
+                    ProcessError::Io {
+                        program: command.program.clone(),
+                        message: error.to_string(),
+                    }
+                }
+            })?;
+
+        let stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let (events_tx, events_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let stdout_thread = thread::spawn({
+            let events_tx = events_tx.clone();
+            let cancel_rx = cancel_rx;
+            move || {
+                read_stream(
+                    stdout_pipe,
+                    crate::progress::OutputStream::Stdout,
+                    events_tx,
+                    cancel_rx,
+                )
+            }
+        });
+        let (cancel_stderr_tx, cancel_stderr_rx) = mpsc::channel();
+        let stderr_thread = thread::spawn({
+            let events_tx = events_tx.clone();
+            move || {
+                read_stream(
+                    stderr_pipe,
+                    crate::progress::OutputStream::Stderr,
+                    events_tx,
+                    cancel_stderr_rx,
+                )
+            }
+        });
+        drop(events_tx);
+
+        let mut stdout_capture = StreamCapture::new(crate::progress::OutputStream::Stdout);
+        let mut stderr_capture = StreamCapture::new(crate::progress::OutputStream::Stderr);
+        let mut reader_error = None;
+        let mut reader_done = [false, false];
+        let start = Instant::now();
+        let status = loop {
+            let wait = command
+                .timeout
+                .map(|timeout| timeout.saturating_sub(start.elapsed()).min(STREAM_POLL_INTERVAL))
+                .unwrap_or(STREAM_POLL_INTERVAL);
+            match child.wait_timeout(wait) {
+                Ok(Some(status)) => break status,
+                Ok(None) if command.timeout.is_some_and(|timeout| start.elapsed() >= timeout) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cancel_stream_readers(
+                        cancel_tx,
+                        cancel_stderr_tx,
+                        stdout_thread,
+                        stderr_thread,
+                    );
+                    return Err(ProcessError::Timeout {
+                        program: command.program.clone(),
+                        timeout_ms: command.timeout.expect("timeout is set").as_millis(),
+                    });
+                }
+                Ok(None) => {
+                    while let Ok(event) = events_rx.try_recv() {
+                        mark_stream_done(&event, &mut reader_done);
+                        handle_stream_event(
+                            event,
+                            on_line,
+                            &mut stdout_capture,
+                            &mut stderr_capture,
+                            &mut reader_error,
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cancel_stream_readers(
+                        cancel_tx,
+                        cancel_stderr_tx,
+                        stdout_thread,
+                        stderr_thread,
+                    );
+                    return Err(ProcessError::Io {
+                        program: command.program.clone(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        };
+
+        let grace_deadline = Instant::now() + STREAM_DRAIN_GRACE;
+        if reader_done != [true, true] {
+            while Instant::now() < grace_deadline {
+                let remaining = grace_deadline.saturating_duration_since(Instant::now());
+                match events_rx.recv_timeout(remaining.min(STREAM_POLL_INTERVAL)) {
+                    Ok(event) => {
+                        mark_stream_done(&event, &mut reader_done);
+                        handle_stream_event(
+                            event,
+                            on_line,
+                            &mut stdout_capture,
+                            &mut stderr_capture,
+                            &mut reader_error,
+                        );
+                        if reader_done == [true, true] {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if reader_error.is_some() {
+                    break;
+                }
+            }
+        }
+        cancel_stream_readers(cancel_tx, cancel_stderr_tx, stdout_thread, stderr_thread);
+        while let Ok(event) = events_rx.try_recv() {
+            mark_stream_done(&event, &mut reader_done);
+            handle_stream_event(
+                event,
+                on_line,
+                &mut stdout_capture,
+                &mut stderr_capture,
+                &mut reader_error,
+            );
+        }
+        stdout_capture.flush(on_line);
+        stderr_capture.flush(on_line);
+
+        if let Some(message) = reader_error {
+            return Err(ProcessError::Capture { program: command.program.clone(), message });
+        }
+        Ok(CommandOutput {
+            stdout: stdout_capture.output,
+            stderr: stderr_capture.output,
+            status: status.code(),
+        })
+    }
+}
+
+#[cfg(unix)]
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(unix)]
+const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+#[cfg(unix)]
+enum StreamEvent {
+    Data(crate::progress::OutputStream, Vec<u8>),
+    Done(crate::progress::OutputStream),
+    Error(crate::progress::OutputStream, String),
+}
+
+#[cfg(unix)]
+struct StreamCapture {
+    stream: crate::progress::OutputStream,
+    output: String,
+    pending: String,
+}
+
+#[cfg(unix)]
+impl StreamCapture {
+    fn new(stream: crate::progress::OutputStream) -> Self {
+        Self { stream, output: String::new(), pending: String::new() }
+    }
+
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+    ) {
+        let text = String::from_utf8_lossy(bytes);
+        self.output.push_str(&text);
+        self.pending.push_str(&text);
+        while let Some(index) = self.pending.find('\n') {
+            let mut line = self.pending.drain(..=index).collect::<String>();
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            on_line(&line, self.stream);
+        }
+    }
+
+    fn flush(&mut self, on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync)) {
+        if !self.pending.is_empty() {
+            on_line(&self.pending, self.stream);
+            self.pending.clear();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_stream(
+    mut pipe: impl Read + std::os::fd::AsFd,
+    stream: crate::progress::OutputStream,
+    events_tx: mpsc::Sender<StreamEvent>,
+    cancel_rx: mpsc::Receiver<()>,
+) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let timeout = Timespec::try_from(Duration::from_millis(20)).expect("valid poll interval");
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if cancel_rx.try_recv().is_ok() {
+            break;
+        }
+        let ready = {
+            let mut poll_fds =
+                [PollFd::new(&pipe, PollFlags::IN | PollFlags::HUP | PollFlags::ERR)];
+            poll(&mut poll_fds, Some(&timeout)).map(|_| !poll_fds[0].revents().is_empty())
+        };
+        match ready {
+            Ok(false) => continue,
+            Ok(true) => match pipe.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = events_tx.send(StreamEvent::Done(stream));
+                    break;
+                }
+                Ok(bytes) => {
+                    if events_tx.send(StreamEvent::Data(stream, buffer[..bytes].to_vec())).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = events_tx.send(StreamEvent::Error(stream, error.to_string()));
+                    break;
+                }
+            },
+            Err(error) => {
+                let _ = events_tx.send(StreamEvent::Error(stream, error.to_string()));
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn mark_stream_done(event: &StreamEvent, done: &mut [bool; 2]) {
+    if let StreamEvent::Done(stream) = event {
+        let index = if *stream == crate::progress::OutputStream::Stderr { 1 } else { 0 };
+        done[index] = true;
+    }
+}
+
+#[cfg(unix)]
+fn handle_stream_event(
+    event: StreamEvent,
+    on_line: &(dyn Fn(&str, crate::progress::OutputStream) + Send + Sync),
+    stdout: &mut StreamCapture,
+    stderr: &mut StreamCapture,
+    reader_error: &mut Option<String>,
+) {
+    match event {
+        StreamEvent::Data(crate::progress::OutputStream::Stdout, bytes) => {
+            stdout.push(&bytes, on_line)
+        }
+        StreamEvent::Data(_, bytes) => stderr.push(&bytes, on_line),
+        StreamEvent::Done(stream) => {
+            if stream == crate::progress::OutputStream::Stdout {
+                stdout.flush(on_line);
+            } else {
+                stderr.flush(on_line);
+            }
+        }
+        StreamEvent::Error(stream, message) => {
+            *reader_error = Some(format!("{stream:?}: {message}"));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cancel_stream_readers(
+    stdout_cancel: mpsc::Sender<()>,
+    stderr_cancel: mpsc::Sender<()>,
+    stdout_thread: thread::JoinHandle<()>,
+    stderr_thread: thread::JoinHandle<()>,
+) {
+    let _ = stdout_cancel.send(());
+    let _ = stderr_cancel.send(());
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
 }
 
 fn to_stdio(mode: StdioMode) -> Stdio {
@@ -429,6 +735,37 @@ mod tests {
     }
 
     #[test]
+    fn real_runner_streaming_delivers_stderr_and_final_unterminated_line() {
+        let runner = RealCommandRunner::new();
+        let delivered = std::sync::Mutex::new(Vec::new());
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new("sh", ["-c", "printf 'final stdout'; printf 'final stderr' >&2"]),
+                &|line, stream| delivered.lock().unwrap().push((stream, line.to_owned())),
+            )
+            .expect("shell exits successfully");
+        let delivered = delivered.into_inner().unwrap();
+        assert!(
+            delivered.contains(&(crate::progress::OutputStream::Stdout, "final stdout".into()))
+        );
+        assert!(
+            delivered.contains(&(crate::progress::OutputStream::Stderr, "final stderr".into()))
+        );
+        assert_eq!(output.stdout, "final stdout");
+        assert_eq!(output.stderr, "final stderr");
+    }
+
+    #[test]
+    fn real_runner_streaming_preserves_nonzero_provider_status() {
+        let runner = RealCommandRunner::new();
+        let output = runner
+            .run_streaming(&CommandSpec::new("sh", ["-c", "printf 'failed'; exit 7"]), &|_, _| {})
+            .expect("provider process started");
+        assert_eq!(output.status, Some(7));
+        assert!(!output.success());
+    }
+
+    #[test]
     fn real_runner_streaming_timeout_terminates_child_and_returns_error() {
         let runner = RealCommandRunner::new();
         let start = std::time::Instant::now();
@@ -444,6 +781,31 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(1500),
             "streaming timeout should bound execution time (took {:?})",
+            elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_streaming_does_not_wait_for_descendant_pipe_lifetime() {
+        let runner = RealCommandRunner::new();
+        let start = std::time::Instant::now();
+        let output = runner
+            .run_streaming(
+                &CommandSpec::new(
+                    "sh",
+                    ["-c", "sleep 2 & printf 'parent stdout\\n'; printf 'parent stderr\\n' >&2; exit 0"],
+                ),
+                &|_line, _stream| {},
+            )
+            .expect("shell parent exits successfully");
+        let elapsed = start.elapsed();
+        assert_eq!(output.status, Some(0));
+        assert!(output.stdout.contains("parent stdout"));
+        assert!(output.stderr.contains("parent stderr"));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "runner waited for an inherited pipe (took {:?})",
             elapsed
         );
     }

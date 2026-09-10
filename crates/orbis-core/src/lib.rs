@@ -469,15 +469,39 @@ impl ProviderRegistry {
     ) -> Result<MaintenancePlan, String> {
         let mut providers = Vec::new();
         let mut issues = Vec::new();
-        for provider in self.selected_maintenance(source) {
-            let result = match action {
-                MaintenanceAction::Refresh => provider.refresh_plan(),
-                MaintenanceAction::Upgrade => provider.upgrade_plan(),
-                MaintenanceAction::Cleanup => provider.cleanup_plan().map(|plan| vec![plan]),
-            };
-            match result {
-                Ok(plans) => providers.extend(plans),
-                Err(error) => issues.push(format!("{}: {}", provider.source(), error)),
+        let selected = self.selected_maintenance(source);
+        if action == MaintenanceAction::Upgrade {
+            let results = std::thread::scope(|scope| {
+                selected
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        scope.spawn(move || (index, provider.source(), provider.upgrade_plan()))
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().expect("upgrade planner thread panicked"))
+                    .collect::<Vec<_>>()
+            });
+            let mut results = results;
+            results.sort_by_key(|(index, _, _)| *index);
+            for (_, source, result) in results {
+                match result {
+                    Ok(plans) => providers.extend(plans),
+                    Err(error) => issues.push(format!("{}: {}", source, error)),
+                }
+            }
+        } else {
+            for provider in selected {
+                let result = match action {
+                    MaintenanceAction::Refresh => provider.refresh_plan(),
+                    MaintenanceAction::Cleanup => provider.cleanup_plan().map(|plan| vec![plan]),
+                    MaintenanceAction::Upgrade => unreachable!("upgrade handled above"),
+                };
+                match result {
+                    Ok(plans) => providers.extend(plans),
+                    Err(error) => issues.push(format!("{}: {}", provider.source(), error)),
+                }
             }
         }
         if providers.is_empty() && !issues.is_empty() {
@@ -646,6 +670,17 @@ impl ProviderRegistry {
         }
 
         observer.on_event(&progress::OperationEvent::ProviderStarted { source: plan.source });
+
+        if plan.action == MaintenanceAction::Upgrade && plan.source == PackageSource::Npm {
+            for candidate in &plan.candidates {
+                observer.on_event(&progress::OperationEvent::ProviderOutput(
+                    progress::OutputLine {
+                        stream: progress::OutputStream::Stdout,
+                        content: format!("Updating {}...", candidate.name),
+                    },
+                ));
+            }
+        }
 
         observer.on_event(&progress::OperationEvent::StageChanged {
             stage: progress::ExecutionStage::Preparing,
@@ -886,7 +921,7 @@ mod tests {
     use std::{
         collections::BTreeSet,
         fs,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicUsize},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -951,6 +986,37 @@ mod tests {
                 program => panic!("unexpected fake command: {program} {:?}", command.args),
             };
             Ok(CommandOutput { stdout: output.into(), stderr: String::new(), status: Some(0) })
+        }
+    }
+
+    struct NpmPlanningRunner {
+        outdated_calls: AtomicUsize,
+    }
+
+    impl CommandRunner for NpmPlanningRunner {
+        fn is_available(&self, program: &str) -> bool {
+            program == "npm"
+        }
+
+        fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError> {
+            let (stdout, status) = match command.args.as_slice() {
+                [prefix, flag] if prefix == "prefix" && flag == "--global" => {
+                    (format!("{}\n", std::env::var("HOME").expect("home is set")), Some(0))
+                }
+                [outdated, global, json]
+                    if outdated == "outdated" && global == "--global" && json == "--json" =>
+                {
+                    self.outdated_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (r#"{"example":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0","dependent":"global","location":"/tmp/example"}}"#.into(), Some(1))
+                }
+                [install, global, separator, _]
+                    if install == "install" && global == "--global" && separator == "--" =>
+                {
+                    (String::new(), Some(0))
+                }
+                args => panic!("unexpected npm command: {args:?}"),
+            };
+            Ok(CommandOutput { stdout, stderr: String::new(), status })
         }
     }
 
@@ -1184,6 +1250,75 @@ mod tests {
             registry.plan_transaction(&request),
             Err(crate::transaction::TransactionError::Ambiguous { .. })
         ));
+    }
+
+    #[test]
+    fn reviewed_upgrade_revalidates_once_before_execution() {
+        struct SuccessfulExecutor;
+        impl OperationExecutor for SuccessfulExecutor {
+            fn execute(
+                &self,
+                operation: &crate::transaction::ProviderOperation,
+                _requirement: crate::transaction::PrivilegeRequirement,
+            ) -> Result<CommandOutput, crate::privilege::PrivilegeError> {
+                assert!(matches!(
+                    operation,
+                    crate::transaction::ProviderOperation::Maintenance {
+                        operation: crate::transaction::MaintenanceOperation::NpmUpgrade {
+                            package_ids
+                        }
+                    } if package_ids == &["example@2.0.0"]
+                ));
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), status: Some(0) })
+            }
+        }
+
+        let runner = Arc::new(NpmPlanningRunner { outdated_calls: AtomicUsize::new(0) });
+        let registry = ProviderRegistry::with_runner(runner.clone());
+        let plan = registry
+            .maintenance_plan(MaintenanceAction::Upgrade, Some(PackageSource::Npm))
+            .expect("npm plan");
+        assert_eq!(runner.outdated_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        registry.revalidate_upgrade_plan(&plan).expect("reviewed plan remains current");
+        assert_eq!(runner.outdated_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        registry
+            .execute_maintenance(&plan.providers[0], &SuccessfulExecutor)
+            .expect("npm execution and verification");
+        assert_eq!(runner.outdated_calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn npm_execution_emits_package_activity_before_mutation() {
+        struct SuccessfulExecutor;
+        impl OperationExecutor for SuccessfulExecutor {
+            fn execute(
+                &self,
+                _operation: &crate::transaction::ProviderOperation,
+                _requirement: crate::transaction::PrivilegeRequirement,
+            ) -> Result<CommandOutput, crate::privilege::PrivilegeError> {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), status: Some(0) })
+            }
+        }
+
+        struct OutputRecorder(Mutex<Vec<String>>);
+        impl crate::progress::ProgressObserver for OutputRecorder {
+            fn on_event(&self, event: &crate::progress::OperationEvent) {
+                if let crate::progress::OperationEvent::ProviderOutput(line) = event {
+                    self.0.lock().unwrap().push(line.content.clone());
+                }
+            }
+        }
+
+        let runner = Arc::new(NpmPlanningRunner { outdated_calls: AtomicUsize::new(0) });
+        let registry = ProviderRegistry::with_runner(runner);
+        let plan = registry
+            .maintenance_plan(MaintenanceAction::Upgrade, Some(PackageSource::Npm))
+            .expect("npm plan");
+        let recorder = OutputRecorder(Mutex::new(Vec::new()));
+        registry
+            .execute_maintenance_with_progress(&plan.providers[0], &SuccessfulExecutor, &recorder)
+            .expect("npm execution");
+        assert_eq!(*recorder.0.lock().unwrap(), vec!["Updating example...".to_owned()]);
     }
 
     struct StageRecorder {

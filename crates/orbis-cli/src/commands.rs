@@ -625,9 +625,6 @@ fn run_maintenance(
     if !plan.executable() {
         return report_error(json, "no executable provider plan is available; unsupported or blocked providers were not changed".into());
     }
-    if options.action == MaintenanceAction::Upgrade {
-        revalidate_upgrade_for_review(registry, renderer, json, preserve_raw_output, &plan)?;
-    }
     if plan.mutates && !options.yes {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return report_error(json, "confirmation is required: use an interactive terminal or pass --yes after reviewing the plan".into());
@@ -637,11 +634,11 @@ fn run_maintenance(
             println!("\nOperation cancelled.\nNothing was changed.\n");
             return Ok(());
         }
-        if options.action == MaintenanceAction::Upgrade {
-            revalidate_upgrade_for_review(registry, renderer, json, preserve_raw_output, &plan)?;
-        }
     } else if !json {
         print!("{}", renderer.maintenance_plan(&plan, preserve_raw_output));
+    }
+    if options.action == MaintenanceAction::Upgrade {
+        revalidate_upgrade_for_review(registry, renderer, json, preserve_raw_output, &plan)?;
     }
     let executor = RealOperationExecutor::new(registry.runner());
     if plan.providers.iter().any(|provider| {
