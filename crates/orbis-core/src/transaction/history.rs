@@ -278,17 +278,23 @@ impl HistoryStore {
     }
 
     /// Reads and summarizes all current and legacy records, newest first.
+    /// Unreadable or corrupt individual records are skipped so one damaged
+    /// file cannot hide the rest of the history; the durable store itself is
+    /// never modified by listing.
     pub fn entries(&self) -> Result<Vec<HistoryEntry>, String> {
         if !self.directory.exists() {
             return Ok(Vec::new());
         }
         let mut entries = Vec::new();
         for item in fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
-            let path = item.map_err(|error| error.to_string())?.path();
+            let path = match item {
+                Ok(item) => item.path(),
+                Err(_) => continue,
+            };
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let body = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            let Ok(body) = fs::read_to_string(&path) else { continue };
             if let Ok(record) = serde_json::from_str::<MaintenanceRecord>(&body)
                 && record.plan.operation_id.starts_with("maint-")
             {
@@ -314,8 +320,7 @@ impl HistoryStore {
                 continue;
             }
             if let Ok(record) = serde_json::from_str::<TransactionRecord>(&body) {
-                let Some(plan) = record.resolved_plan() else { continue };
-                let operation_id = plan.operation_id.clone();
+                let Some(plan) = record.resolved_plan() else { continue };                let operation_id = plan.operation_id.clone();
                 let (status, verification, message) = match &record.result {
                     Some(result) => (
                         format!("{:?}", record.effective_lifecycle()).to_ascii_lowercase(),
@@ -459,5 +464,19 @@ mod tests {
         let store = HistoryStore::at("/tmp/orbis-history-safety-test");
         assert!(store.entry("../outside").is_err());
         assert!(!store.record_path("../outside").starts_with("/tmp/outside"));
+    }
+
+    #[test]
+    fn listing_skips_unreadable_and_corrupt_records() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let directory = std::env::temp_dir().join(format!("orbis-history-corrupt-{unique}"));
+        let store = HistoryStore::at(&directory);
+        fs::create_dir_all(&directory).expect("directory");
+        fs::write(directory.join("tx-corrupt.json"), "{not json").expect("corrupt record");
+        fs::write(directory.join("tx-empty.json"), "").expect("empty record");
+        fs::write(directory.join("notes.txt"), "ignored").expect("non-record");
+        let entries = store.entries().expect("listing survives corrupt records");
+        assert!(entries.is_empty());
+        let _ = fs::remove_dir_all(directory);
     }
 }
