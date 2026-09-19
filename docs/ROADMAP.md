@@ -59,3 +59,20 @@ This milestone does not add package ecosystems or a background service. The ordi
 The first beta release gate covers the release identity, reproducible Linux artifacts, user-owned installation, checksums, provenance, package/licensing metadata, release documentation, and CI validation. New provider breadth is not part of this milestone.
 
 The repository is release-ready for `v0.1.0-beta.1` once the complete local and CI validation suite passes. Publishing the version tag and GitHub Release remains an explicit final gate after those checks.
+
+## Milestone 7 — correctness and private insight hardening (complete, 2026-09-20)
+
+- APT planning reduced to one simulation per operation, with hold marks and
+  suite-derived security relevance (ADR-001).
+- Shell-history insights: local, sanitized, opt-out `orbis commands` plus a
+  small launcher section (ADR-003).
+- History listing resilience, honest `Ign` source reporting, health
+  environment diagnostics, durable project docs.
+
+## Milestone 8 — Beta 2 gate (candidate)
+
+Requires an explicit human decision to prepare and publish. Engineering
+candidates before that gate: Snap structured local API evaluation, per-
+provider latency instrumentation for `orbis update`, optional small config
+file only if justified by real feedback, and a final README/docs polish pass.
+No daemon, hosted backend, or telemetry is planned.
