@@ -86,7 +86,6 @@ pub(crate) fn section_title(theme: Theme, title: &str) -> Line<'static> {
     Line::from(Span::styled(title.to_owned(), theme.style(Token::Section)))
 }
 
-#[allow(dead_code)]
 pub(crate) fn divider(theme: Theme, width: u16) -> Line<'static> {
     Line::from(Span::styled(
         (if theme.unicode { "─" } else { "-" }).repeat(width as usize),

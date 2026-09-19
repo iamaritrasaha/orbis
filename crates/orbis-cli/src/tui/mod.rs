@@ -70,7 +70,6 @@ enum WorkerMessage {
     Why(Box<Result<WhyReport, String>>),
     Progress(orbis_core::progress::OperationEvent),
     TransactionComplete(Box<Result<orbis_core::transaction::TransactionResult, String>>),
-    #[allow(dead_code)]
     MaintenanceComplete(Box<Result<orbis_core::maintenance::MaintenanceResult, String>>),
     UpdateNotice(String),
     SelfUpdateChecked(Box<Result<CheckReport, SelfUpdateReport>>),
@@ -3768,7 +3767,7 @@ mod tests {
         for (start, end) in [
             (
                 "pub(crate) fn execute_confirmed_transaction_with_observer",
-                "/// Executes a previously generated, already-confirmed plan.",
+                "fn run_info(",
             ),
             ("pub(crate) fn execute_confirmed_maintenance_with_observer", "fn skipped_provider"),
         ] {
