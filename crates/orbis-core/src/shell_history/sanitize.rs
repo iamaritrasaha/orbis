@@ -144,15 +144,22 @@ pub fn sanitize_command(line: &str) -> Option<String> {
 
 fn executable_only(line: &str) -> Option<String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
-    let mut first = tokens.first()?.to_owned();
-    while is_assignment(first) {
-        first = tokens.get(1)?.to_owned();
+    // Assignments are skipped by advancing an index; re-reading a fixed slot
+    // would loop forever on a run of two or more assignments.
+    let mut index = 0;
+    let mut first;
+    loop {
+        first = tokens.get(index)?;
+        if !is_assignment(first) {
+            break;
+        }
+        index += 1;
     }
     let executable = basename(first.trim_end_matches([';', '|', '&']));
     match executable.as_str() {
         "" => None,
         "sudo" | "doas" => {
-            let rest = &tokens[1..];
+            let rest = &tokens[index + 1..];
             match if rest.is_empty() { None } else { executable_only(&rest.join(" ")) } {
                 Some(signature) if !signature.starts_with('-') => Some(signature),
                 _ => Some(executable),
@@ -265,5 +272,64 @@ mod tests {
     fn paths_collapse_to_executable_basename() {
         assert_eq!(sanitize_command("/usr/bin/btop --utf8"), Some("btop".into()));
         assert_eq!(sanitize_command("./scripts/build.sh all"), Some("build.sh".into()));
+    }
+
+    /// Runs the sanitizer on a worker thread under a deadline. dev.16 looped
+    /// forever on consecutive leading assignments before a composite, so a
+    /// plain assertion would hang the whole suite instead of failing this
+    /// test deterministically.
+    fn sanitize_within_deadline(line: &'static str) -> Option<String> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(sanitize_command(line));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("sanitize_command must terminate on every input")
+    }
+
+    #[test]
+    fn leading_assignments_before_composites_terminate() {
+        // The historic hang: the second assignment became `first` forever.
+        assert_eq!(
+            sanitize_within_deadline("FOO=1 BAR=2 cargo test | tee out").as_deref(),
+            Some("cargo")
+        );
+        assert_eq!(
+            sanitize_within_deadline("TOKEN=x SECRET=y curl https://example | cat").as_deref(),
+            Some("curl")
+        );
+        // Three and more assignments advance the same way.
+        assert_eq!(
+            sanitize_within_deadline("A=1 B=2 C=3 D=4 E=5 make build | tee log").as_deref(),
+            Some("make")
+        );
+        // The non-composite path keeps its executable + benign subcommand.
+        assert_eq!(sanitize_within_deadline("FOO=1 BAR=2 git status").as_deref(), Some("git status"));
+        // Assignments alone still produce nothing, composite or not.
+        assert_eq!(sanitize_within_deadline("A=1 B=2"), None);
+        assert_eq!(sanitize_within_deadline("A=1 B=2 C=3"), None);
+    }
+
+    #[test]
+    fn leading_assignment_values_never_survive_composites() {
+        for line in [
+            "FOO=1 BAR=2 cargo test | tee out",
+            "TOKEN=x SECRET=y curl https://example | cat",
+            "A=1 B=2 C=3 D=4 E=5 make build | tee log",
+        ] {
+            let signature = sanitize_within_deadline(line).unwrap_or_default();
+            for forbidden in [
+                "FOO", "BAR", "TOKEN", "SECRET", "https", "example", "tee", "cat", "build",
+                "log", "out", "=1", "=2", "=x", "=y",
+            ] {
+                assert!(!signature.contains(forbidden), "{forbidden} leaked from {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn assignment_run_before_sudo_still_resolves_the_real_command() {
+        assert_eq!(sanitize_within_deadline("A=1 B=2 sudo apt update | tee log").as_deref(), Some("apt"));
     }
 }
