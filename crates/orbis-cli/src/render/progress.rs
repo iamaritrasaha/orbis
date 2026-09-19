@@ -933,7 +933,10 @@ fn compact_activity(source: PackageSource, content: &str, refresh: bool) -> Stri
 fn apt_activity(value: &str) -> Option<(String, String)> {
     let action = value.split_whitespace().next()?.split(':').next()?;
     let state = match action {
-        "Hit" | "Ign" => "up to date",
+        "Hit" => "up to date",
+        // An Ignored source is not proof of freshness; apt skips sources it
+        // cannot currently process, so they must not read as "up to date".
+        "Ign" => "skipped",
         "Get" => "checking",
         "Err" => "error",
         _ => return None,

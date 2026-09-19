@@ -101,3 +101,21 @@ The dashboard creates bounded, read-only standard-thread workers for source snap
 ## Safety scope
 
 Milestones 3 and 4 add update inventories, coordinated upgrade and cleanup plans, history queries, provider-specific explanation evidence, and user-wide developer-tool coverage. Flatpak remote configuration, Snap retention, package indexes, developer-tool configuration, project manifests, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact administrator-scoped maintenance plan is confirmed; Cargo, npm, pnpm, uv, and pipx operations never request it.
+
+## Shell-history insights
+
+`orbis-core::shell_history` is a read-only, local-only subsystem. A
+`ShellHistorySource` (Bash today, `$HISTFILE` else `~/.bash_history`) parses
+entries — `#<epoch>` lines are metadata, backslash continuations join — and
+`sanitize::sanitize_command` reduces each entry to a safe signature: the
+executable and, when provably safe, one benign subcommand. Paths, URLs,
+option values, credentials, and composite lines never appear; uncertain input
+degrades to the executable alone. `orbis commands` renders human or JSON
+output; nothing is persisted, transmitted, or merged with transaction
+history, and `ORBIS_HISTORY_INSIGHTS=off` disables the feature entirely. The
+bare launcher reuses the same sanitizer for at most three frequent
+signatures, read from local disk so startup never waits on provider work.
+
+See `docs/DECISIONS.md` for the APT backend decision (ADR-001), the
+read-only `update` semantics (ADR-002), the shell-history privacy design
+(ADR-003), and the provider capability matrix.

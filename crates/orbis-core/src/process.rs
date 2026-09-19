@@ -696,6 +696,11 @@ fn find_on_path(program: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// Read-only PATH lookup used by diagnostics that must not spawn processes.
+pub fn program_on_path(program: &str) -> bool {
+    find_on_path(program).is_some()
+}
+
 /// Shared ownership type used by providers.
 pub type SharedRunner = Arc<dyn CommandRunner>;
 

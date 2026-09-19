@@ -26,6 +26,15 @@ pub struct AptProvider {
     runner: SharedRunner,
 }
 
+/// Facts extracted from one `apt-get -s upgrade` simulation.
+struct AptUpgradeFacts {
+    candidates: Vec<UpdateCandidate>,
+    removals: usize,
+    kept_back: Vec<String>,
+    download_size_bytes: Option<u64>,
+    disk_delta_bytes: Option<i64>,
+}
+
 impl AptProvider {
     /// Creates an APT provider around an injected command runner.
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
@@ -34,6 +43,30 @@ impl AptProvider {
 
     fn available(&self) -> bool {
         self.runner.is_available("apt-cache")
+    }
+
+    /// Facts from exactly one `apt-get -s upgrade` simulation plus one
+    /// read-only `apt-mark showhold` query. Planning paths share this so a
+    /// single user operation never simulates the same upgrade twice.
+    fn upgrade_facts(&self) -> Result<AptUpgradeFacts, ProviderError> {
+        let output = execute(
+            &self.runner,
+            PackageSource::Apt,
+            "simulate the APT upgrade",
+            apt_simulation_command("upgrade"),
+        )?;
+        let output = expect_success(PackageSource::Apt, "simulate the APT upgrade", output)?;
+        let holds = read_holds(&self.runner);
+        let lines = parse_apt_upgrade_lines(&output.stdout);
+        let candidates = update_candidates_from_lines(&lines, &holds);
+        let changes = parse_simulation_changes(&output.stdout);
+        Ok(AptUpgradeFacts {
+            candidates,
+            removals: changes.iter().filter(|change| change.kind == ChangeKind::Remove).count(),
+            kept_back: parse_kept_back(&output.stdout),
+            download_size_bytes: find_apt_size(&output.stdout, "Need to get"),
+            disk_delta_bytes: find_apt_disk_delta(&output.stdout),
+        })
     }
 
     fn installed_versions(&self, names: &[String]) -> BTreeMap<String, String> {
@@ -382,17 +415,11 @@ impl MaintenanceProvider for AptProvider {
                 program: "apt-cache".into(),
             });
         }
-        let output = execute(
-            &self.runner,
-            PackageSource::Apt,
-            "inspect available APT upgrades",
-            apt_simulation_command("upgrade"),
-        )?;
-        let output = expect_success(PackageSource::Apt, "inspect available APT upgrades", output)?;
+        let facts = self.upgrade_facts()?;
         Ok(ProviderUpdateInventory {
             source: PackageSource::Apt,
             available: true,
-            candidates: parse_apt_update_candidates(&output.stdout),
+            candidates: facts.candidates,
             notes: vec![
                 "Read-only inventory uses the current local APT package index.".into(),
                 "Orbis does not run apt-get update for `orbis update`; refresh metadata with `orbis refresh`.".into(),
@@ -430,44 +457,30 @@ impl MaintenanceProvider for AptProvider {
     }
 
     fn upgrade_plan(&self) -> Result<Vec<ProviderMaintenancePlan>, ProviderError> {
-        let inventory = self.update_inventory()?;
-        let metadata_incomplete = inventory
-            .metadata_state
-            .as_deref()
-            .is_some_and(|state| state.contains("unknown") || state.contains("incomplete"));
-        let output = execute(
-            &self.runner,
-            PackageSource::Apt,
-            "simulate the APT upgrade",
-            apt_simulation_command("upgrade"),
-        )?;
-        let output = expect_success(PackageSource::Apt, "simulate the APT upgrade", output)?;
-        let changes = parse_simulation_changes(&output.stdout);
-        let removals: Vec<_> =
-            changes.iter().filter(|change| change.kind == ChangeKind::Remove).collect();
-        let kept_back = parse_kept_back(&output.stdout);
+        let facts = self.upgrade_facts()?;
+        // The freshness of the local index is never known without a refresh,
+        // so upgrade coverage is always reported as partial.
+        let metadata_incomplete = true;
         let mut warnings = Vec::new();
-        if !kept_back.is_empty() {
+        if !facts.kept_back.is_empty() {
             warnings.push(crate::transaction::PlanWarning {
                 level: WarningLevel::Info,
-                message: format!("APT will keep back: {}.", kept_back.join(", ")),
+                message: format!("APT will keep back: {}.", facts.kept_back.join(", ")),
             });
         }
-        if metadata_incomplete {
-            warnings.push(crate::transaction::PlanWarning {
-                level: WarningLevel::Caution,
-                message: "APT repository freshness is unknown; the update coverage is incomplete."
-                    .into(),
-            });
-        }
-        let (risk, supported) = if removals.is_empty() {
+        warnings.push(crate::transaction::PlanWarning {
+            level: WarningLevel::Caution,
+            message: "APT repository freshness is unknown; the update coverage is incomplete."
+                .into(),
+        });
+        let (risk, supported) = if facts.removals == 0 {
             (RiskLevel::Normal, true)
         } else {
             warnings.push(crate::transaction::PlanWarning {
                 level: WarningLevel::Blocked,
                 message: format!(
                     "APT upgrade simulation reported {} removal(s); Orbis blocks this safe-upgrade plan.",
-                    removals.len()
+                    facts.removals
                 ),
             });
             (RiskLevel::Blocked, false)
@@ -481,7 +494,7 @@ impl MaintenanceProvider for AptProvider {
             source: PackageSource::Apt,
             action: MaintenanceAction::Upgrade,
             scope: None,
-            candidates: inventory.candidates,
+            candidates: facts.candidates,
             cleanup_candidates: Vec::new(),
             privilege: PrivilegeRequirement::Administrator,
             completeness: if metadata_incomplete {
@@ -495,16 +508,16 @@ impl MaintenanceProvider for AptProvider {
             supported,
             mutates: true,
             warnings,
-            notes: if kept_back.is_empty() {
+            notes: if facts.kept_back.is_empty() {
                 Vec::new()
             } else {
                 vec![format!(
                     "{} package(s) are kept back by ordinary APT upgrade semantics.",
-                    kept_back.len()
+                    facts.kept_back.len()
                 )]
             },
-            download_size_bytes: find_apt_size(&output.stdout, "Need to get"),
-            disk_delta_bytes: find_apt_disk_delta(&output.stdout),
+            download_size_bytes: facts.download_size_bytes,
+            disk_delta_bytes: facts.disk_delta_bytes,
         }])
     }
 
@@ -650,7 +663,8 @@ impl MaintenanceProvider for AptProvider {
         match plan.action {
             MaintenanceAction::Refresh => Ok(VerificationResult::Verified),
             MaintenanceAction::Upgrade => {
-                Ok(if self.upgrade_plan()?.first().is_some_and(|plan| plan.candidates.is_empty()) {
+                let facts = self.upgrade_facts()?;
+                Ok(if facts.candidates.is_empty() {
                     VerificationResult::Verified
                 } else {
                     VerificationResult::PartiallyVerified
@@ -697,42 +711,98 @@ fn apt_simulation_command(action: &str) -> CommandSpec {
         .with_timeout(Duration::from_secs(60))
 }
 
-fn parse_apt_update_candidates(output: &str) -> Vec<UpdateCandidate> {
-    output
-        .lines()
-        .filter_map(parse_apt_upgrade_line)
-        .map(|(provider_id, current_version, available_version)| UpdateCandidate {
-            source: PackageSource::Apt,
-            name: provider_id.clone(),
-            provider_id,
-            current_version,
-            available_version,
-            architecture: None,
-            scope: Some(InstallScope::System),
-            channel: None,
-            held: None,
-            security_relevance: None,
-            notes: Vec::new(),
-            metadata: BTreeMap::new(),
-        })
-        .collect()
+/// One upgrade candidate exactly as reported by an APT simulation line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AptUpgradeLine {
+    provider_id: String,
+    current_version: Option<String>,
+    available_version: Option<String>,
+    architecture: Option<String>,
+    /// Repository suite such as `noble-security`, when APT reported one.
+    suite: Option<String>,
 }
 
-fn parse_apt_upgrade_line(line: &str) -> Option<(String, Option<String>, Option<String>)> {
+fn parse_apt_upgrade_lines(output: &str) -> Vec<AptUpgradeLine> {
+    output.lines().filter_map(parse_apt_upgrade_line).collect()
+}
+
+fn parse_apt_upgrade_line(line: &str) -> Option<AptUpgradeLine> {
     let rest = line.trim().strip_prefix("Inst ")?;
-    let provider_id = rest.split_whitespace().next()?.to_owned();
-    let current_version = rest
-        .split_once('(')
-        .and_then(|(before_version, _)| before_version.split_once('['))
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .map(|(version, _)| version.trim().to_owned())
+    let mut fields = rest.split_whitespace();
+    let provider_id = fields.next()?.to_owned();
+    // `Inst pkg [current] (candidate archive:suite [arch])` or, without a
+    // current version, `Inst pkg (candidate archive:suite [arch])`.
+    let remainder = rest
+        .split_once('[')
+        .and_then(|(_, after)| after.split_once(']'))
+        .and_then(|(current, tail)| {
+            let version = current.trim();
+            let tail = tail.split_once('(').map(|(_, rest)| rest)?;
+            Some((if version.is_empty() { None } else { Some(version.to_owned()) }, tail))
+        })
+        .or_else(|| rest.split_once('(').map(|(_, tail)| (None, tail)))?;
+    let (current_version, parenthesized) = remainder;
+    let paren_fields: Vec<&str> = parenthesized.split_whitespace().collect();
+    let available_version = paren_fields
+        .first()
+        .map(|version| (*version).to_owned())
         .filter(|version| !version.is_empty());
-    let available_version = rest
-        .split_once('(')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .map(str::to_owned)
-        .filter(|version| !version.is_empty());
-    Some((provider_id, current_version, available_version))
+    // The candidate origin field looks like `Ubuntu:26.04/noble-security`;
+    // the suite is the component after the archive prefix and the slash.
+    let suite = paren_fields
+        .get(1)
+        .and_then(|origin| origin.split_once(':'))
+        .map(|(_, suite)| suite.to_owned())
+        .map(|suite| match suite.split_once('/') {
+            Some((_, name)) => name.to_owned(),
+            None => suite,
+        })
+        .filter(|suite| !suite.is_empty());
+    let architecture = parenthesized
+        .split_once('[')
+        .and_then(|(_, after)| after.split_once(']'))
+        .map(|(arch, _)| arch.trim().to_owned())
+        .filter(|arch| !arch.is_empty());
+    Some(AptUpgradeLine { provider_id, current_version, available_version, architecture, suite })
+}
+
+/// Conservative security classification from the repository suite name.
+/// Unknown suites stay unknown instead of being classified as security.
+fn suite_is_security(suite: Option<&str>) -> Option<bool> {
+    suite.map(|suite| {
+        let suite = suite.to_ascii_lowercase();
+        suite.contains("security") || suite.contains("-esm")
+    })
+}
+
+fn update_candidates_from_lines(
+    lines: &[AptUpgradeLine],
+    holds: &std::collections::BTreeSet<String>,
+) -> Vec<UpdateCandidate> {
+    lines
+        .iter()
+        .map(|line| UpdateCandidate {
+            source: PackageSource::Apt,
+            name: line.provider_id.clone(),
+            provider_id: line.provider_id.clone(),
+            current_version: line.current_version.clone(),
+            available_version: line.available_version.clone(),
+            architecture: line.architecture.clone(),
+            scope: Some(InstallScope::System),
+            channel: None,
+            held: Some(holds.contains(&line.provider_id)),
+            security_relevance: suite_is_security(line.suite.as_deref()),
+            notes: line
+                .suite
+                .as_deref()
+                .map_or_else(Vec::new, |suite| vec![format!("Candidate suite: {suite}.")]),
+            metadata: line
+                .suite
+                .as_deref()
+                .map(|suite| BTreeMap::from([("suite".into(), suite.to_owned())]))
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn parse_kept_back(output: &str) -> Vec<String> {
@@ -803,6 +873,13 @@ fn read_marked_packages(runner: &SharedRunner, action: &str) -> std::collections
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// Reads held package names through apt-mark's read-only `showhold` interface.
+/// Unavailable or failing mark data is reported as an empty set; absence of
+/// hold information is never interpreted as a hold.
+fn read_holds(runner: &SharedRunner) -> std::collections::BTreeSet<String> {
+    read_marked_packages(runner, "showhold")
 }
 
 fn read_reverse_dependencies(runner: &SharedRunner, package_id: &str) -> Vec<String> {
@@ -1002,14 +1079,41 @@ mod tests {
 
     #[test]
     fn parses_upgrade_inventory_without_fabricating_versions() {
-        let inventory = parse_apt_update_candidates(
+        let lines = parse_apt_upgrade_lines(
             "Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n\
              Inst held-package (2.0 Ubuntu:26.04/resolute [amd64])\n",
         );
-        assert_eq!(inventory.len(), 2);
-        assert_eq!(inventory[0].current_version.as_deref(), Some("8.14"));
-        assert_eq!(inventory[0].available_version.as_deref(), Some("8.15"));
-        assert_eq!(inventory[1].current_version, None);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].current_version.as_deref(), Some("8.14"));
+        assert_eq!(lines[0].available_version.as_deref(), Some("8.15"));
+        assert_eq!(lines[0].suite.as_deref(), Some("resolute"));
+        assert_eq!(lines[0].architecture.as_deref(), Some("amd64"));
+        assert_eq!(lines[1].current_version, None);
+        assert_eq!(lines[1].suite.as_deref(), Some("resolute"));
+    }
+
+    #[test]
+    fn classifies_security_suites_and_leaves_unknown_unknown() {
+        assert_eq!(suite_is_security(Some("noble-security")), Some(true));
+        assert_eq!(suite_is_security(Some("noble-esm-infra")), Some(true));
+        assert_eq!(suite_is_security(Some("noble-updates")), Some(false));
+        assert_eq!(suite_is_security(None), None);
+    }
+
+    #[test]
+    fn update_candidates_carry_hold_marks_and_security_relevance() {
+        let lines = parse_apt_upgrade_lines(
+            "Inst curl [8.14] (8.15 Ubuntu:26.04/noble-security [amd64])\n\
+             Inst btop [1.2] (1.3 Ubuntu:26.04/noble-updates [amd64])\n",
+        );
+        let holds = std::collections::BTreeSet::from(["btop".to_owned()]);
+        let candidates = update_candidates_from_lines(&lines, &holds);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].security_relevance, Some(true));
+        assert_eq!(candidates[0].held, Some(false));
+        assert_eq!(candidates[1].security_relevance, Some(false));
+        assert_eq!(candidates[1].held, Some(true));
+        assert_eq!(candidates[0].metadata["suite"], "noble-security");
     }
 
     #[test]
@@ -1026,5 +1130,64 @@ mod tests {
     fn cleanup_risk_elevates_core_packages() {
         assert_eq!(cleanup_risk("libc6"), RiskLevel::HighImpact);
         assert_eq!(cleanup_risk("unused-example"), RiskLevel::Caution);
+    }
+
+    #[test]
+    fn upgrade_planning_simulates_the_upgrade_exactly_once() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CountingRunner {
+            simulations: Mutex<usize>,
+        }
+        impl CommandRunner for CountingRunner {
+            fn is_available(&self, program: &str) -> bool {
+                matches!(program, "apt-cache" | "apt-get" | "apt-mark")
+            }
+
+            fn run(
+                &self,
+                command: &CommandSpec,
+            ) -> Result<crate::process::CommandOutput, crate::process::ProcessError> {
+                match command.program.as_str() {
+                    "apt-get" => {
+                        *self.simulations.lock().unwrap() += 1;
+                        Ok(crate::process::CommandOutput {
+                            stdout: "Inst curl [8.14] (8.15 Ubuntu:26.04/noble-security [amd64])\n\
+                                     Need to get 2.5 MB of archives.\n"
+                                .into(),
+                            stderr: String::new(),
+                            status: Some(0),
+                        })
+                    }
+                    "apt-mark" => Ok(crate::process::CommandOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        status: Some(0),
+                    }),
+                    program => panic!("unexpected planning command: {program}"),
+                }
+            }
+        }
+
+        let runner = std::sync::Arc::new(CountingRunner::default());
+        let provider = AptProvider::new(runner.clone());
+        let inventory = provider.update_inventory().expect("inventory");
+        assert_eq!(inventory.candidates.len(), 1);
+        assert_eq!(*runner.simulations.lock().unwrap(), 1);
+
+        let plan = provider.upgrade_plan().expect("upgrade plan");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            *runner.simulations.lock().unwrap(),
+            2,
+            "plan must not re-simulate beyond its own single simulation"
+        );
+        assert_eq!(plan[0].candidates[0].security_relevance, Some(true));
+
+        // Verification performs exactly one more re-check after execution.
+        let verification = provider.verify_maintenance(&plan[0]).expect("verification");
+        assert_eq!(verification, VerificationResult::PartiallyVerified);
+        assert_eq!(*runner.simulations.lock().unwrap(), 3);
     }
 }

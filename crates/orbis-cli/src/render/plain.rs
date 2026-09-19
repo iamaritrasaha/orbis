@@ -39,6 +39,15 @@ impl Renderer {
             "j/k move  Enter choose  q cancel"
         };
         output.push_str(&format!("{selected} Find software\n  Show software\n  Check updates\n  Refresh information\n  Clean up\n  Health\n  History\n  Full interface\n\n"));
+        let frequent = super::transient::frequent_commands();
+        if !frequent.is_empty() {
+            output
+                .push_str(&format!("  {}\n", self.theme.paint("Frequent commands", Token::Muted)));
+            for (signature, count) in frequent {
+                output.push_str(&format!("  {}  {}\n", signature, count));
+            }
+            output.push('\n');
+        }
         output.push_str(controls);
         output.push('\n');
         output
@@ -708,6 +717,50 @@ impl Renderer {
         self.heading("History record", "Sanitized persisted operation record.")
             + &serde_json::to_string_pretty(entry).unwrap_or_else(|_| "{}".into())
             + "\n"
+    }
+
+    pub(crate) fn commands(
+        &self,
+        report: &orbis_core::shell_history::ShellHistoryReport,
+    ) -> String {
+        let mut output = self.heading("Commands", "Your most-used shell commands.");
+        if report.insights.is_empty() {
+            output.push_str("No recognizable commands were found in your shell history.\n");
+            return output;
+        }
+        output.push_str("Most used\n\n");
+        let width = report
+            .insights
+            .iter()
+            .map(|insight| UnicodeWidthStr::width(insight.signature.as_str()))
+            .max()
+            .unwrap_or(0)
+            .min(28);
+        for insight in &report.insights {
+            output.push_str(&format!(
+                "  {}  {}\n",
+                self.theme.paint(
+                    format!("{:<width$}", insight.signature, width = width).as_str(),
+                    Token::Foreground
+                ),
+                self.theme.paint(insight.count.to_string().as_str(), Token::Muted)
+            ));
+        }
+        output.push_str(&format!(
+            "\nBased on {} local {} history entries\n",
+            report.entries_scanned, report.shell
+        ));
+        output.push_str(&self.theme.paint("Nothing leaves this machine.\n", Token::Muted));
+        output
+    }
+
+    pub(crate) fn commands_disabled(&self) -> String {
+        self.heading("Commands", "Your most-used shell commands.")
+            + "Shell history insights are disabled.\nEnable them by removing ORBIS_HISTORY_INSIGHTS or setting it to `on`.\n"
+    }
+
+    pub(crate) fn commands_unavailable(&self, reason: &str) -> String {
+        self.heading("Commands", "Your most-used shell commands.") + reason + "\n"
     }
 
     pub(crate) fn why(&self, report: &WhyReport) -> String {

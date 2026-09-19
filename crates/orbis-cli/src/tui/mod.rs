@@ -70,7 +70,6 @@ enum WorkerMessage {
     Why(Box<Result<WhyReport, String>>),
     Progress(orbis_core::progress::OperationEvent),
     TransactionComplete(Box<Result<orbis_core::transaction::TransactionResult, String>>),
-    #[allow(dead_code)]
     MaintenanceComplete(Box<Result<orbis_core::maintenance::MaintenanceResult, String>>),
     UpdateNotice(String),
     SelfUpdateChecked(Box<Result<CheckReport, SelfUpdateReport>>),
@@ -3766,10 +3765,7 @@ mod tests {
     fn authorization_is_absent_from_worker_entry_points() {
         let commands = include_str!("../commands.rs");
         for (start, end) in [
-            (
-                "pub(crate) fn execute_confirmed_transaction_with_observer",
-                "/// Executes a previously generated, already-confirmed plan.",
-            ),
+            ("pub(crate) fn execute_confirmed_transaction_with_observer", "fn run_info("),
             ("pub(crate) fn execute_confirmed_maintenance_with_observer", "fn skipped_provider"),
         ] {
             let function = commands.split(start).nth(1).unwrap().split(end).next().unwrap();

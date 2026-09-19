@@ -230,6 +230,34 @@ Human output is intentionally quiet:
 
 Full operation IDs and structured records remain available in plain, JSON, and detail views.
 
+### See your own command habits
+
+```bash
+orbis commands
+```
+
+Orbis can summarize which commands you tend to run, derived entirely from your local shell history:
+
+```text
+◈ ORBIS // COMMANDS
+────────────────────────────────────────────────────────────────
+
+Most used
+
+  git status             184
+  cargo test              92
+  orbis update            71
+
+Based on 4,821 local bash history entries
+Nothing leaves this machine.
+```
+
+This feature is **private by design**: it is read-only, runs locally, never
+executes or stores history, never touches the network, and shows sanitized
+command signatures only — never file paths, URLs, option values, or secrets.
+Signatures are computed on demand; no second copy of your history is kept.
+Set `ORBIS_HISTORY_INSIGHTS=off` to disable it completely.
+
 ---
 
 ## How Orbis works
@@ -386,6 +414,7 @@ update       Check for updates
 refresh      Refresh software information
 clean        Remove unused software conservatively
 history      Review previous Orbis actions
+commands     See your most-used shell commands (private, local)
 health       Check provider readiness
 self-update  Update Orbis itself safely
 ```

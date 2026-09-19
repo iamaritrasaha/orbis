@@ -201,6 +201,7 @@ pub(crate) fn dispatch(
         Some(Command::History { operation_id, limit, source }) => {
             run_history(renderer, cli.json, cli.plain, operation_id, limit, source.map(Into::into))
         }
+        Some(Command::Commands { limit, shell }) => run_commands(renderer, cli.json, limit, &shell),
         Some(Command::Why { package, source }) => {
             run_why(registry, renderer, cli.json, package, source.map(Into::into))
         }
@@ -304,24 +305,6 @@ pub(crate) fn execute_confirmed_transaction_with_observer(
     registry
         .execute_transaction_with_progress(request, plan, &executor, &history, observer)
         .map_err(|error| error.to_string())
-}
-
-/// Executes a previously generated, already-confirmed plan.
-///
-/// This is intentionally the only mutation entry point exposed to the TUI.
-/// The TUI must generate and render an executable plan before calling it.
-#[allow(dead_code)]
-pub(crate) fn execute_confirmed_transaction(
-    registry: &ProviderRegistry,
-    request: &OperationRequest,
-    plan: OperationPlan,
-) -> Result<TransactionResult, String> {
-    execute_confirmed_transaction_with_observer(
-        registry,
-        request,
-        plan,
-        &orbis_core::progress::SilentObserver,
-    )
 }
 
 fn run_info(
@@ -918,6 +901,44 @@ fn run_history(
             print_json(&entries)
         } else {
             print!("{}", renderer.history(&entries, plain));
+            Ok(())
+        }
+    }
+}
+
+fn run_commands(renderer: &Renderer, json: bool, limit: usize, shell: &str) -> Result<(), String> {
+    if !shell.eq_ignore_ascii_case("bash") {
+        return report_error(
+            json,
+            format!("shell history insights support bash today; `{shell}` is not available yet"),
+        );
+    }
+    if !orbis_core::shell_history::insights_enabled() {
+        if json {
+            print_json(&serde_json::json!({"status":"disabled"}))?;
+        } else {
+            print!("{}", renderer.commands_disabled());
+        }
+        return Ok(());
+    }
+    let source = orbis_core::shell_history::BashHistorySource::from_environment();
+    match orbis_core::shell_history::analyze_source(&source, limit) {
+        Ok(report) => {
+            if json {
+                print_json(&report)?;
+            } else {
+                print!("{}", renderer.commands(&report));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                print_json(
+                    &serde_json::json!({"status":"unavailable","reason":error.to_string()}),
+                )?;
+            } else {
+                print!("{}", renderer.commands_unavailable(&error.to_string()));
+            }
             Ok(())
         }
     }

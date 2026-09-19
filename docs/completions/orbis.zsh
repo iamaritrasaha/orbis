@@ -20,6 +20,7 @@ _orbis() {
         'upgrade:Plan and apply available updates'
         'clean:Plan conservative cleanup'
         'history:Read transaction history'
+        'commands:Show your most-used shell commands, computed privately'
         'why:Explain why a package is present'
         'health:Check that everything is working'
         'self-update:Update Orbis safely'
