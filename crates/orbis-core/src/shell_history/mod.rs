@@ -10,7 +10,7 @@
 
 pub mod sanitize;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -24,13 +24,14 @@ pub struct CommandInsight {
 }
 
 /// Aggregate result of a shell-history analysis.
+///
+/// Deliberately contains no filesystem paths: structured output exposes
+/// sanitized, normalized command insights only, never the local history
+/// location, the user's home, or raw entries.
 #[derive(Clone, Debug, Serialize)]
 pub struct ShellHistoryReport {
     /// Shell the entries came from, e.g. `bash`.
     pub shell: String,
-    /// Source file that was read, when one was readable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub histfile: Option<String>,
     /// Physical command lines scanned (timestamp records excluded).
     pub entries_scanned: u64,
     /// Entries that produced a sanitized signature.
@@ -72,8 +73,19 @@ pub trait ShellHistorySource: Send + Sync {
 
 /// Bash history source.
 ///
-/// Resolution order: `$HISTFILE` when explicitly set and pointing at an
-/// existing file, otherwise `~/.bash_history`.
+/// Resolution contract (see [`resolve_bash_histfile_from`]):
+///
+/// 1. `ORBIS_BASH_HISTFILE` when it names an existing regular file. This is
+///    the explicit Orbis-level override and may deliberately live outside
+///    the user's home directory.
+/// 2. `$HISTFILE` only when it names an existing regular file **inside the
+///    user's home directory** (after resolving symlinks) *and* there is
+///    Bash-specific evidence: the file name itself looks like Bash history,
+///    or the login shell is Bash. A name that itself identifies zsh or fish
+///    history is rejected outright, regardless of other signals.
+/// 3. `~/.bash_history` when it is an existing regular file.
+/// 4. Otherwise no source: the caller reports the shell as unavailable
+///    honestly rather than parsing another shell's history as Bash.
 pub struct BashHistorySource {
     histfile: Option<PathBuf>,
 }
@@ -84,7 +96,8 @@ impl BashHistorySource {
         Self { histfile: resolve_bash_histfile() }
     }
 
-    /// Creates a Bash source pinned to one file, for tests.
+    /// Creates a Bash source pinned to one file. Intended for tests; this
+    /// bypasses environment resolution entirely.
     pub fn at(path: PathBuf) -> Self {
         Self { histfile: Some(path) }
     }
@@ -180,14 +193,14 @@ pub fn analyze(entries: &[String], limit: usize) -> ShellHistoryReport {
     });
     ShellHistoryReport {
         shell: "bash".into(),
-        histfile: None,
         entries_scanned: entries.len() as u64,
         commands_analyzed: analyzed,
         insights: insights.into_iter().take(limit).collect(),
     }
 }
 
-/// Produces a complete report for one source, including the resolved path.
+/// Produces a complete report for one source. The resolved path stays
+/// internal; reports never carry filesystem locations.
 pub fn analyze_source(
     source: &dyn ShellHistorySource,
     limit: usize,
@@ -195,7 +208,6 @@ pub fn analyze_source(
     let entries = source.read_entries()?;
     let mut report = analyze(&entries, limit);
     report.shell = source.shell_name().to_owned();
-    report.histfile = source.histfile().map(|path| path.display().to_string());
     Ok(report)
 }
 
@@ -219,15 +231,96 @@ fn insights_enabled_with(value: Option<&str>) -> bool {
 }
 
 fn resolve_bash_histfile() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("HISTFILE") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
+    resolve_bash_histfile_from(&BashHistfileEnvironment::from_process())
+}
+
+/// Environment inputs to Bash history resolution, so the contract can be
+/// tested without mutating process-wide variables.
+#[derive(Clone, Debug, Default)]
+struct BashHistfileEnvironment {
+    /// Explicit Orbis override (`ORBIS_BASH_HISTFILE`).
+    orbis_override: Option<PathBuf>,
+    /// The invoking shell's `$HISTFILE`.
+    histfile: Option<PathBuf>,
+    /// The user's home directory (`$HOME`).
+    home: Option<PathBuf>,
+    /// The login shell (`$SHELL`).
+    login_shell: Option<PathBuf>,
+}
+
+impl BashHistfileEnvironment {
+    fn from_process() -> Self {
+        Self {
+            orbis_override: std::env::var_os("ORBIS_BASH_HISTFILE").map(PathBuf::from),
+            histfile: std::env::var_os("HISTFILE").map(PathBuf::from),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            login_shell: std::env::var_os("SHELL").map(PathBuf::from),
         }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+}
+
+/// Resolves the Bash history file for one environment. `$HISTFILE` belongs to
+/// whichever shell invoked Orbis and may point at zsh or fish history, so it
+/// is trusted only with Bash evidence and only under the user's home; the
+/// explicit Orbis override is the one deliberately unconstrained path.
+fn resolve_bash_histfile_from(env: &BashHistfileEnvironment) -> Option<PathBuf> {
+    if let Some(path) = env.orbis_override.as_ref().filter(|path| is_regular_file(path)) {
+        return Some(path.clone());
+    }
+    if let Some(path) = env.histfile.as_ref().filter(|path| {
+        is_regular_file(path)
+            && is_under_home(path, env.home.as_deref())
+            && !looks_like_foreign_shell_history(path)
+            && (looks_like_bash_history(path) || login_shell_is_bash(env.login_shell.as_deref()))
+    }) {
+        return Some(path.clone());
+    }
+    let home = env.home.as_ref()?;
     let default = home.join(".bash_history");
-    default.is_file().then_some(default)
+    is_regular_file(&default).then_some(default)
+}
+
+/// Existing regular file; symlinks count only when they resolve to a
+/// regular file, and broken symlinks count as nothing.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Whether the path stays under the given home directory once symlinks are
+/// resolved, so an in-home symlink to an arbitrary location is not trusted.
+fn is_under_home(path: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else { return false };
+    let (Ok(home), Ok(canonical)) = (home.canonicalize(), path.canonicalize()) else {
+        return false;
+    };
+    canonical.starts_with(home)
+}
+
+/// Whether a file name itself identifies another shell's history. Such a name
+/// is definitive evidence against Bash, so no other signal can override it.
+fn looks_like_foreign_shell_history(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.contains("zsh") || lower.contains("fish")
+        })
+}
+
+/// Whether a file name is itself Bash-history evidence. Neutral names carry
+/// no evidence either way and rely on the login shell instead.
+fn looks_like_bash_history(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return false };
+    let lower = name.to_ascii_lowercase();
+    lower == ".bash_history" || lower.contains("bash")
+}
+
+/// Whether the login shell identifies itself as Bash by its executable name.
+fn login_shell_is_bash(login_shell: Option<&Path>) -> bool {
+    login_shell
+        .and_then(|shell| shell.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("bash"))
 }
 
 #[cfg(test)]
@@ -281,5 +374,201 @@ mod tests {
         assert!(insights_enabled_with(None));
         assert!(insights_enabled_with(Some("1")));
         assert!(insights_enabled_with(Some("on")));
+    }
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("orbis-bash-histfile-{label}-{unique}"))
+    }
+
+    fn environment(
+        home: &std::path::Path,
+        histfile: Option<std::path::PathBuf>,
+        login_shell: Option<&str>,
+    ) -> BashHistfileEnvironment {
+        BashHistfileEnvironment {
+            orbis_override: None,
+            histfile,
+            home: Some(home.to_path_buf()),
+            login_shell: login_shell.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn histfile_is_used_only_with_bash_evidence_under_home() {
+        let home = unique_dir("home");
+        std::fs::create_dir_all(&home).expect("home directory");
+        let default = home.join(".bash_history");
+        std::fs::write(&default, "ls\n").expect("default history");
+        let bash_histfile = home.join("bash_history");
+        std::fs::write(&bash_histfile, "git status\n").expect("named history");
+
+        // Plain Bash history file name: accepted without shell evidence.
+        let resolved = resolve_bash_histfile_from(&environment(&home, Some(bash_histfile.clone()), None));
+        assert_eq!(resolved, Some(bash_histfile.clone()));
+
+        // Bash login shell vouches for an unnamed in-home history file.
+        let unnamed = home.join(".histfile");
+        std::fs::write(&unnamed, "cargo build\n").expect("unnamed history");
+        let resolved = resolve_bash_histfile_from(&environment(
+            &home,
+            Some(unnamed.clone()),
+            Some("/bin/bash"),
+        ));
+        assert_eq!(resolved, Some(unnamed));
+
+        // No Bash evidence at all: the default is used instead.
+        let resolved = resolve_bash_histfile_from(&environment(
+            &home,
+            Some(home.join(".histfile")),
+            Some("/usr/bin/zsh"),
+        ));
+        assert_eq!(resolved, Some(default.clone()));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn zsh_and_fish_histfiles_are_rejected_even_with_bash_login_shell() {
+        let home = unique_dir("home");
+        std::fs::create_dir_all(&home).expect("home directory");
+        let default = home.join(".bash_history");
+        std::fs::write(&default, "ls\n").expect("default history");
+        for foreign in [".zsh_history", "zsh-history", ".fish_history"] {
+            let path = home.join(foreign);
+            std::fs::write(&path, ": 1750000000:0;ls\n").expect("foreign history");
+            let resolved = resolve_bash_histfile_from(&environment(
+                &home,
+                Some(path),
+                Some("/bin/bash"),
+            ));
+            assert_eq!(resolved, Some(default.clone()), "{foreign} must not be read as Bash");
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn histfile_outside_home_or_behind_a_symlink_is_rejected() {
+        let home = unique_dir("home");
+        let outside = unique_dir("outside");
+        std::fs::create_dir_all(&home).expect("home directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        let default = home.join(".bash_history");
+        std::fs::write(&default, "ls\n").expect("default history");
+
+        // Bash-looking name, but outside HOME: not trusted.
+        let external = outside.join(".bash_history");
+        std::fs::write(&external, "ls\n").expect("external history");
+        let resolved = resolve_bash_histfile_from(&environment(&home, Some(external), Some("/bin/bash")));
+        assert_eq!(resolved, Some(default.clone()));
+
+        // In-home symlink that resolves outside HOME: not trusted either.
+        let target = outside.join("real-history");
+        std::fs::write(&target, "ls\n").expect("symlink target");
+        let linked = home.join("linked-bash-history");
+        std::os::unix::fs::symlink(&target, &linked).expect("symlink");
+        let resolved = resolve_bash_histfile_from(&environment(&home, Some(linked), Some("/bin/bash")));
+        assert_eq!(resolved, Some(default));
+
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn explicit_orbis_override_wins_and_may_live_outside_home() {
+        let home = unique_dir("home");
+        let outside = unique_dir("outside");
+        std::fs::create_dir_all(&home).expect("home directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        let default = home.join(".bash_history");
+        std::fs::write(&default, "ls\n").expect("default history");
+
+        let override_path = outside.join("deliberate-history");
+        std::fs::write(&override_path, "git status\n").expect("override history");
+        let env = BashHistfileEnvironment {
+            orbis_override: Some(override_path.clone()),
+            ..environment(&home, None, None)
+        };
+        assert_eq!(resolve_bash_histfile_from(&env), Some(override_path));
+
+        // A nonexistent override is ignored, not invented.
+        let env = BashHistfileEnvironment {
+            orbis_override: Some(outside.join("missing")),
+            ..environment(&home, None, None)
+        };
+        assert_eq!(resolve_bash_histfile_from(&env), Some(default));
+
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn nonexistent_histfile_and_plain_fallbacks() {
+        let home = unique_dir("home");
+        std::fs::create_dir_all(&home).expect("home directory");
+
+        // No history anywhere: honestly unavailable.
+        assert_eq!(resolve_bash_histfile_from(&environment(&home, None, None)), None);
+        assert_eq!(
+            resolve_bash_histfile_from(&environment(&home, Some(home.join(".bash_history")), None)),
+            None
+        );
+
+        // Default ~/.bash_history appears once it exists.
+        let default = home.join(".bash_history");
+        std::fs::write(&default, "ls\n").expect("default history");
+        assert_eq!(resolve_bash_histfile_from(&environment(&home, None, None)), Some(default));
+
+        // No HOME at all: no resolution.
+        let env = BashHistfileEnvironment::default();
+        assert_eq!(resolve_bash_histfile_from(&env), None);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn serialized_report_exposes_no_local_paths() {
+        let home = unique_dir("json-privacy");
+        std::fs::create_dir_all(&home).expect("home directory");
+        let history = home.join(".bash_history");
+        std::fs::write(&history, "git status\nls\n").expect("history file");
+
+        let source = BashHistorySource::at(history.clone());
+        let report = analyze_source(&source, 10).expect("analysis");
+        let json = serde_json::to_string(&report).expect("report serializes");
+
+        // No history path, no home path, and no path field at all.
+        assert!(!json.contains("histfile"), "histfile must not appear in JSON");
+        assert!(!json.contains(history.to_str().expect("utf-8 temp path")));
+        assert!(!json.contains(home.to_str().expect("utf-8 temp path")));
+        assert!(!json.contains("/tmp/"), "no filesystem location may appear");
+
+        // Only the sanitized aggregate shape is exposed.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let mut keys =
+            value.as_object().expect("object").keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["commands_analyzed", "entries_scanned", "insights", "shell"]);
+        for insight in value["insights"].as_array().expect("insights array") {
+            let mut insight_keys =
+                insight.as_object().expect("insight object").keys().cloned().collect::<Vec<_>>();
+            insight_keys.sort();
+            assert_eq!(insight_keys, vec!["count", "signature"]);
+        }
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn bash_history_name_evidence_is_conservative() {
+        assert!(looks_like_bash_history(Path::new("/home/u/.bash_history")));
+        assert!(looks_like_bash_history(Path::new("/home/u/bash_history")));
+        assert!(!looks_like_bash_history(Path::new("/home/u/.zsh_history")));
+        assert!(!looks_like_bash_history(Path::new("/home/u/.fish-history")));
+        assert!(!looks_like_bash_history(Path::new("/home/u/.histfile")));
+        assert!(!looks_like_bash_history(Path::new("/home/u/")));
     }
 }

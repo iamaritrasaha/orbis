@@ -152,7 +152,9 @@ fn history_directory_check() -> DiagnosticCheck {
     )
 }
 
-/// Reports the private shell-history insight feature state.
+/// Reports the private shell-history insight feature state. The local
+/// history path is deliberately never named; availability is the only fact
+/// surfaced.
 fn shell_history_check() -> DiagnosticCheck {
     use crate::shell_history::ShellHistorySource;
     if !crate::shell_history::insights_enabled() {
@@ -164,13 +166,10 @@ fn shell_history_check() -> DiagnosticCheck {
     }
     let source = crate::shell_history::BashHistorySource::from_environment();
     match source.histfile() {
-        Some(path) => DiagnosticCheck::environment(
+        Some(_) => DiagnosticCheck::environment(
             true,
             "Shell history",
-            &format!(
-                "Local insights read {} on demand; signatures only, nothing leaves this machine.",
-                path.display()
-            ),
+            "Bash history available · local-only insights enabled. Signatures only; nothing leaves this machine.",
         ),
         None => DiagnosticCheck::environment(
             true,

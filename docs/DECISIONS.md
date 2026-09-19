@@ -84,8 +84,14 @@ Design invariants:
 - Signatures only: executable + (when provably safe) one benign subcommand.
   Paths, URLs, option values, environment values, credentials, and composite
   lines never appear; uncertain input degrades to the executable alone.
-- `$HISTFILE` (when set and sensible) else `~/.bash_history`; `#<epoch>`
-  timestamp lines are metadata, never commands.
+- Bash history resolution is bash-specific: `ORBIS_BASH_HISTFILE` (explicit
+  Orbis override, existing regular file) first; then `$HISTFILE` only when it
+  is an existing regular file under the user's home directory (symlinks
+  resolved) with Bash evidence — a Bash-history file name or a Bash login
+  shell — and its name does not itself identify zsh or fish history; then
+  `~/.bash_history`; otherwise the shell is honestly unavailable. A foreign
+  `HISTFILE` is never parsed as Bash. `#<epoch>` timestamp lines are
+  metadata, never commands.
 - Disabled via `ORBIS_HISTORY_INSIGHTS=off`; absent history degrades to an
   empty, honest result.
 - Storage is separate from, and never merged with, Orbis transaction history

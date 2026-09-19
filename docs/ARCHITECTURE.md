@@ -105,7 +105,10 @@ Milestones 3 and 4 add update inventories, coordinated upgrade and cleanup plans
 ## Shell-history insights
 
 `orbis-core::shell_history` is a read-only, local-only subsystem. A
-`ShellHistorySource` (Bash today, `$HISTFILE` else `~/.bash_history`) parses
+`ShellHistorySource` (Bash today) resolves the history file conservatively —
+`ORBIS_BASH_HISTFILE`, then `$HISTFILE` only with Bash evidence under the
+user's home (zsh/fish-named files are rejected outright), then
+`~/.bash_history` — and parses
 entries — `#<epoch>` lines are metadata, backslash continuations join — and
 `sanitize::sanitize_command` reduces each entry to a safe signature: the
 executable and, when provably safe, one benign subcommand. Paths, URLs,
