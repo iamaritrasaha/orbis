@@ -305,7 +305,10 @@ mod tests {
             Some("make")
         );
         // The non-composite path keeps its executable + benign subcommand.
-        assert_eq!(sanitize_within_deadline("FOO=1 BAR=2 git status").as_deref(), Some("git status"));
+        assert_eq!(
+            sanitize_within_deadline("FOO=1 BAR=2 git status").as_deref(),
+            Some("git status")
+        );
         // Assignments alone still produce nothing, composite or not.
         assert_eq!(sanitize_within_deadline("A=1 B=2"), None);
         assert_eq!(sanitize_within_deadline("A=1 B=2 C=3"), None);
@@ -320,8 +323,8 @@ mod tests {
         ] {
             let signature = sanitize_within_deadline(line).unwrap_or_default();
             for forbidden in [
-                "FOO", "BAR", "TOKEN", "SECRET", "https", "example", "tee", "cat", "build",
-                "log", "out", "=1", "=2", "=x", "=y",
+                "FOO", "BAR", "TOKEN", "SECRET", "https", "example", "tee", "cat", "build", "log",
+                "out", "=1", "=2", "=x", "=y",
             ] {
                 assert!(!signature.contains(forbidden), "{forbidden} leaked from {line}");
             }
@@ -330,6 +333,9 @@ mod tests {
 
     #[test]
     fn assignment_run_before_sudo_still_resolves_the_real_command() {
-        assert_eq!(sanitize_within_deadline("A=1 B=2 sudo apt update | tee log").as_deref(), Some("apt"));
+        assert_eq!(
+            sanitize_within_deadline("A=1 B=2 sudo apt update | tee log").as_deref(),
+            Some("apt")
+        );
     }
 }

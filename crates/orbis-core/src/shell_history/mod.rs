@@ -144,11 +144,13 @@ impl ShellHistorySource for BashHistorySource {
             shell: self.shell_name().to_owned(),
             message: error.to_string(),
         })?;
-        let length = file.metadata().map_err(|error| ShellHistoryError::Io {
-            shell: self.shell_name().to_owned(),
-            message: error.to_string(),
-        })?
-        .len();
+        let length = file
+            .metadata()
+            .map_err(|error| ShellHistoryError::Io {
+                shell: self.shell_name().to_owned(),
+                message: error.to_string(),
+            })?
+            .len();
         let start = length.saturating_sub(max_bytes);
         file.seek(SeekFrom::Start(start)).map_err(|error| ShellHistoryError::Io {
             shell: self.shell_name().to_owned(),
@@ -361,12 +363,10 @@ fn is_under_home(path: &Path, home: Option<&Path>) -> bool {
 /// Whether a file name itself identifies another shell's history. Such a name
 /// is definitive evidence against Bash, so no other signal can override it.
 fn looks_like_foreign_shell_history(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower.contains("zsh") || lower.contains("fish")
-        })
+    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains("zsh") || lower.contains("fish")
+    })
 }
 
 /// Whether a file name is itself Bash-history evidence. Neutral names carry
@@ -469,7 +469,8 @@ mod tests {
         std::fs::write(&bash_histfile, "git status\n").expect("named history");
 
         // Plain Bash history file name: accepted without shell evidence.
-        let resolved = resolve_bash_histfile_from(&environment(&home, Some(bash_histfile.clone()), None));
+        let resolved =
+            resolve_bash_histfile_from(&environment(&home, Some(bash_histfile.clone()), None));
         assert_eq!(resolved, Some(bash_histfile.clone()));
 
         // Bash login shell vouches for an unnamed in-home history file.
@@ -502,11 +503,8 @@ mod tests {
         for foreign in [".zsh_history", "zsh-history", ".fish_history"] {
             let path = home.join(foreign);
             std::fs::write(&path, ": 1750000000:0;ls\n").expect("foreign history");
-            let resolved = resolve_bash_histfile_from(&environment(
-                &home,
-                Some(path),
-                Some("/bin/bash"),
-            ));
+            let resolved =
+                resolve_bash_histfile_from(&environment(&home, Some(path), Some("/bin/bash")));
             assert_eq!(resolved, Some(default.clone()), "{foreign} must not be read as Bash");
         }
         let _ = std::fs::remove_dir_all(home);
@@ -524,7 +522,8 @@ mod tests {
         // Bash-looking name, but outside HOME: not trusted.
         let external = outside.join(".bash_history");
         std::fs::write(&external, "ls\n").expect("external history");
-        let resolved = resolve_bash_histfile_from(&environment(&home, Some(external), Some("/bin/bash")));
+        let resolved =
+            resolve_bash_histfile_from(&environment(&home, Some(external), Some("/bin/bash")));
         assert_eq!(resolved, Some(default.clone()));
 
         // In-home symlink that resolves outside HOME: not trusted either.
@@ -532,7 +531,8 @@ mod tests {
         std::fs::write(&target, "ls\n").expect("symlink target");
         let linked = home.join("linked-bash-history");
         std::os::unix::fs::symlink(&target, &linked).expect("symlink");
-        let resolved = resolve_bash_histfile_from(&environment(&home, Some(linked), Some("/bin/bash")));
+        let resolved =
+            resolve_bash_histfile_from(&environment(&home, Some(linked), Some("/bin/bash")));
         assert_eq!(resolved, Some(default));
 
         let _ = std::fs::remove_dir_all(home);
@@ -610,8 +610,7 @@ mod tests {
 
         // Only the sanitized aggregate shape is exposed.
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        let mut keys =
-            value.as_object().expect("object").keys().cloned().collect::<Vec<_>>();
+        let mut keys = value.as_object().expect("object").keys().cloned().collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, vec!["commands_analyzed", "entries_scanned", "insights", "shell"]);
         for insight in value["insights"].as_array().expect("insights array") {

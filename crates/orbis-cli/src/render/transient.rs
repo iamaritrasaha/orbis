@@ -195,7 +195,9 @@ pub(crate) fn recent_commands() -> Vec<(String, u64)> {
         orbis_core::shell_history::LAUNCHER_HISTORY_TAIL_BYTES,
         3,
     )
-    .map(|report| report.insights.into_iter().map(|insight| (insight.signature, insight.count)).collect())
+    .map(|report| {
+        report.insights.into_iter().map(|insight| (insight.signature, insight.count)).collect()
+    })
     .unwrap_or_default()
 }
 

@@ -41,8 +41,7 @@ impl Renderer {
         output.push_str(&format!("{selected} Find software\n  Show software\n  Check updates\n  Refresh information\n  Clean up\n  Health\n  History\n  Full interface\n\n"));
         let recent = super::transient::recent_commands();
         if !recent.is_empty() {
-            output
-                .push_str(&format!("  {}\n", self.theme.paint("Recent commands", Token::Muted)));
+            output.push_str(&format!("  {}\n", self.theme.paint("Recent commands", Token::Muted)));
             for (signature, count) in recent {
                 output.push_str(&format!("  {}  {}\n", signature, count));
             }
@@ -723,8 +722,7 @@ impl Renderer {
     /// listing never silently hides gaps. Never names the records.
     pub(crate) fn history_skipped_note(&self, skipped: usize) -> String {
         let noun = if skipped == 1 { "record" } else { "records" };
-        self.theme
-            .paint(&format!("{skipped} unreadable history {noun} skipped.\n"), Token::Muted)
+        self.theme.paint(&format!("{skipped} unreadable history {noun} skipped.\n"), Token::Muted)
     }
 
     pub(crate) fn commands(

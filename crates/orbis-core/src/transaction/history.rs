@@ -331,9 +331,7 @@ impl HistoryStore {
                     }),
                 });
             }
-            if !parsed
-                && let Ok(record) = serde_json::from_str::<TransactionRecord>(&body)
-            {
+            if !parsed && let Ok(record) = serde_json::from_str::<TransactionRecord>(&body) {
                 parsed = true;
                 let Some(plan) = record.resolved_plan() else {
                     skipped += 1;
@@ -499,7 +497,8 @@ mod tests {
         fs::write(directory.join("tx-corrupt.json"), "{not json").expect("corrupt record");
         fs::write(directory.join("tx-empty.json"), "").expect("empty record");
         fs::write(directory.join("notes.txt"), "ignored").expect("non-record");
-        let (entries, skipped) = store.entries_with_skipped().expect("listing survives corrupt records");
+        let (entries, skipped) =
+            store.entries_with_skipped().expect("listing survives corrupt records");
         assert!(entries.is_empty());
         assert_eq!(skipped, 2, "exactly the two unreadable .json records are counted");
         let _ = fs::remove_dir_all(directory);

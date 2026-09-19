@@ -1125,9 +1125,8 @@ mod tests {
 
     #[test]
     fn unknown_hold_data_leaves_held_unknown_not_false() {
-        let lines = parse_apt_upgrade_lines(
-            "Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n",
-        );
+        let lines =
+            parse_apt_upgrade_lines("Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n");
         let candidates = update_candidates_from_lines(&lines, None);
         assert_eq!(candidates[0].held, None, "no hold data must not become held=false");
         assert_eq!(candidates[0].available_version.as_deref(), Some("8.15"));
@@ -1142,8 +1141,7 @@ mod tests {
     }
     impl CommandRunner for MarkRunner {
         fn is_available(&self, program: &str) -> bool {
-            matches!(program, "apt-cache" | "apt-get")
-                || (program == "apt-mark" && self.available)
+            matches!(program, "apt-cache" | "apt-get") || (program == "apt-mark" && self.available)
         }
 
         fn run(
@@ -1190,9 +1188,8 @@ mod tests {
         let holds = read_holds(&runner).expect("hold data");
         assert!(holds.is_empty());
 
-        let lines = parse_apt_upgrade_lines(
-            "Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n",
-        );
+        let lines =
+            parse_apt_upgrade_lines("Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n");
         let candidates = update_candidates_from_lines(&lines, Some(&holds));
         assert_eq!(candidates[0].held, Some(false));
     }
