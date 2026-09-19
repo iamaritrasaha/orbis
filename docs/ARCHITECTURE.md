@@ -116,8 +116,11 @@ option values, credentials, and composite lines never appear; uncertain input
 degrades to the executable alone. `orbis commands` renders human or JSON
 output; nothing is persisted, transmitted, or merged with transaction
 history, and `ORBIS_HISTORY_INSIGHTS=off` disables the feature entirely. The
-bare launcher reuses the same sanitizer for at most three frequent
-signatures, read from local disk so startup never waits on provider work.
+bare launcher reuses the same sanitizer for at most three signatures drawn
+from a bounded recent tail of the history file (256 KiB), labeled "Recent
+commands" because the counts describe that sampled window only; the read is
+bounded so pathological history sizes never stall startup. `orbis commands`
+keeps the complete scan.
 
 See `docs/DECISIONS.md` for the APT backend decision (ADR-001), the
 read-only `update` semantics (ADR-002), the shell-history privacy design

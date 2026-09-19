@@ -129,22 +129,22 @@ impl Drop for RawModeGuard {
 /// Runs the bare-command launcher. None means cancel or a non-interactive
 /// caller; the caller can then return without entering a persistent screen.
 pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
-    // Frequent commands come from local shell history only. The read and the
-    // sanitization are bounded tens-of-milliseconds work; provider and
-    // network queries are deliberately never started here so the launcher
-    // appears instantly.
-    let frequent = frequent_commands();
+    // Recent commands come from a bounded tail of local shell history only.
+    // The read, sanitization, and counting are bounded tens-of-milliseconds
+    // work regardless of history size; provider and network queries are
+    // deliberately never started here so the launcher appears instantly.
+    let recent = recent_commands();
     if !terminal_capable() {
-        print!("{}", launcher_text_compact(theme, 0, &frequent));
+        print!("{}", launcher_text_compact(theme, 0, &recent));
         return Ok(None);
     }
 
     let mut selected = 0usize;
-    let region = TransientRegion::new(launcher_rows(theme, selected, &frequent).len());
+    let region = TransientRegion::new(launcher_rows(theme, selected, &recent).len());
     let mut stdout = io::stdout();
     region.reserve(&mut stdout).map_err(|error| error.to_string())?;
     region
-        .render(&mut stdout, &launcher_rows(theme, selected, &frequent))
+        .render(&mut stdout, &launcher_rows(theme, selected, &recent))
         .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())?;
     let raw_guard = RawModeGuard::try_new()?;
@@ -169,7 +169,7 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
             _ => {}
         }
         if changed {
-            redraw_launcher(&region, theme, selected, &frequent)?;
+            redraw_launcher(&region, theme, selected, &recent)?;
         }
     })();
     drop(raw_guard);
@@ -181,18 +181,22 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
     Ok(Some(command_for_selection(selected)?))
 }
 
-/// Top sanitized shell-history signatures for the launcher footer.
-/// Never returns raw arguments; empty when disabled or unavailable.
-pub(crate) fn frequent_commands() -> Vec<(String, u64)> {
+/// Top sanitized signatures from a bounded recent tail of shell history for
+/// the launcher footer. Never returns raw arguments; empty when disabled or
+/// unavailable. The counts describe only the sampled recent window, which is
+/// why the section is labeled "Recent commands", not all-time frequency.
+pub(crate) fn recent_commands() -> Vec<(String, u64)> {
     if !orbis_core::shell_history::insights_enabled() {
         return Vec::new();
     }
     let source = orbis_core::shell_history::BashHistorySource::from_environment();
-    orbis_core::shell_history::analyze_source(&source, 3)
-        .map(|report| {
-            report.insights.into_iter().map(|insight| (insight.signature, insight.count)).collect()
-        })
-        .unwrap_or_default()
+    orbis_core::shell_history::analyze_recent(
+        &source,
+        orbis_core::shell_history::LAUNCHER_HISTORY_TAIL_BYTES,
+        3,
+    )
+    .map(|report| report.insights.into_iter().map(|insight| (insight.signature, insight.count)).collect())
+    .unwrap_or_default()
 }
 
 fn command_for_selection(selected: usize) -> Result<Command, String> {
@@ -252,7 +256,7 @@ fn launcher_rows(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> V
     }
     if !frequent.is_empty() {
         rows.push(String::new());
-        rows.push(format!("  {}", theme.paint("Frequent commands", Token::Muted)));
+        rows.push(format!("  {}", theme.paint("Recent commands", Token::Muted)));
         for (signature, count) in frequent {
             rows.push(format!(
                 "  {}  {}",
@@ -287,7 +291,7 @@ fn launcher_text_compact(theme: Theme, selected: usize, frequent: &[(String, u64
         ));
     }
     if !frequent.is_empty() {
-        output.push_str(&format!("\n  {}\n", theme.paint("Frequent commands", Token::Muted)));
+        output.push_str(&format!("\n  {}\n", theme.paint("Recent commands", Token::Muted)));
         for (signature, count) in frequent {
             output.push_str(&format!(
                 "  {}  {}\n",
@@ -331,12 +335,12 @@ mod tests {
     fn frequent_commands_section_is_sanitized_and_optional() {
         let theme = Theme::test(80);
         let plain = launcher_rows(theme, 0, &[]);
-        assert!(!plain.iter().any(|row| row.contains("Frequent commands")));
+        assert!(!plain.iter().any(|row| row.contains("Recent commands")));
 
         let frequent = vec![("git status".to_owned(), 184_u64), ("cargo test".to_owned(), 92_u64)];
         let rows = launcher_rows(theme, 0, &frequent);
         assert_eq!(rows.len(), plain.len() + 4, "one label row, two entries, one spacer");
-        assert!(rows.iter().any(|row| row.contains("Frequent commands")));
+        assert!(rows.iter().any(|row| row.contains("Recent commands")));
         assert!(rows.iter().any(|row| row.contains("git status") && row.contains("184")));
         assert!(rows.iter().any(|row| row.contains("cargo test") && row.contains("92")));
         // Only the two passed signatures appear as command content.

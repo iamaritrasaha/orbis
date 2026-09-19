@@ -69,7 +69,17 @@ pub trait ShellHistorySource: Send + Sync {
     /// continuation artifacts are handled by the implementation; entries are
     /// always returned in file order.
     fn read_entries(&self) -> Result<Vec<String>, ShellHistoryError>;
+    /// Reads entries from a bounded tail of the history file, for
+    /// latency-sensitive callers such as the bare launcher. The result covers
+    /// only the most recent history — reports built from it must be labeled
+    /// as recent, never presented as all-time frequency.
+    fn read_recent_entries(&self, max_bytes: u64) -> Result<Vec<String>, ShellHistoryError>;
 }
+
+/// Byte budget the launcher reads from the tail of the history file. Large
+/// enough for thousands of recent commands, small enough that pathological
+/// history sizes cannot stall startup.
+pub const LAUNCHER_HISTORY_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Bash history source.
 ///
@@ -122,6 +132,42 @@ impl ShellHistorySource for BashHistorySource {
             message: error.to_string(),
         })?;
         Ok(parse_bash_history(&String::from_utf8_lossy(&bytes)))
+    }
+
+    fn read_recent_entries(&self, max_bytes: u64) -> Result<Vec<String>, ShellHistoryError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self
+            .histfile
+            .as_ref()
+            .ok_or_else(|| ShellHistoryError::NotFound { shell: self.shell_name().to_owned() })?;
+        let mut file = std::fs::File::open(path).map_err(|error| ShellHistoryError::Io {
+            shell: self.shell_name().to_owned(),
+            message: error.to_string(),
+        })?;
+        let length = file.metadata().map_err(|error| ShellHistoryError::Io {
+            shell: self.shell_name().to_owned(),
+            message: error.to_string(),
+        })?
+        .len();
+        let start = length.saturating_sub(max_bytes);
+        file.seek(SeekFrom::Start(start)).map_err(|error| ShellHistoryError::Io {
+            shell: self.shell_name().to_owned(),
+            message: error.to_string(),
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|error| ShellHistoryError::Io {
+            shell: self.shell_name().to_owned(),
+            message: error.to_string(),
+        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        // Skip the first, likely truncated line unless the tail starts at the
+        // beginning of the file, so parsing always begins at a line boundary.
+        let complete = if start > 0 {
+            text.split_once('\n').map(|(_, rest)| rest).unwrap_or_default()
+        } else {
+            text.as_ref()
+        };
+        Ok(parse_bash_history(complete))
     }
 }
 
@@ -206,6 +252,22 @@ pub fn analyze_source(
     limit: usize,
 ) -> Result<ShellHistoryReport, ShellHistoryError> {
     let entries = source.read_entries()?;
+    let mut report = analyze(&entries, limit);
+    report.shell = source.shell_name().to_owned();
+    Ok(report)
+}
+
+/// Produces a report from a bounded recent tail of one source's history.
+///
+/// The counts describe only the sampled recent window (at most `max_bytes`
+/// of the history file), so callers must present them as recent activity,
+/// not all-time frequency. [`analyze_source`] remains the complete scan.
+pub fn analyze_recent(
+    source: &dyn ShellHistorySource,
+    max_bytes: u64,
+    limit: usize,
+) -> Result<ShellHistoryReport, ShellHistoryError> {
+    let entries = source.read_recent_entries(max_bytes)?;
     let mut report = analyze(&entries, limit);
     report.shell = source.shell_name().to_owned();
     Ok(report)
@@ -558,6 +620,87 @@ mod tests {
             insight_keys.sort();
             assert_eq!(insight_keys, vec!["count", "signature"]);
         }
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn recent_tail_read_is_bounded_and_starts_at_a_line_boundary() {
+        let home = unique_dir("tail");
+        std::fs::create_dir_all(&home).expect("home directory");
+        let history = home.join(".bash_history");
+        // A large file whose interesting commands live only at the very end.
+        let filler = "echo filler\n".repeat(20_000);
+        let tail = "cargo test --release\ngit status\n";
+        std::fs::write(&history, format!("echo early-marker\n{filler}{tail}"))
+            .expect("large history");
+
+        let source = BashHistorySource::at(history.clone());
+        let budget = 64; // far below the file size, spanning only a few lines
+        let entries = source.read_recent_entries(budget).expect("tail read");
+        // Only a handful of lines fit in the window: the read is bounded.
+        assert!(entries.len() <= 6, "tail read must respect the byte budget");
+        assert!(
+            !entries.iter().any(|entry| entry.contains("early-marker")),
+            "entries far outside the window must never appear"
+        );
+        assert_eq!(
+            entries.last().map(String::as_str),
+            Some("git status"),
+            "the newest entry is always included"
+        );
+        assert!(entries.iter().any(|entry| entry == "cargo test --release"));
+
+        // A budget of the whole file behaves like a complete read.
+        let full = source.read_recent_entries(u64::MAX).expect("full read");
+        assert_eq!(full.len(), 20_003);
+        assert_eq!(full.last().map(String::as_str), Some("git status"));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn recent_tail_drops_the_truncated_first_line() {
+        let home = unique_dir("tail-partial");
+        std::fs::create_dir_all(&home).expect("home directory");
+        let history = home.join(".bash_history");
+        // "git stat" is split by the budget; the fragment must never surface.
+        std::fs::write(&history, "ls -la\ncargo build\ngit status").expect("history file");
+        let body = std::fs::read_to_string(&history).expect("content");
+        let cut = body.find("git status").expect("marker");
+        let budget = (body.len() - cut + 2) as u64; // starts mid-"git stat…"
+        assert!(budget < body.len() as u64);
+
+        let source = BashHistorySource::at(history.clone());
+        let entries = source.read_recent_entries(budget).expect("tail read");
+        assert_eq!(entries, vec!["git status"]);
+        assert!(entries.iter().all(|entry| !entry.contains("stat\ncargo")));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn analyze_recent_counts_only_the_sampled_window() {
+        let home = unique_dir("recent");
+        std::fs::create_dir_all(&home).expect("home directory");
+        let history = home.join(".bash_history");
+        // Filler lines are far longer than the budget, so a 64-byte window
+        // can only reach the recent section at the end.
+        let old = format!("{}\n", "echo old-command-".repeat(12)).repeat(5_000);
+        let recent = "git status\n#1712345678\ngit status\n";
+        std::fs::write(&history, format!("{old}{recent}")).expect("history file");
+
+        let source = BashHistorySource::at(history);
+        let report = analyze_recent(&source, 64, 10).expect("recent analysis");
+        assert_eq!(report.shell, "bash");
+        assert_eq!(report.entries_scanned, 2);
+        assert_eq!(report.insights[0].signature, "git status");
+        assert_eq!(report.insights[0].count, 2);
+        assert!(!report.insights.iter().any(|insight| insight.signature == "echo"));
+
+        // The complete scan still sees everything, unchanged.
+        let complete = analyze_source(&source, 10).expect("complete analysis");
+        assert_eq!(complete.entries_scanned, 5_002);
 
         let _ = std::fs::remove_dir_all(home);
     }

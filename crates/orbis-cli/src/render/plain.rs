@@ -39,11 +39,11 @@ impl Renderer {
             "j/k move  Enter choose  q cancel"
         };
         output.push_str(&format!("{selected} Find software\n  Show software\n  Check updates\n  Refresh information\n  Clean up\n  Health\n  History\n  Full interface\n\n"));
-        let frequent = super::transient::frequent_commands();
-        if !frequent.is_empty() {
+        let recent = super::transient::recent_commands();
+        if !recent.is_empty() {
             output
-                .push_str(&format!("  {}\n", self.theme.paint("Frequent commands", Token::Muted)));
-            for (signature, count) in frequent {
+                .push_str(&format!("  {}\n", self.theme.paint("Recent commands", Token::Muted)));
+            for (signature, count) in recent {
                 output.push_str(&format!("  {}  {}\n", signature, count));
             }
             output.push('\n');
