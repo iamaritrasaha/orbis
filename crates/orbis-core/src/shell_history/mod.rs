@@ -100,9 +100,10 @@ impl ShellHistorySource for BashHistorySource {
     }
 
     fn read_entries(&self) -> Result<Vec<String>, ShellHistoryError> {
-        let path = self.histfile.as_ref().ok_or_else(|| ShellHistoryError::NotFound {
-            shell: self.shell_name().to_owned(),
-        })?;
+        let path = self
+            .histfile
+            .as_ref()
+            .ok_or_else(|| ShellHistoryError::NotFound { shell: self.shell_name().to_owned() })?;
         let bytes = std::fs::read(path).map_err(|error| ShellHistoryError::Io {
             shell: self.shell_name().to_owned(),
             message: error.to_string(),
@@ -172,10 +173,8 @@ pub fn analyze(entries: &[String], limit: usize) -> ShellHistoryReport {
             *counts.entry(signature).or_insert(0) += 1;
         }
     }
-    let mut insights: Vec<CommandInsight> = counts
-        .into_iter()
-        .map(|(signature, count)| CommandInsight { signature, count })
-        .collect();
+    let mut insights: Vec<CommandInsight> =
+        counts.into_iter().map(|(signature, count)| CommandInsight { signature, count }).collect();
     insights.sort_by(|left, right| {
         right.count.cmp(&left.count).then_with(|| left.signature.cmp(&right.signature))
     });
@@ -189,7 +188,10 @@ pub fn analyze(entries: &[String], limit: usize) -> ShellHistoryReport {
 }
 
 /// Produces a complete report for one source, including the resolved path.
-pub fn analyze_source(source: &dyn ShellHistorySource, limit: usize) -> Result<ShellHistoryReport, ShellHistoryError> {
+pub fn analyze_source(
+    source: &dyn ShellHistorySource,
+    limit: usize,
+) -> Result<ShellHistoryReport, ShellHistoryError> {
     let entries = source.read_entries()?;
     let mut report = analyze(&entries, limit);
     report.shell = source.shell_name().to_owned();

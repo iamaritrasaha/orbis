@@ -73,20 +73,8 @@ const SAFE_SUBCOMMANDS: [&str; 44] = [
 
 /// Shells and remote-execution commands whose arguments are never summarized.
 const EXECUTABLE_ONLY: [&str; 14] = [
-    "curl",
-    "wget",
-    "ssh",
-    "scp",
-    "sftp",
-    "nc",
-    "ncat",
-    "socat",
-    "openssl",
-    "gpg",
-    "vault",
-    "aws",
-    "gcloud",
-    "az",
+    "curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "socat", "openssl", "gpg", "vault", "aws",
+    "gcloud", "az",
 ];
 
 /// Reduces one raw history line to a safe normalized signature.
@@ -99,7 +87,11 @@ pub fn sanitize_command(line: &str) -> Option<String> {
     }
     // Composites, substitutions, and redirections change what actually ran.
     // Only the executable level is certain, so everything else is dropped.
-    if line.contains(['|', ';', '&', '`']) || line.contains("$(") || line.contains('<') || line.contains('>') {
+    if line.contains(['|', ';', '&', '`'])
+        || line.contains("$(")
+        || line.contains('<')
+        || line.contains('>')
+    {
         return executable_only(line);
     }
     let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -123,9 +115,7 @@ pub fn sanitize_command(line: &str) -> Option<String> {
         return None;
     }
     if executable.eq_ignore_ascii_case("sudo") || executable.eq_ignore_ascii_case("doas") {
-        return Some(
-            sanitize_command(&tokens[1..].join(" ")).unwrap_or(executable),
-        );
+        return Some(sanitize_command(&tokens[1..].join(" ")).unwrap_or(executable));
     }
     if EXECUTABLE_ONLY.iter().any(|known| known.eq_ignore_ascii_case(&executable)) {
         return Some(executable);

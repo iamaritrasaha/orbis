@@ -3765,10 +3765,7 @@ mod tests {
     fn authorization_is_absent_from_worker_entry_points() {
         let commands = include_str!("../commands.rs");
         for (start, end) in [
-            (
-                "pub(crate) fn execute_confirmed_transaction_with_observer",
-                "fn run_info(",
-            ),
+            ("pub(crate) fn execute_confirmed_transaction_with_observer", "fn run_info("),
             ("pub(crate) fn execute_confirmed_maintenance_with_observer", "fn skipped_provider"),
         ] {
             let function = commands.split(start).nth(1).unwrap().split(end).next().unwrap();

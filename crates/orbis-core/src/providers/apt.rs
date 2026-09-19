@@ -723,10 +723,7 @@ struct AptUpgradeLine {
 }
 
 fn parse_apt_upgrade_lines(output: &str) -> Vec<AptUpgradeLine> {
-    output
-        .lines()
-        .filter_map(parse_apt_upgrade_line)
-        .collect()
+    output.lines().filter_map(parse_apt_upgrade_line).collect()
 }
 
 fn parse_apt_upgrade_line(line: &str) -> Option<AptUpgradeLine> {
@@ -795,9 +792,10 @@ fn update_candidates_from_lines(
             channel: None,
             held: Some(holds.contains(&line.provider_id)),
             security_relevance: suite_is_security(line.suite.as_deref()),
-            notes: line.suite.as_deref().map_or_else(Vec::new, |suite| {
-                vec![format!("Candidate suite: {suite}.")]
-            }),
+            notes: line
+                .suite
+                .as_deref()
+                .map_or_else(Vec::new, |suite| vec![format!("Candidate suite: {suite}.")]),
             metadata: line
                 .suite
                 .as_deref()
@@ -1147,7 +1145,10 @@ mod tests {
                 matches!(program, "apt-cache" | "apt-get" | "apt-mark")
             }
 
-            fn run(&self, command: &CommandSpec) -> Result<crate::process::CommandOutput, crate::process::ProcessError> {
+            fn run(
+                &self,
+                command: &CommandSpec,
+            ) -> Result<crate::process::CommandOutput, crate::process::ProcessError> {
                 match command.program.as_str() {
                     "apt-get" => {
                         *self.simulations.lock().unwrap() += 1;
@@ -1177,7 +1178,11 @@ mod tests {
 
         let plan = provider.upgrade_plan().expect("upgrade plan");
         assert_eq!(plan.len(), 1);
-        assert_eq!(*runner.simulations.lock().unwrap(), 2, "plan must not re-simulate beyond its own single simulation");
+        assert_eq!(
+            *runner.simulations.lock().unwrap(),
+            2,
+            "plan must not re-simulate beyond its own single simulation"
+        );
         assert_eq!(plan[0].candidates[0].security_relevance, Some(true));
 
         // Verification performs exactly one more re-check after execution.

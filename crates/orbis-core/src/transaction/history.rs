@@ -320,7 +320,8 @@ impl HistoryStore {
                 continue;
             }
             if let Ok(record) = serde_json::from_str::<TransactionRecord>(&body) {
-                let Some(plan) = record.resolved_plan() else { continue };                let operation_id = plan.operation_id.clone();
+                let Some(plan) = record.resolved_plan() else { continue };
+                let operation_id = plan.operation_id.clone();
                 let (status, verification, message) = match &record.result {
                     Some(result) => (
                         format!("{:?}", record.effective_lifecycle()).to_ascii_lowercase(),

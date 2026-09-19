@@ -201,9 +201,7 @@ pub(crate) fn dispatch(
         Some(Command::History { operation_id, limit, source }) => {
             run_history(renderer, cli.json, cli.plain, operation_id, limit, source.map(Into::into))
         }
-        Some(Command::Commands { limit, shell }) => {
-            run_commands(renderer, cli.json, limit, &shell)
-        }
+        Some(Command::Commands { limit, shell }) => run_commands(renderer, cli.json, limit, &shell),
         Some(Command::Why { package, source }) => {
             run_why(registry, renderer, cli.json, package, source.map(Into::into))
         }
@@ -935,7 +933,9 @@ fn run_commands(renderer: &Renderer, json: bool, limit: usize, shell: &str) -> R
         }
         Err(error) => {
             if json {
-                print_json(&serde_json::json!({"status":"unavailable","reason":error.to_string()}))?;
+                print_json(
+                    &serde_json::json!({"status":"unavailable","reason":error.to_string()}),
+                )?;
             } else {
                 print!("{}", renderer.commands_unavailable(&error.to_string()));
             }

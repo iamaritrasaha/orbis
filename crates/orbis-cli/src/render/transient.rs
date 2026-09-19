@@ -333,8 +333,7 @@ mod tests {
         let plain = launcher_rows(theme, 0, &[]);
         assert!(!plain.iter().any(|row| row.contains("Frequent commands")));
 
-        let frequent =
-            vec![("git status".to_owned(), 184_u64), ("cargo test".to_owned(), 92_u64)];
+        let frequent = vec![("git status".to_owned(), 184_u64), ("cargo test".to_owned(), 92_u64)];
         let rows = launcher_rows(theme, 0, &frequent);
         assert_eq!(rows.len(), plain.len() + 4, "one label row, two entries, one spacer");
         assert!(rows.iter().any(|row| row.contains("Frequent commands")));

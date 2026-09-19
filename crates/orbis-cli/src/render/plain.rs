@@ -41,10 +41,8 @@ impl Renderer {
         output.push_str(&format!("{selected} Find software\n  Show software\n  Check updates\n  Refresh information\n  Clean up\n  Health\n  History\n  Full interface\n\n"));
         let frequent = super::transient::frequent_commands();
         if !frequent.is_empty() {
-            output.push_str(&format!(
-                "  {}\n",
-                self.theme.paint("Frequent commands", Token::Muted)
-            ));
+            output
+                .push_str(&format!("  {}\n", self.theme.paint("Frequent commands", Token::Muted)));
             for (signature, count) in frequent {
                 output.push_str(&format!("  {}  {}\n", signature, count));
             }
@@ -721,7 +719,10 @@ impl Renderer {
             + "\n"
     }
 
-    pub(crate) fn commands(&self, report: &orbis_core::shell_history::ShellHistoryReport) -> String {
+    pub(crate) fn commands(
+        &self,
+        report: &orbis_core::shell_history::ShellHistoryReport,
+    ) -> String {
         let mut output = self.heading("Commands", "Your most-used shell commands.");
         if report.insights.is_empty() {
             output.push_str("No recognizable commands were found in your shell history.\n");
@@ -747,8 +748,7 @@ impl Renderer {
         }
         output.push_str(&format!(
             "\nBased on {} local {} history entries\n",
-            report.entries_scanned,
-            report.shell
+            report.entries_scanned, report.shell
         ));
         output.push_str(&self.theme.paint("Nothing leaves this machine.\n", Token::Muted));
         output
