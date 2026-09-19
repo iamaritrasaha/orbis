@@ -58,7 +58,7 @@ impl AptProvider {
         let output = expect_success(PackageSource::Apt, "simulate the APT upgrade", output)?;
         let holds = read_holds(&self.runner);
         let lines = parse_apt_upgrade_lines(&output.stdout);
-        let candidates = update_candidates_from_lines(&lines, &holds);
+        let candidates = update_candidates_from_lines(&lines, holds.as_ref());
         let changes = parse_simulation_changes(&output.stdout);
         Ok(AptUpgradeFacts {
             candidates,
@@ -591,8 +591,10 @@ impl MaintenanceProvider for AptProvider {
             operation: "explain package provenance".into(),
             technical: error.to_string(),
         })?;
-        let auto = read_marked_packages(&self.runner, "showauto");
-        let manual = read_marked_packages(&self.runner, "showmanual");
+        // Hold facts are the only tri-state mark; auto/manual marks keep the
+        // pre-existing degrade-to-empty presentation behavior here.
+        let auto = read_marked_packages(&self.runner, "showauto").unwrap_or_default();
+        let manual = read_marked_packages(&self.runner, "showmanual").unwrap_or_default();
         let reverse = read_reverse_dependencies(&self.runner, &package.provider_id);
         let installed_as = if auto.contains(&package.provider_id) {
             "Automatic dependency"
@@ -777,7 +779,7 @@ fn suite_is_security(suite: Option<&str>) -> Option<bool> {
 
 fn update_candidates_from_lines(
     lines: &[AptUpgradeLine],
-    holds: &std::collections::BTreeSet<String>,
+    holds: Option<&std::collections::BTreeSet<String>>,
 ) -> Vec<UpdateCandidate> {
     lines
         .iter()
@@ -790,7 +792,7 @@ fn update_candidates_from_lines(
             architecture: line.architecture.clone(),
             scope: Some(InstallScope::System),
             channel: None,
-            held: Some(holds.contains(&line.provider_id)),
+            held: holds.map(|set| set.contains(&line.provider_id)),
             security_relevance: suite_is_security(line.suite.as_deref()),
             notes: line
                 .suite
@@ -854,31 +856,36 @@ fn maintenance_id(source: PackageSource, action: MaintenanceAction) -> String {
     format!("maint-{}-{}-{}", source.label().to_ascii_lowercase(), action, std::process::id())
 }
 
-fn read_marked_packages(runner: &SharedRunner, action: &str) -> std::collections::BTreeSet<String> {
-    let Ok(output) = execute(
+fn read_marked_packages(
+    runner: &SharedRunner,
+    action: &str,
+) -> Option<std::collections::BTreeSet<String>> {
+    let output = execute(
         runner,
         PackageSource::Apt,
         "read APT install marks",
         CommandSpec::new("apt-mark", [action]).with_timeout(short_timeout()),
-    ) else {
-        return std::collections::BTreeSet::new();
-    };
+    )
+    .ok()?;
     if !output.success() {
-        return std::collections::BTreeSet::new();
+        return None;
     }
-    output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect()
+    Some(
+        output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
-/// Reads held package names through apt-mark's read-only `showhold` interface.
-/// Unavailable or failing mark data is reported as an empty set; absence of
-/// hold information is never interpreted as a hold.
-fn read_holds(runner: &SharedRunner) -> std::collections::BTreeSet<String> {
+/// Reads held package names through apt-mark's read-only `showhold`
+/// interface. Hold facts stay honest in all three states: `Some` set when
+/// apt-mark answered (possibly empty), `None` when apt-mark is unavailable
+/// or fails — an unknown hold is never reported as "not held".
+fn read_holds(runner: &SharedRunner) -> Option<std::collections::BTreeSet<String>> {
     read_marked_packages(runner, "showhold")
 }
 
@@ -1107,13 +1114,99 @@ mod tests {
              Inst btop [1.2] (1.3 Ubuntu:26.04/noble-updates [amd64])\n",
         );
         let holds = std::collections::BTreeSet::from(["btop".to_owned()]);
-        let candidates = update_candidates_from_lines(&lines, &holds);
+        let candidates = update_candidates_from_lines(&lines, Some(&holds));
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].security_relevance, Some(true));
         assert_eq!(candidates[0].held, Some(false));
         assert_eq!(candidates[1].security_relevance, Some(false));
         assert_eq!(candidates[1].held, Some(true));
         assert_eq!(candidates[0].metadata["suite"], "noble-security");
+    }
+
+    #[test]
+    fn unknown_hold_data_leaves_held_unknown_not_false() {
+        let lines = parse_apt_upgrade_lines(
+            "Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n",
+        );
+        let candidates = update_candidates_from_lines(&lines, None);
+        assert_eq!(candidates[0].held, None, "no hold data must not become held=false");
+        assert_eq!(candidates[0].available_version.as_deref(), Some("8.15"));
+    }
+
+    /// Fake runner exposing apt-mark with a configurable answer; any other
+    /// program is a test bug.
+    struct MarkRunner {
+        available: bool,
+        status: Option<i32>,
+        stdout: String,
+    }
+    impl CommandRunner for MarkRunner {
+        fn is_available(&self, program: &str) -> bool {
+            matches!(program, "apt-cache" | "apt-get")
+                || (program == "apt-mark" && self.available)
+        }
+
+        fn run(
+            &self,
+            command: &CommandSpec,
+        ) -> Result<crate::process::CommandOutput, crate::process::ProcessError> {
+            match command.program.as_str() {
+                "apt-mark" => Ok(crate::process::CommandOutput {
+                    stdout: self.stdout.clone(),
+                    stderr: String::new(),
+                    status: self.status,
+                }),
+                program => panic!("unexpected command: {program}"),
+            }
+        }
+    }
+
+    fn holds_runner(
+        available: bool,
+        status: Option<i32>,
+        stdout: &str,
+    ) -> std::sync::Arc<dyn CommandRunner> {
+        std::sync::Arc::new(MarkRunner { available, status, stdout: stdout.to_owned() })
+    }
+
+    #[test]
+    fn successful_showhold_reports_held_and_not_held() {
+        let runner = holds_runner(true, Some(0), "btop\n");
+        let holds = read_holds(&runner).expect("hold data");
+        assert_eq!(holds, std::collections::BTreeSet::from(["btop".to_owned()]));
+
+        let lines = parse_apt_upgrade_lines(
+            "Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n\
+             Inst btop [1.2] (1.3 Ubuntu:26.04/resolute [amd64])\n",
+        );
+        let candidates = update_candidates_from_lines(&lines, Some(&holds));
+        assert_eq!(candidates[0].held, Some(false));
+        assert_eq!(candidates[1].held, Some(true));
+    }
+
+    #[test]
+    fn successful_empty_showhold_reports_everything_not_held() {
+        let runner = holds_runner(true, Some(0), "");
+        let holds = read_holds(&runner).expect("hold data");
+        assert!(holds.is_empty());
+
+        let lines = parse_apt_upgrade_lines(
+            "Inst curl [8.14] (8.15 Ubuntu:26.04/resolute [amd64])\n",
+        );
+        let candidates = update_candidates_from_lines(&lines, Some(&holds));
+        assert_eq!(candidates[0].held, Some(false));
+    }
+
+    #[test]
+    fn unavailable_apt_mark_reports_unknown_holds() {
+        let runner = holds_runner(false, None, "");
+        assert_eq!(read_holds(&runner), None);
+    }
+
+    #[test]
+    fn failing_apt_mark_reports_unknown_holds() {
+        let runner = holds_runner(true, Some(1), "");
+        assert_eq!(read_holds(&runner), None);
     }
 
     #[test]
