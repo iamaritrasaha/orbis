@@ -1,4 +1,4 @@
-.TH ORBIS 1 "2026-09-09" "Orbis 0.1.0-beta.1.dev.12" "Orbis manual"
+.TH ORBIS 1 "2026-09-09" "Orbis 0.1.0-beta.1.dev.16" "Orbis manual"
 .SH NAME
 orbis \- your Linux software, in one place
 .SH SYNOPSIS
@@ -50,6 +50,9 @@ Review confidently unused software items for safe cleanup.
 .TP
 .B history
 Read previous Orbis operations.
+.TP
+.B commands
+Show your most-used shell commands. Signatures are derived locally from your Bash history; raw arguments, paths, and secrets are never displayed and nothing leaves this machine. Disable with ORBIS_HISTORY_INSIGHTS=off.
 .TP
 .B health
 Check that software systems are working.

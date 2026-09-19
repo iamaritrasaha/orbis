@@ -50,6 +50,7 @@ pub(crate) fn command_label(command: Option<&Command>) -> Option<&'static str> {
         Command::Upgrade { .. } => "UPGRADE",
         Command::Clean { .. } => "CLEAN",
         Command::History { .. } => "HISTORY",
+        Command::Commands { .. } => "COMMANDS",
         Command::Why { .. } => "WHY",
     })
 }
@@ -128,17 +129,22 @@ impl Drop for RawModeGuard {
 /// Runs the bare-command launcher. None means cancel or a non-interactive
 /// caller; the caller can then return without entering a persistent screen.
 pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
+    // Frequent commands come from local shell history only. The read and the
+    // sanitization are bounded tens-of-milliseconds work; provider and
+    // network queries are deliberately never started here so the launcher
+    // appears instantly.
+    let frequent = frequent_commands();
     if !terminal_capable() {
-        print!("{}", launcher_text_compact(theme, 0));
+        print!("{}", launcher_text_compact(theme, 0, &frequent));
         return Ok(None);
     }
 
     let mut selected = 0usize;
-    let region = TransientRegion::new(launcher_rows(theme, selected).len());
+    let region = TransientRegion::new(launcher_rows(theme, selected, &frequent).len());
     let mut stdout = io::stdout();
     region.reserve(&mut stdout).map_err(|error| error.to_string())?;
     region
-        .render(&mut stdout, &launcher_rows(theme, selected))
+        .render(&mut stdout, &launcher_rows(theme, selected, &frequent))
         .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())?;
     let raw_guard = RawModeGuard::try_new()?;
@@ -163,7 +169,7 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
             _ => {}
         }
         if changed {
-            redraw_launcher(&region, theme, selected)?;
+            redraw_launcher(&region, theme, selected, &frequent)?;
         }
     })();
     drop(raw_guard);
@@ -173,6 +179,20 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
 
     let Some(selected) = result else { return Ok(None) };
     Ok(Some(command_for_selection(selected)?))
+}
+
+/// Top sanitized shell-history signatures for the launcher footer.
+/// Never returns raw arguments; empty when disabled or unavailable.
+pub(crate) fn frequent_commands() -> Vec<(String, u64)> {
+    if !orbis_core::shell_history::insights_enabled() {
+        return Vec::new();
+    }
+    let source = orbis_core::shell_history::BashHistorySource::from_environment();
+    orbis_core::shell_history::analyze_source(&source, 3)
+        .map(|report| {
+            report.insights.into_iter().map(|insight| (insight.signature, insight.count)).collect()
+        })
+        .unwrap_or_default()
 }
 
 fn command_for_selection(selected: usize) -> Result<Command, String> {
@@ -198,22 +218,27 @@ fn prompt(label: &str) -> Result<String, String> {
     if value.is_empty() { Err("a software name is required".into()) } else { Ok(value) }
 }
 
-fn redraw_launcher(region: &TransientRegion, theme: Theme, selected: usize) -> Result<(), String> {
+fn redraw_launcher(
+    region: &TransientRegion,
+    theme: Theme,
+    selected: usize,
+    frequent: &[(String, u64)],
+) -> Result<(), String> {
     let mut stdout = io::stdout();
     region
-        .render(&mut stdout, &launcher_rows(theme, selected))
+        .render(&mut stdout, &launcher_rows(theme, selected, frequent))
         .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 pub(crate) fn launcher_text(theme: Theme, selected: usize) -> String {
-    let mut output = launcher_rows(theme, selected).join("\n");
+    let mut output = launcher_rows(theme, selected, &[]).join("\n");
     output.push('\n');
     output
 }
 
-fn launcher_rows(theme: Theme, selected: usize) -> Vec<String> {
+fn launcher_rows(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> Vec<String> {
     let mut rows = BrandFrame::settled(theme, IdentityMode::Launcher).lines().to_vec();
     rows.push(String::new());
     for (index, option) in LAUNCHER_OPTIONS.iter().enumerate() {
@@ -225,6 +250,17 @@ fn launcher_rows(theme: Theme, selected: usize) -> Vec<String> {
             theme.paint(option, token)
         ));
     }
+    if !frequent.is_empty() {
+        rows.push(String::new());
+        rows.push(format!("  {}", theme.paint("Frequent commands", Token::Muted)));
+        for (signature, count) in frequent {
+            rows.push(format!(
+                "  {}  {}",
+                theme.paint(signature, Token::Foreground),
+                theme.paint(count.to_string().as_str(), Token::Muted)
+            ));
+        }
+    }
     let controls = if theme.unicode {
         "↑↓ move  Enter choose  q cancel"
     } else {
@@ -235,7 +271,7 @@ fn launcher_rows(theme: Theme, selected: usize) -> Vec<String> {
     rows
 }
 
-fn launcher_text_compact(theme: Theme, selected: usize) -> String {
+fn launcher_text_compact(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> String {
     let mut output = format!(
         "{}\n  {}\n\n",
         theme.paint(theme.brand_compact(), Token::Primary),
@@ -249,6 +285,16 @@ fn launcher_text_compact(theme: Theme, selected: usize) -> String {
             theme.paint(marker, Token::Primary),
             theme.paint(option, token)
         ));
+    }
+    if !frequent.is_empty() {
+        output.push_str(&format!("\n  {}\n", theme.paint("Frequent commands", Token::Muted)));
+        for (signature, count) in frequent {
+            output.push_str(&format!(
+                "  {}  {}\n",
+                theme.paint(signature, Token::Foreground),
+                theme.paint(count.to_string().as_str(), Token::Muted)
+            ));
+        }
     }
     output.push_str("\n  j/k move  Enter choose  q cancel\n");
     output
@@ -282,19 +328,37 @@ mod tests {
     }
 
     #[test]
+    fn frequent_commands_section_is_sanitized_and_optional() {
+        let theme = Theme::test(80);
+        let plain = launcher_rows(theme, 0, &[]);
+        assert!(!plain.iter().any(|row| row.contains("Frequent commands")));
+
+        let frequent =
+            vec![("git status".to_owned(), 184_u64), ("cargo test".to_owned(), 92_u64)];
+        let rows = launcher_rows(theme, 0, &frequent);
+        assert_eq!(rows.len(), plain.len() + 4, "one label row, two entries, one spacer");
+        assert!(rows.iter().any(|row| row.contains("Frequent commands")));
+        assert!(rows.iter().any(|row| row.contains("git status") && row.contains("184")));
+        assert!(rows.iter().any(|row| row.contains("cargo test") && row.contains("92")));
+        // Only the two passed signatures appear as command content.
+        assert_eq!(rows.iter().filter(|row| row.contains("184")).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.contains("92")).count(), 1);
+    }
+
+    #[test]
     fn launcher_navigation_reuses_one_fixed_frame() {
         let theme = Theme::test(80);
-        let initial = launcher_rows(theme, 0);
+        let initial = launcher_rows(theme, 0, &[]);
         assert_eq!(initial.len(), 17);
 
         for selected in 0..=4 {
-            let rows = launcher_rows(theme, selected);
+            let rows = launcher_rows(theme, selected, &[]);
             assert_eq!(rows.len(), initial.len());
             assert_eq!(rows.iter().filter(|row| row.contains("Find software")).count(), 1);
             assert_eq!(rows.iter().filter(|row| row.contains("Clean up")).count(), 1);
         }
 
-        let clean_up = launcher_rows(theme, 4);
+        let clean_up = launcher_rows(theme, 4, &[]);
         let clean_up_index = initial.iter().position(|row| row.contains("Clean up")).unwrap();
         for (index, (before, after)) in initial.iter().zip(clean_up.iter()).enumerate() {
             assert_eq!(

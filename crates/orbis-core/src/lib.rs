@@ -11,6 +11,7 @@ pub mod privilege;
 pub mod process;
 pub mod progress;
 pub mod providers;
+pub mod shell_history;
 pub mod transaction;
 
 use std::collections::BTreeSet;
