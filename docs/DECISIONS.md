@@ -18,8 +18,10 @@ parsed `apt-cache`/`apt-get -s` output; the question was whether to move to
 - `rust-apt` 0.11.x (volian): rich API (candidate/installed versions,
   `is_upgradable`, auto/garbage marks, hold marks, download/disk sizes,
   `get_changes`, resolver, origins) — functionally attractive.
-- **License:** `GPL-3.0-or-later`. Orbis is **MIT**. Linking the crate would
-  force relicensing the whole product. This alone blocks adoption today.
+- **License:** `GPL-3.0-or-later`. Orbis is MIT-only. Distributing Orbis
+  linked with rust-apt would require the combined work to satisfy
+  GPL-compatible distribution terms, which conflicts with Orbis's current
+  MIT-only distribution goal. This alone blocks adoption today.
 - **Build/runtime:** requires `libapt-pkg-dev` ≥ 2.0.2 (C++ build dep) and
   libapt linkage at runtime — heavier CI and release artifacts.
 - **Stability:** upstream states the API "is subject to change at any time"
