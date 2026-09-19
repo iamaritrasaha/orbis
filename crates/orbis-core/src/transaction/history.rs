@@ -282,10 +282,18 @@ impl HistoryStore {
     /// file cannot hide the rest of the history; the durable store itself is
     /// never modified by listing.
     pub fn entries(&self) -> Result<Vec<HistoryEntry>, String> {
+        Ok(self.entries_with_skipped()?.0)
+    }
+
+    /// Like [`entries`], but also reports how many `.json` record files
+    /// could not be read or parsed, so a listing can admit gaps honestly.
+    /// The count never exposes record contents.
+    pub fn entries_with_skipped(&self) -> Result<(Vec<HistoryEntry>, usize), String> {
         if !self.directory.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let mut entries = Vec::new();
+        let mut skipped = 0_usize;
         for item in fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
             let path = match item {
                 Ok(item) => item.path(),
@@ -294,10 +302,15 @@ impl HistoryStore {
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(body) = fs::read_to_string(&path) else { continue };
+            let Ok(body) = fs::read_to_string(&path) else {
+                skipped += 1;
+                continue;
+            };
+            let mut parsed = false;
             if let Ok(record) = serde_json::from_str::<MaintenanceRecord>(&body)
                 && record.plan.operation_id.starts_with("maint-")
             {
+                parsed = true;
                 let status = record.result.as_ref().map_or_else(
                     || "executing".into(),
                     |result| format!("{:?}", result.status).to_ascii_lowercase(),
@@ -317,10 +330,15 @@ impl HistoryStore {
                         result.providers.iter().find_map(|provider| provider.message.clone())
                     }),
                 });
-                continue;
             }
-            if let Ok(record) = serde_json::from_str::<TransactionRecord>(&body) {
-                let Some(plan) = record.resolved_plan() else { continue };
+            if !parsed
+                && let Ok(record) = serde_json::from_str::<TransactionRecord>(&body)
+            {
+                parsed = true;
+                let Some(plan) = record.resolved_plan() else {
+                    skipped += 1;
+                    continue;
+                };
                 let operation_id = plan.operation_id.clone();
                 let (status, verification, message) = match &record.result {
                     Some(result) => (
@@ -348,9 +366,12 @@ impl HistoryStore {
                     message,
                 });
             }
+            if !parsed {
+                skipped += 1;
+            }
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.recorded_at_unix_ms));
-        Ok(entries)
+        Ok((entries, skipped))
     }
 
     /// Reads a single sanitized record by its operation ID.
@@ -398,10 +419,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    #[test]
-    fn writes_structured_record_atomically_without_command_output() {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-        let directory = std::env::temp_dir().join(format!("orbis-history-test-{unique}"));
+    fn sample_transaction_record() -> TransactionRecord {
         let package = Package {
             source: PackageSource::Apt,
             provider_id: "btop".into(),
@@ -422,7 +440,7 @@ mod tests {
         plan.completeness = PlanCompleteness::Complete;
         plan.risk = crate::transaction::RiskLevel::Normal;
         let result = crate::transaction::TransactionResult {
-            plan,
+            plan: plan.clone(),
             execution: crate::transaction::ExecutionSummary {
                 exit_status: Some(0),
                 process_succeeded: true,
@@ -431,15 +449,20 @@ mod tests {
             verification: crate::transaction::VerificationResult::Verified,
             status: crate::transaction::TransactionStatus::Succeeded,
         };
-        let record = TransactionRecord::new(
-            OperationRequest {
-                action: OperationAction::Install,
-                package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
-                scope: Some(InstallScope::System),
-                channel: None,
-            },
-            result,
-        );
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Apt), query: "btop".into() },
+            scope: Some(InstallScope::System),
+            channel: None,
+        };
+        TransactionRecord::new(request, result)
+    }
+
+    #[test]
+    fn writes_structured_record_atomically_without_command_output() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let directory = std::env::temp_dir().join(format!("orbis-history-test-{unique}"));
+        let record = sample_transaction_record();
         let store = HistoryStore::at(&directory);
         let path = store.write(&record, "tx-test").expect("record writes");
         let body = fs::read_to_string(path).expect("record readable");
@@ -468,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn listing_skips_unreadable_and_corrupt_records() {
+    fn listing_skips_unreadable_and_corrupt_records_but_counts_them() {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
         let directory = std::env::temp_dir().join(format!("orbis-history-corrupt-{unique}"));
         let store = HistoryStore::at(&directory);
@@ -476,8 +499,22 @@ mod tests {
         fs::write(directory.join("tx-corrupt.json"), "{not json").expect("corrupt record");
         fs::write(directory.join("tx-empty.json"), "").expect("empty record");
         fs::write(directory.join("notes.txt"), "ignored").expect("non-record");
-        let entries = store.entries().expect("listing survives corrupt records");
+        let (entries, skipped) = store.entries_with_skipped().expect("listing survives corrupt records");
         assert!(entries.is_empty());
+        assert_eq!(skipped, 2, "exactly the two unreadable .json records are counted");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn healthy_records_leave_the_skipped_count_at_zero() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let directory = std::env::temp_dir().join(format!("orbis-history-healthy-{unique}"));
+        let record = sample_transaction_record();
+        let store = HistoryStore::at(&directory);
+        store.write(&record, "tx-healthy").expect("record writes");
+        let (entries, skipped) = store.entries_with_skipped().expect("listing");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(skipped, 0);
         let _ = fs::remove_dir_all(directory);
     }
 }

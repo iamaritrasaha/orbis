@@ -719,6 +719,14 @@ impl Renderer {
             + "\n"
     }
 
+    /// One-line admission that damaged history records were skipped, so the
+    /// listing never silently hides gaps. Never names the records.
+    pub(crate) fn history_skipped_note(&self, skipped: usize) -> String {
+        let noun = if skipped == 1 { "record" } else { "records" };
+        self.theme
+            .paint(&format!("{skipped} unreadable history {noun} skipped.\n"), Token::Muted)
+    }
+
     pub(crate) fn commands(
         &self,
         report: &orbis_core::shell_history::ShellHistoryReport,

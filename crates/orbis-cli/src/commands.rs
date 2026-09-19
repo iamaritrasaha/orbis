@@ -891,8 +891,8 @@ fn run_history(
             Ok(())
         }
     } else {
-        let entries = history
-            .entries()?
+        let (all_entries, skipped) = history.entries_with_skipped()?;
+        let entries = all_entries
             .into_iter()
             .filter(|entry| source.is_none_or(|wanted| entry.source == Some(wanted)))
             .take(limit)
@@ -900,7 +900,11 @@ fn run_history(
         if json {
             print_json(&entries)
         } else {
-            print!("{}", renderer.history(&entries, plain));
+            let mut output = renderer.history(&entries, plain);
+            if skipped > 0 {
+                output.push_str(&renderer.history_skipped_note(skipped));
+            }
+            print!("{output}");
             Ok(())
         }
     }
