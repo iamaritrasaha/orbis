@@ -1,13 +1,35 @@
 # Orbis current state
 
-Updated: 2026-09-22. Baseline: `0.1.0-beta.1.dev.18` final outcome-integrity
-correction on `flagship-dev18`. Not merged; no `dev.19`.
+Updated: 2026-09-22. Baseline: `0.1.0-beta.1.dev.18` terminal UX and
+outcome-integrity correction on `flagship-dev18`. Not merged; no `dev.19`.
 
 ## Version
 
 `0.1.0-beta.1.dev.18` (development line; no tag, no release, Beta 1 untouched).
 
 ## Completed work (this session)
+
+Terminal UX and zero-candidate update correction:
+
+- A complete, supported upgrade plan with zero candidates is now a successful
+  CLI no-op. It returns exit 0, emits a concise human result or structured JSON,
+  and stops before confirmation, administrator authorization, executor,
+  history, or operation-journal mutation. Blocked, unsupported, incomplete, or
+  candidate-bearing plans remain non-executable and fail closed.
+- Default plain output now uses a compact identity line (`◈ Orbis · Title`),
+  outcome-first wording, semantic marks, and whitespace hierarchy instead of
+  report cards, divider bars, repeated branding, and internal lifecycle rows.
+  Show, install/remove review and result, updates, activity, and health were
+  redesigned while diagnostic output retains IDs, raw typed commands,
+  verification, coverage, warnings, and evidence.
+- Transient progress owns one or two task-oriented lines and collapses into the
+  final result. The bare launcher is now a static compact summary; a real PTY
+  check showed no leading blank reservation and no blank footprint on exit.
+- Development self-update output distinguishes the current development build
+  from the published release and explains that self-update is disabled.
+- Descriptions and long package names wrap by terminal display width and break
+  long words safely at narrow widths. NO_COLOR, TERM=dumb, and non-TTY paths
+  remain deterministic and readable.
 
 Final outcome-integrity correction (four semantic defects fixed on top of the
 earlier dev.18 correction; no regressions to it):
@@ -87,11 +109,18 @@ outcomes**, not shell commands.
 - `cargo fmt --all -- --check` clean (after fmt).
 - `cargo check --workspace` clean.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- `cargo test --workspace`: 243 tests green (92 CLI + 151 core; was 233).
+- `cargo test --workspace`: 245 tests green (91 CLI + 154 core; was 243).
 - `cargo build --workspace --release` succeeds.
 - `git diff --check` clean.
-- Read-only host QA: `orbis health` renders tri-state dependency health; the
-  host's real `deinstall ok config-files` dpkg rows match the new parser.
+- Installed local binary with `cargo install --path crates/orbis-cli --locked
+  --force`; `$HOME/.cargo/bin/orbis --version` reports
+  `0.1.0-beta.1.dev.18`.
+- Read-only host QA completed for `orbis --version`, bare `orbis`, `show apt:sl`,
+  update inventory, activity, health, and self-update check. The current host's
+  APT index reports unknown freshness, so `orbis update --apply --source apt`
+  correctly stopped before confirmation/authorization/execution with no
+  journal mutation; a physically complete zero-candidate plan was not present
+  to exercise the success branch on this host.
 
 ## Known failures
 
@@ -104,20 +133,28 @@ limitations remain by design: Flatpak upgrades are not auto-executable; Cargo
 upgrade remains blocked; non-APT providers still use lighter verification
 than the APT vertical slice.
 
-## Manual QA remaining (needs a human; Orbis performed none of these)
+## Manual QA remaining (needs a human)
 
 ~~~bash
-orbis update --apply        # confirm one System updated journal entry + versions
-orbis install <pkg>         # confirm version-verified install outcome
-orbis remove <pkg>          # confirm removal verification
-orbis                       # launcher Recent activity / Needs attention
-orbis activity              # operation journal listing
-orbis health                # actionable system insight
+orbis                       # visually review compact PTY launcher and cleanup
+orbis show apt:sl           # compact show layout and natural wrapping
+orbis activity              # compact verified operation listing
+orbis health                # exceptions-first layout and unknown handling
+orbis self-update --check   # development-build wording
+orbis update --apply --source apt  # on a complete zero-candidate APT plan,
+                                   # confirm exit 0, no prompt, no sudo, and
+                                   # no activity/journal record
 ~~~
+
+No real package mutation or sudo was performed in this session. The earlier
+human-verified APT install/remove vertical slice remains the reference for
+mutation QA.
 
 ## Exact next step
 
-Deepen APT-only product usefulness before expanding providers: richer
+Have a human review the compact terminal surfaces in a real shell, then refine
+any remaining persistent TUI/detail-surface inconsistencies. After that,
+deepen APT-only product usefulness before expanding providers: richer
 post-upgrade change lists from dpkg logs when simulation candidates are empty,
 service restart observation, and optionally demote or hide shallow multi-provider
 surfaces that do not yet produce verified outcomes. Beta 2 remains a human

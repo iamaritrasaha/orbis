@@ -1362,7 +1362,7 @@ impl<'a> App<'a> {
         } else {
             match step {
                 AnimationStep::Diamond => "◇",
-                AnimationStep::Reveal => "◈ ORBIS",
+                AnimationStep::Reveal => self.theme.brand_compact(),
                 AnimationStep::Settled | AnimationStep::Finished => self.theme.brand_compact(),
             }
         };
@@ -3234,7 +3234,7 @@ mod tests {
         for (width, height) in [(121, 24), (80, 24), (100, 30), (140, 40)] {
             let content = render_at(width, height);
             let lines = render_lines(width, height, true);
-            assert!(content.contains("ORBIS"));
+            assert!(content.contains("Orbis"));
             assert!(content.contains("SYSTEM PULSE"));
             assert!(content.contains("FIND SOFTWARE"));
             assert!(content.contains("HEALTH"));
@@ -3250,7 +3250,7 @@ mod tests {
     #[test]
     fn dashboard_121x24_has_a_deliberate_full_height_composition() {
         let lines = render_lines(121, 24, true);
-        assert!(lines[0].contains("◈ ORBIS"));
+        assert!(lines[0].contains("◈ Orbis"));
         assert!(lines.iter().any(|line| line.contains("SYSTEM PULSE")));
         assert!(lines.iter().any(|line| line.contains("FIND SOFTWARE")));
         assert!(lines.iter().any(|line| line.contains("RECENT")));
@@ -3282,7 +3282,7 @@ mod tests {
     #[test]
     fn compact_80x24_uses_the_small_brand_and_keeps_footer_visible() {
         let lines = render_lines(80, 24, false);
-        assert!(lines[0].contains("* ORBIS"));
+        assert!(lines[0].contains("* Orbis"));
         assert!(lines.iter().any(|line| line.contains("SYSTEM PULSE")));
         assert!(lines.iter().any(|line| line.contains("FIND SOFTWARE")));
         assert!(lines[23].contains("/ Find"));
@@ -3303,7 +3303,7 @@ mod tests {
                 current_version: "0.1.0-beta.1.dev.12".into(),
                 available_version: Some("0.1.0-beta.1".into()),
                 installed_version: None,
-                message: "This is a development build. It will not replace itself.".into(),
+                message: "Self-update is disabled for development builds.".into(),
             });
             let mut terminal =
                 Terminal::new(TestBackend::new(width, height)).expect("test terminal");
@@ -3403,7 +3403,7 @@ mod tests {
                     "missing footer on {screen:?}\n{}",
                     lines.join("\n")
                 );
-                assert!(lines.iter().take(5).any(|line| line.contains("ORBIS")
+                assert!(lines.iter().take(5).any(|line| line.contains("Orbis")
                     || line.contains('◈')
                     || line.contains('█')));
             }
@@ -3544,7 +3544,7 @@ mod tests {
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
         assert!(content.contains("Checking software sources"));
         assert!(content.contains("Checking…"));
-        assert!(content.contains("◈ ORBIS"));
+        assert!(content.contains("◈ Orbis"));
     }
 
     #[test]
@@ -3697,7 +3697,7 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).expect("draw wordmark");
         let content_wm: String =
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
-        assert!(content_wm.contains("◈ ORBIS"));
+        assert!(content_wm.contains("◈ Orbis"));
 
         app.animation.set_elapsed_ms(650);
         terminal.draw(|frame| app.draw(frame)).expect("draw finished");

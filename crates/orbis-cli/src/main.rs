@@ -33,20 +33,11 @@ fn run() -> Result<(), String> {
     let renderer = Renderer::new(color);
     let registry = ProviderRegistry::system();
 
-    if !cli.json && !cli.plain {
-        if cli.command.is_none() {
-            render::transient::reveal(renderer.theme, "LAUNCHER");
-            let Some(command) = render::transient::launcher(renderer.theme)? else {
-                return Ok(());
-            };
-            if let Some(label) = render::transient::command_label(Some(&command)) {
-                render::transient::reveal(renderer.theme, label);
-            }
-            return commands::dispatch(Cli { command: Some(command), ..cli }, &registry, &renderer);
-        }
-        if let Some(label) = render::transient::command_label(cli.command.as_ref()) {
-            render::transient::reveal(renderer.theme, label);
-        }
+    if !cli.json && !cli.plain && cli.command.is_none() {
+        let Some(command) = render::transient::launcher(renderer.theme)? else {
+            return Ok(());
+        };
+        return commands::dispatch(Cli { command: Some(command), ..cli }, &registry, &renderer);
     }
     commands::dispatch(cli, &registry, &renderer)
 }

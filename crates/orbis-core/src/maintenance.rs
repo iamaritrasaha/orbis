@@ -262,6 +262,23 @@ impl MaintenancePlan {
     pub fn executable(&self) -> bool {
         self.executable_providers().next().is_some()
     }
+
+    /// Whether every selected provider fully answered an upgrade with no
+    /// candidates and no provider reported work.
+    ///
+    /// This is intentionally separate from [`Self::executable`]. An empty
+    /// upgrade must not cross the executor boundary just to produce a
+    /// successful no-op.
+    pub fn is_successful_upgrade_noop(&self) -> bool {
+        self.action == MaintenanceAction::Upgrade
+            && !self.providers.is_empty()
+            && self.providers.iter().all(|provider| {
+                provider.candidates.is_empty()
+                    && provider.supported
+                    && provider.completeness == PlanCompleteness::Complete
+                    && provider.risk != RiskLevel::Blocked
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -623,7 +640,60 @@ mod tests {
     fn upgrade_without_candidates_is_not_executable() {
         let mut plan = executable_plan(PackageSource::Snap, RiskLevel::Normal);
         plan.candidates.clear();
+        let coordinated =
+            MaintenancePlan::new(MaintenanceAction::Upgrade, Some(PackageSource::Snap), vec![plan]);
+        assert!(!coordinated.executable());
+        assert!(coordinated.is_successful_upgrade_noop());
+    }
+
+    #[test]
+    fn blocked_zero_candidate_plan_is_not_a_successful_noop() {
+        let plan = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            Some(PackageSource::Pipx),
+            vec![ProviderMaintenancePlan::blocked(
+                PackageSource::Pipx,
+                MaintenanceAction::Upgrade,
+                "pipx is unavailable",
+            )],
+        );
         assert!(!plan.executable());
+        assert!(!plan.is_successful_upgrade_noop());
+    }
+
+    #[test]
+    fn complete_provider_does_not_hide_blocked_zero_candidate_provider() {
+        let mut apt = executable_plan(PackageSource::Apt, RiskLevel::Normal);
+        apt.candidates.clear();
+        let plan = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            None,
+            vec![
+                apt,
+                ProviderMaintenancePlan::blocked(
+                    PackageSource::Pipx,
+                    MaintenanceAction::Upgrade,
+                    "pipx is unavailable",
+                ),
+            ],
+        );
+        assert!(!plan.is_successful_upgrade_noop());
+    }
+
+    #[test]
+    fn candidate_bearing_blocked_plan_is_not_a_successful_noop() {
+        let mut blocked = ProviderMaintenancePlan::blocked(
+            PackageSource::Pipx,
+            MaintenanceAction::Upgrade,
+            "pipx is unavailable",
+        );
+        blocked.candidates.push(candidate(PackageSource::Pipx, None, "tool"));
+        let plan = MaintenancePlan::new(
+            MaintenanceAction::Upgrade,
+            Some(PackageSource::Pipx),
+            vec![blocked],
+        );
+        assert!(!plan.is_successful_upgrade_noop());
     }
 
     #[test]
