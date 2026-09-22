@@ -507,6 +507,18 @@ pub struct TransactionResult {
     pub verification: VerificationResult,
     /// Final transaction status.
     pub status: TransactionStatus,
+    /// Observed package changes after verification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<crate::facts::PackageChange>,
+    /// Warnings such as reboot-required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// Structured failure diagnosis when status is Failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis: Option<crate::facts::FailureDiagnosis>,
+    /// Expandable raw command references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_commands: Vec<crate::facts::RawCommandRef>,
 }
 
 /// Transaction failures that prevent or invalidate an operation.

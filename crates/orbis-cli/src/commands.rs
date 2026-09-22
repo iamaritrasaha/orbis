@@ -67,10 +67,12 @@ pub(crate) fn dispatch(
         }
         Some(Command::Health) => {
             let report = registry.diagnostics(None).with_environment();
+            let pending = registry.updates(Some(orbis_core::models::PackageSource::Apt)).total();
+            let insight = orbis_core::system::system_insight(registry.runner(), Some(pending));
             if cli.json {
-                print_json(&report)
+                print_json(&serde_json::json!({"diagnostics": report, "insight": insight}))
             } else {
-                print!("{}", renderer.health(&report));
+                print!("{}", renderer.health(&report, &insight));
                 Ok(())
             }
         }
@@ -695,6 +697,10 @@ fn run_maintenance(
                     .max(provider_plan.cleanup_candidates.len()),
                 verification: None,
                 message: Some(error),
+                changes: Vec::new(),
+                warnings: Vec::new(),
+                diagnosis: None,
+                raw_commands: Vec::new(),
             }),
         }
     }
@@ -704,6 +710,40 @@ fn run_maintenance(
         status: maintenance_status(&providers),
         providers,
     };
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64);
+    // Prefer a single meaningful journal entry for the coordinated run.
+    if plan.mutates
+        && let Ok(journal) = orbis_core::operation::OperationJournal::default_location()
+    {
+        let changes = result
+            .providers
+            .iter()
+            .flat_map(|provider| provider.changes.iter().cloned())
+            .collect::<Vec<_>>();
+        let warnings = result
+            .providers
+            .iter()
+            .flat_map(|provider| provider.warnings.iter().cloned())
+            .collect::<Vec<_>>();
+        let diagnosis = result.providers.iter().find_map(|provider| provider.diagnosis.clone());
+        let raw_commands = result
+            .providers
+            .iter()
+            .flat_map(|provider| provider.raw_commands.iter().cloned())
+            .collect::<Vec<_>>();
+        let record = orbis_core::operation::from_maintenance(
+            &plan,
+            &result,
+            started_at.saturating_sub(1),
+            changes,
+            warnings,
+            diagnosis,
+            raw_commands,
+        );
+        let _ = journal.write(&record);
+    }
     let result_plans = plan.providers.clone();
     if let Some(history) = history {
         history
@@ -800,6 +840,10 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
                     .max(provider_plan.cleanup_candidates.len()),
                 verification: None,
                 message: Some(error),
+                changes: Vec::new(),
+                warnings: Vec::new(),
+                diagnosis: None,
+                raw_commands: Vec::new(),
             }),
         }
     }
@@ -809,6 +853,36 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
         status: maintenance_status(&providers),
         providers,
     };
+    if plan.mutates
+        && let Ok(journal) = orbis_core::operation::OperationJournal::default_location()
+    {
+        let changes = result
+            .providers
+            .iter()
+            .flat_map(|provider| provider.changes.iter().cloned())
+            .collect::<Vec<_>>();
+        let warnings = result
+            .providers
+            .iter()
+            .flat_map(|provider| provider.warnings.iter().cloned())
+            .collect::<Vec<_>>();
+        let diagnosis = result.providers.iter().find_map(|provider| provider.diagnosis.clone());
+        let raw_commands = result
+            .providers
+            .iter()
+            .flat_map(|provider| provider.raw_commands.iter().cloned())
+            .collect::<Vec<_>>();
+        let record = orbis_core::operation::from_maintenance(
+            &plan,
+            &result,
+            0,
+            changes,
+            warnings,
+            diagnosis,
+            raw_commands,
+        );
+        let _ = journal.write(&record);
+    }
     if let Some(history) = history {
         history
             .write_maintenance(
@@ -836,6 +910,10 @@ fn skipped_provider(
             (warning.level == orbis_core::transaction::WarningLevel::Blocked)
                 .then(|| warning.message.clone())
         }),
+        changes: Vec::new(),
+        warnings: Vec::new(),
+        diagnosis: None,
+        raw_commands: Vec::new(),
     }
 }
 fn maintenance_status(results: &[MaintenanceProviderResult]) -> MaintenanceStatus {
@@ -879,9 +957,21 @@ fn run_history(
     limit: usize,
     source: Option<PackageSource>,
 ) -> Result<(), String> {
-    let history = orbis_core::transaction::history::HistoryStore::default_location()
-        .map_err(|e| format!("could not open history: {e}"))?;
+    // Prefer the Orbis operation journal (meaningful outcomes). Fall back to
+    // legacy transaction history when the journal is empty or for exact IDs
+    // that only exist there.
     if let Some(id) = operation_id {
+        if let Ok(journal) = orbis_core::operation::OperationJournal::default_location()
+            && let Ok(Some(record)) = journal.get(&id)
+        {
+            if json {
+                return print_json(&record);
+            }
+            print!("{}", renderer.activity(&[record], plain));
+            return Ok(());
+        }
+        let history = orbis_core::transaction::history::HistoryStore::default_location()
+            .map_err(|e| format!("could not open history: {e}"))?;
         let entry =
             history.entry(&id)?.ok_or_else(|| format!("history operation {id} was not found"))?;
         if json {
@@ -890,7 +980,45 @@ fn run_history(
             print!("{}", renderer.history_entry(&entry));
             Ok(())
         }
+    } else if let Ok(journal) = orbis_core::operation::OperationJournal::default_location() {
+        let (mut records, skipped) = journal.recent(limit.max(50))?;
+        if let Some(wanted) = source {
+            records.retain(|record| record.source == Some(wanted));
+        }
+        records.truncate(limit);
+        if !records.is_empty() || skipped > 0 {
+            if json {
+                return print_json(&records);
+            }
+            let mut output = renderer.activity(&records, plain);
+            if skipped > 0 {
+                output.push_str(&renderer.history_skipped_note(skipped));
+            }
+            print!("{output}");
+            return Ok(());
+        }
+        // Empty journal: fall through to legacy transaction history.
+        let history = orbis_core::transaction::history::HistoryStore::default_location()
+            .map_err(|e| format!("could not open history: {e}"))?;
+        let (all_entries, skipped) = history.entries_with_skipped()?;
+        let entries = all_entries
+            .into_iter()
+            .filter(|entry| source.is_none_or(|wanted| entry.source == Some(wanted)))
+            .take(limit)
+            .collect::<Vec<_>>();
+        if json {
+            print_json(&entries)
+        } else {
+            let mut output = renderer.history(&entries, plain);
+            if skipped > 0 {
+                output.push_str(&renderer.history_skipped_note(skipped));
+            }
+            print!("{output}");
+            Ok(())
+        }
     } else {
+        let history = orbis_core::transaction::history::HistoryStore::default_location()
+            .map_err(|e| format!("could not open history: {e}"))?;
         let (all_entries, skipped) = history.entries_with_skipped()?;
         let entries = all_entries
             .into_iter()

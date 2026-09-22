@@ -3,15 +3,20 @@
 
 //! The provider-neutral, read-only foundation of Orbis.
 
+pub mod apt_ops;
 pub mod diagnostics;
 pub mod explain;
+pub mod facts;
 pub mod maintenance;
 pub mod models;
+pub mod operation;
+pub mod outcome;
 pub mod privilege;
 pub mod process;
 pub mod progress;
 pub mod providers;
 pub mod shell_history;
+pub mod system;
 pub mod transaction;
 
 use std::collections::BTreeSet;
@@ -227,50 +232,76 @@ impl ProviderRegistry {
                 return Err(error.into());
             }
         };
-        let execution = ExecutionSummary {
-            exit_status: output.status,
-            process_succeeded: output.success(),
-            message: (!output.success())
-                .then(|| transaction::safe_process_message(&output))
-                .flatten(),
-        };
-        if !output.success() {
-            observer.on_event(&progress::OperationEvent::ProviderFinished {
-                source: plan.target.source,
-                success: false,
-            });
-            return Ok(TransactionResult {
-                plan,
-                execution,
-                verification: VerificationResult::Failed,
-                status: TransactionStatus::Failed,
-            });
-        }
-
         observer.on_event(&progress::OperationEvent::StageChanged {
             stage: progress::ExecutionStage::Verifying,
         });
 
-        let verification = match provider.verify_transaction(&plan) {
-            Ok(verification) => verification,
-            Err(error) => {
-                observer.on_event(&progress::OperationEvent::ProviderFinished {
-                    source: plan.target.source,
-                    success: false,
-                });
-                return Err(error);
+        // APT uses structured observation + diagnosis. Other providers keep
+        // their installed-state verification, then attach empty outcome fields.
+        let observed = if plan.target.source == PackageSource::Apt {
+            crate::outcome::observe_transaction(self.runner.clone(), &plan, &output, &operation)
+        } else if output.success() {
+            match provider.verify_transaction(&plan) {
+                Ok(verification) => crate::outcome::ObservedOutcome {
+                    verification,
+                    checks: vec!["Provider installed-state verification".into()],
+                    ..crate::outcome::ObservedOutcome::default()
+                },
+                Err(error) => {
+                    observer.on_event(&progress::OperationEvent::ProviderFinished {
+                        source: plan.target.source,
+                        success: false,
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            crate::outcome::ObservedOutcome {
+                verification: VerificationResult::Failed,
+                diagnosis: Some(crate::facts::FailureDiagnosis {
+                    cause: crate::facts::FailureCause::Unknown,
+                    summary: "Provider command failed.".into(),
+                    hint: transaction::safe_process_message(&output),
+                }),
+                ..crate::outcome::ObservedOutcome::default()
             }
         };
-        let status = match verification {
-            VerificationResult::Verified => TransactionStatus::Succeeded,
-            VerificationResult::PartiallyVerified => TransactionStatus::PartiallyVerified,
-            VerificationResult::Failed => TransactionStatus::Failed,
+
+        let verification = observed.verification;
+        let status = match (output.success(), verification) {
+            (false, _) | (_, VerificationResult::Failed) => TransactionStatus::Failed,
+            (true, VerificationResult::Verified) => TransactionStatus::Succeeded,
+            (true, VerificationResult::PartiallyVerified) => TransactionStatus::PartiallyVerified,
+        };
+        // Never report completed when verification failed.
+        let status = if matches!(verification, VerificationResult::Failed) {
+            TransactionStatus::Failed
+        } else {
+            status
+        };
+        let message =
+            observed.diagnosis.as_ref().map(|diagnosis| diagnosis.summary.clone()).or_else(|| {
+                (!output.success()).then(|| transaction::safe_process_message(&output)).flatten()
+            });
+        let execution = ExecutionSummary {
+            exit_status: output.status,
+            process_succeeded: output.success(),
+            message,
         };
         observer.on_event(&progress::OperationEvent::ProviderFinished {
             source: plan.target.source,
             success: status != TransactionStatus::Failed,
         });
-        Ok(TransactionResult { plan, execution, verification, status })
+        Ok(TransactionResult {
+            plan,
+            execution,
+            verification,
+            status,
+            changes: observed.changes,
+            warnings: observed.warnings,
+            diagnosis: observed.diagnosis,
+            raw_commands: observed.raw_commands,
+        })
     }
 
     /// Writes an executing record before invoking a typed mutation, then atomically replaces it
@@ -328,6 +359,24 @@ impl ProviderRegistry {
             )
             .map_err(TransactionError::History)?;
 
+        let journal = operation_journal_for_history(history);
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64);
+        let _ = journal.write(&operation::running(
+            &operation_id,
+            operation::type_for_plan(&plan),
+            match request.action {
+                transaction::OperationAction::Install => {
+                    format!("Install {}", request.package.query)
+                }
+                transaction::OperationAction::Remove => {
+                    format!("Remove {}", request.package.query)
+                }
+            },
+            Some(plan.target.source),
+        ));
+
         match self.execute_transaction_with_observer(plan.clone(), executor, observer) {
             Ok(result) => {
                 observer.on_event(&progress::OperationEvent::StageChanged {
@@ -342,6 +391,17 @@ impl ProviderRegistry {
                         &operation_id,
                     )
                     .map_err(TransactionError::History)?;
+
+                let record = operation::from_transaction(
+                    request,
+                    &result,
+                    started_at,
+                    result.changes.clone(),
+                    result.warnings.clone(),
+                    result.diagnosis.clone(),
+                    result.raw_commands.clone(),
+                );
+                let _ = journal.write(&record);
 
                 let final_stage = if result.status == TransactionStatus::Failed {
                     progress::ExecutionStage::Failed
@@ -368,11 +428,28 @@ impl ProviderRegistry {
                     },
                     verification: VerificationResult::Failed,
                     status: TransactionStatus::Failed,
+                    changes: Vec::new(),
+                    warnings: Vec::new(),
+                    diagnosis: None,
+                    raw_commands: Vec::new(),
                 };
                 let _ = history.write(
-                    &transaction::history::TransactionRecord::completed(request.clone(), failed),
+                    &transaction::history::TransactionRecord::completed(
+                        request.clone(),
+                        failed.clone(),
+                    ),
                     &operation_id,
                 );
+                let record = operation::from_transaction(
+                    request,
+                    &failed,
+                    started_at,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                );
+                let _ = journal.write(&record);
                 observer.on_event(&progress::OperationEvent::Finished {
                     stage: progress::ExecutionStage::Failed,
                     message: Some(error.to_string()),
@@ -647,6 +724,10 @@ impl ProviderRegistry {
                     candidate_count: 0,
                     verification: Some(transaction::VerificationResult::Verified),
                     message: plan.notes.first().cloned(),
+                    changes: Vec::new(),
+                    warnings: Vec::new(),
+                    diagnosis: None,
+                    raw_commands: Vec::new(),
                 }],
             });
         }
@@ -712,7 +793,24 @@ impl ProviderRegistry {
             }
         };
         if !output.success() {
-            let msg = transaction::safe_process_message(&output);
+            let observed = if plan.source == PackageSource::Apt {
+                crate::outcome::observe_apt_maintenance(self.runner.clone(), plan, &output, 0)
+            } else {
+                crate::outcome::ObservedOutcome {
+                    verification: VerificationResult::Failed,
+                    diagnosis: Some(crate::facts::FailureDiagnosis {
+                        cause: crate::facts::FailureCause::Unknown,
+                        summary: "Maintenance command failed.".into(),
+                        hint: transaction::safe_process_message(&output),
+                    }),
+                    ..crate::outcome::ObservedOutcome::default()
+                }
+            };
+            let msg = observed
+                .diagnosis
+                .as_ref()
+                .map(|diagnosis| diagnosis.summary.clone())
+                .or_else(|| transaction::safe_process_message(&output));
             observer.on_event(&progress::OperationEvent::StageChanged {
                 stage: progress::ExecutionStage::SavingResult,
             });
@@ -736,6 +834,10 @@ impl ProviderRegistry {
                     candidate_count: plan.candidates.len().max(plan.cleanup_candidates.len()),
                     verification: Some(transaction::VerificationResult::Failed),
                     message: msg,
+                    changes: observed.changes,
+                    warnings: observed.warnings,
+                    diagnosis: observed.diagnosis,
+                    raw_commands: observed.raw_commands,
                 }],
             });
         }
@@ -744,7 +846,7 @@ impl ProviderRegistry {
             stage: progress::ExecutionStage::Verifying,
         });
 
-        let verification = match provider.verify_maintenance(plan) {
+        let remaining = match provider.verify_maintenance(plan) {
             Ok(verification) => verification,
             Err(error) => {
                 observer.on_event(&progress::OperationEvent::StageChanged {
@@ -762,6 +864,37 @@ impl ProviderRegistry {
                 return Err(error.to_string());
             }
         };
+
+        let observed = if plan.source == PackageSource::Apt {
+            let remaining_count = match remaining {
+                transaction::VerificationResult::Verified => 0,
+                _ => plan.candidates.len().max(1),
+            };
+            // For upgrades, re-count remaining candidates when verification is partial.
+            let remaining_count = if plan.action == MaintenanceAction::Upgrade
+                && remaining != transaction::VerificationResult::Verified
+            {
+                provider
+                    .update_inventory()
+                    .map(|inventory| inventory.candidates.len())
+                    .unwrap_or(remaining_count)
+            } else {
+                remaining_count
+            };
+            crate::outcome::observe_apt_maintenance(
+                self.runner.clone(),
+                plan,
+                &output,
+                remaining_count,
+            )
+        } else {
+            crate::outcome::ObservedOutcome {
+                verification: remaining,
+                ..crate::outcome::ObservedOutcome::default()
+            }
+        };
+
+        let verification = observed.verification;
         let provider_status = match verification {
             transaction::VerificationResult::Verified => {
                 maintenance::MaintenanceProviderStatus::Succeeded
@@ -792,9 +925,10 @@ impl ProviderRegistry {
         } else {
             progress::ExecutionStage::Completed
         };
+        let finish_message = observed.diagnosis.as_ref().map(|d| d.summary.clone());
         observer.on_event(&progress::OperationEvent::Finished {
             stage: final_stage,
-            message: None,
+            message: finish_message.clone(),
             operation_id: plan.operation_id.clone(),
         });
         observer.on_event(&progress::OperationEvent::ProviderFinished {
@@ -812,7 +946,11 @@ impl ProviderRegistry {
                 status: provider_status,
                 candidate_count: plan.candidates.len().max(plan.cleanup_candidates.len()),
                 verification: Some(verification),
-                message: None,
+                message: finish_message.or(observed.warnings.first().cloned()),
+                changes: observed.changes,
+                warnings: observed.warnings,
+                diagnosis: observed.diagnosis,
+                raw_commands: observed.raw_commands,
             }],
         })
     }
@@ -837,6 +975,19 @@ impl ProviderRegistry {
                 provider
             })
             .collect()
+    }
+}
+
+/// Places the operation journal beside the transaction history store so tests
+/// that inject a temporary history directory never pollute the real XDG journal.
+fn operation_journal_for_history(
+    history: &transaction::history::HistoryStore,
+) -> operation::OperationJournal {
+    let directory = history.directory();
+    if directory.file_name().and_then(|name| name.to_str()) == Some("transactions") {
+        operation::OperationJournal::at(directory.with_file_name("operations"))
+    } else {
+        operation::OperationJournal::at(directory.join("operations"))
     }
 }
 

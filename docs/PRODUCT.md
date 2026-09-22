@@ -33,7 +33,9 @@ software on Linux across the systems already trusted by the machine.
    confirmation semantics (`Y/n`; literal `YES` for high-impact).
 6. **Narrow privilege.** Administrator authorization only when the selected
    operation requires it; developer ecosystems are never elevated.
-7. **Durable history.** Sanitized records under `$XDG_STATE_HOME/orbis`.
+7. **Durable operation journal.** Meaningful system outcomes under
+   `$XDG_STATE_HOME/orbis/operations` (with legacy transaction records retained).
+   Shell history is supplementary evidence only, never the primary activity model.
 8. **Deterministic output.** Plain and JSON modes are stable, ANSI-free, and
    script-safe. `NO_COLOR`, `REDUCE_MOTION`, `TERM=dumb`, and non-TTY
    environments degrade cleanly.
@@ -46,11 +48,12 @@ software on Linux across the systems already trusted by the machine.
 ## Command language
 
 Everyday: `orbis` (launcher) · `find` · `show` · `install` · `remove` ·
-`update` (read-only) · `update --apply` · `refresh` · `clean` · `history` ·
-`commands` · `health` · `self-update` · `ui`.
+`update` (read-only) · `update --apply` · `refresh` · `clean` · `history` /
+`activity` · `health` · `self-update` · `ui`.
 
 Advanced/compatibility: `search`, `info`, `explain`, `updates`, `doctor`,
-`upgrade`, `sources`, `why`, `dashboard`.
+`upgrade`, `sources`, `why`, `commands` (local shell-history insights),
+`dashboard`.
 
 `update` is a read-only check by default; mutation requires `--apply` or an
 explicit plan flag. This asymmetry is intentional and documented in

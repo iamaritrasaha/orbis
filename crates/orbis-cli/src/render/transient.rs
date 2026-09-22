@@ -129,22 +129,21 @@ impl Drop for RawModeGuard {
 /// Runs the bare-command launcher. None means cancel or a non-interactive
 /// caller; the caller can then return without entering a persistent screen.
 pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
-    // Recent commands come from a bounded tail of local shell history only.
-    // The read, sanitization, and counting are bounded tens-of-milliseconds
-    // work regardless of history size; provider and network queries are
-    // deliberately never started here so the launcher appears instantly.
-    let recent = recent_commands();
+    // Attention + recent activity come from the Orbis operation journal and a
+    // cheap reboot-required flag check. Provider inventories never start here.
+    let activity = recent_activity();
+    let attention = orbis_core::system::launcher_insight(&activity).attention;
     if !terminal_capable() {
-        print!("{}", launcher_text_compact(theme, 0, &recent));
+        print!("{}", launcher_text_compact(theme, 0, &attention, &activity));
         return Ok(None);
     }
 
     let mut selected = 0usize;
-    let region = TransientRegion::new(launcher_rows(theme, selected, &recent).len());
+    let region = TransientRegion::new(launcher_rows(theme, selected, &attention, &activity).len());
     let mut stdout = io::stdout();
     region.reserve(&mut stdout).map_err(|error| error.to_string())?;
     region
-        .render(&mut stdout, &launcher_rows(theme, selected, &recent))
+        .render(&mut stdout, &launcher_rows(theme, selected, &attention, &activity))
         .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())?;
     let raw_guard = RawModeGuard::try_new()?;
@@ -169,7 +168,7 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
             _ => {}
         }
         if changed {
-            redraw_launcher(&region, theme, selected, &recent)?;
+            redraw_launcher(&region, theme, selected, &attention, &activity)?;
         }
     })();
     drop(raw_guard);
@@ -181,24 +180,9 @@ pub(crate) fn launcher(theme: Theme) -> Result<Option<Command>, String> {
     Ok(Some(command_for_selection(selected)?))
 }
 
-/// Top sanitized signatures from a bounded recent tail of shell history for
-/// the launcher footer. Never returns raw arguments; empty when disabled or
-/// unavailable. The counts describe only the sampled recent window, which is
-/// why the section is labeled "Recent commands", not all-time frequency.
-pub(crate) fn recent_commands() -> Vec<(String, u64)> {
-    if !orbis_core::shell_history::insights_enabled() {
-        return Vec::new();
-    }
-    let source = orbis_core::shell_history::BashHistorySource::from_environment();
-    orbis_core::shell_history::analyze_recent(
-        &source,
-        orbis_core::shell_history::LAUNCHER_HISTORY_TAIL_BYTES,
-        3,
-    )
-    .map(|report| {
-        report.insights.into_iter().map(|insight| (insight.signature, insight.count)).collect()
-    })
-    .unwrap_or_default()
+/// Recent Orbis operations for the launcher footer. Never shell-history noise.
+pub(crate) fn recent_activity() -> Vec<orbis_core::operation::OperationRecord> {
+    orbis_core::system::recent_activity(3)
 }
 
 fn command_for_selection(selected: usize) -> Result<Command, String> {
@@ -228,23 +212,29 @@ fn redraw_launcher(
     region: &TransientRegion,
     theme: Theme,
     selected: usize,
-    frequent: &[(String, u64)],
+    attention: &[orbis_core::system::AttentionItem],
+    activity: &[orbis_core::operation::OperationRecord],
 ) -> Result<(), String> {
     let mut stdout = io::stdout();
     region
-        .render(&mut stdout, &launcher_rows(theme, selected, frequent))
+        .render(&mut stdout, &launcher_rows(theme, selected, attention, activity))
         .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 pub(crate) fn launcher_text(theme: Theme, selected: usize) -> String {
-    let mut output = launcher_rows(theme, selected, &[]).join("\n");
+    let mut output = launcher_rows(theme, selected, &[], &[]).join("\n");
     output.push('\n');
     output
 }
 
-fn launcher_rows(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> Vec<String> {
+fn launcher_rows(
+    theme: Theme,
+    selected: usize,
+    attention: &[orbis_core::system::AttentionItem],
+    activity: &[orbis_core::operation::OperationRecord],
+) -> Vec<String> {
     let mut rows = BrandFrame::settled(theme, IdentityMode::Launcher).lines().to_vec();
     rows.push(String::new());
     for (index, option) in LAUNCHER_OPTIONS.iter().enumerate() {
@@ -256,15 +246,26 @@ fn launcher_rows(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> V
             theme.paint(option, token)
         ));
     }
-    if !frequent.is_empty() {
+    if !attention.is_empty() {
         rows.push(String::new());
-        rows.push(format!("  {}", theme.paint("Recent commands", Token::Muted)));
-        for (signature, count) in frequent {
-            rows.push(format!(
-                "  {}  {}",
-                theme.paint(signature, Token::Foreground),
-                theme.paint(count.to_string().as_str(), Token::Muted)
-            ));
+        rows.push(format!("  {}", theme.paint("Needs attention", Token::Muted)));
+        for item in attention.iter().take(3) {
+            let token = match item.severity {
+                orbis_core::system::AttentionSeverity::Critical => Token::Destructive,
+                orbis_core::system::AttentionSeverity::Caution => Token::Caution,
+                orbis_core::system::AttentionSeverity::Info => Token::Foreground,
+            };
+            rows.push(format!("  {}", theme.paint(&item.title, token)));
+        }
+    }
+    if !activity.is_empty() {
+        rows.push(String::new());
+        rows.push(format!("  {}", theme.paint("Recent activity", Token::Muted)));
+        for record in activity.iter().take(3) {
+            rows.push(format!("  {}", theme.paint(&record.activity_title(), Token::Foreground)));
+            if let Some(detail) = record.activity_details().first() {
+                rows.push(format!("    {}", theme.paint(detail, Token::Muted)));
+            }
         }
     }
     let controls = if theme.unicode {
@@ -277,7 +278,12 @@ fn launcher_rows(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> V
     rows
 }
 
-fn launcher_text_compact(theme: Theme, selected: usize, frequent: &[(String, u64)]) -> String {
+fn launcher_text_compact(
+    theme: Theme,
+    selected: usize,
+    attention: &[orbis_core::system::AttentionItem],
+    activity: &[orbis_core::operation::OperationRecord],
+) -> String {
     let mut output = format!(
         "{}\n  {}\n\n",
         theme.paint(theme.brand_compact(), Token::Primary),
@@ -292,14 +298,16 @@ fn launcher_text_compact(theme: Theme, selected: usize, frequent: &[(String, u64
             theme.paint(option, token)
         ));
     }
-    if !frequent.is_empty() {
-        output.push_str(&format!("\n  {}\n", theme.paint("Recent commands", Token::Muted)));
-        for (signature, count) in frequent {
-            output.push_str(&format!(
-                "  {}  {}\n",
-                theme.paint(signature, Token::Foreground),
-                theme.paint(count.to_string().as_str(), Token::Muted)
-            ));
+    if !attention.is_empty() {
+        output.push_str(&format!("\n  {}\n", theme.paint("Needs attention", Token::Muted)));
+        for item in attention.iter().take(3) {
+            output.push_str(&format!("  {}\n", item.title));
+        }
+    }
+    if !activity.is_empty() {
+        output.push_str(&format!("\n  {}\n", theme.paint("Recent activity", Token::Muted)));
+        for record in activity.iter().take(3) {
+            output.push_str(&format!("  {}\n", record.activity_title()));
         }
     }
     output.push_str("\n  j/k move  Enter choose  q cancel\n");
@@ -334,36 +342,44 @@ mod tests {
     }
 
     #[test]
-    fn frequent_commands_section_is_sanitized_and_optional() {
+    fn recent_activity_section_is_outcome_oriented() {
+        use orbis_core::operation::{OperationStatus, OperationType, running};
+
         let theme = Theme::test(80);
-        let plain = launcher_rows(theme, 0, &[]);
+        let plain = launcher_rows(theme, 0, &[], &[]);
+        assert!(!plain.iter().any(|row| row.contains("Recent activity")));
         assert!(!plain.iter().any(|row| row.contains("Recent commands")));
 
-        let frequent = vec![("git status".to_owned(), 184_u64), ("cargo test".to_owned(), 92_u64)];
-        let rows = launcher_rows(theme, 0, &frequent);
-        assert_eq!(rows.len(), plain.len() + 4, "one label row, two entries, one spacer");
-        assert!(rows.iter().any(|row| row.contains("Recent commands")));
-        assert!(rows.iter().any(|row| row.contains("git status") && row.contains("184")));
-        assert!(rows.iter().any(|row| row.contains("cargo test") && row.contains("92")));
-        // Only the two passed signatures appear as command content.
-        assert_eq!(rows.iter().filter(|row| row.contains("184")).count(), 1);
-        assert_eq!(rows.iter().filter(|row| row.contains("92")).count(), 1);
+        let mut record = running("tx-demo", OperationType::SystemUpdate, "Update the system", None);
+        record.status = OperationStatus::Succeeded;
+        record.summary = "18 packages upgraded".into();
+        record.changes = vec![orbis_core::facts::PackageChange {
+            package_id: "openssl".into(),
+            name: Some("openssl".into()),
+            kind: orbis_core::facts::ChangeKind::Upgraded,
+            from_version: Some("1".into()),
+            to_version: Some("3".into()),
+        }];
+        let rows = launcher_rows(theme, 0, &[], &[record]);
+        assert!(rows.iter().any(|row| row.contains("Recent activity")));
+        assert!(rows.iter().any(|row| row.contains("System updated")));
+        assert!(!rows.iter().any(|row| row.contains("Recent commands")));
     }
 
     #[test]
     fn launcher_navigation_reuses_one_fixed_frame() {
         let theme = Theme::test(80);
-        let initial = launcher_rows(theme, 0, &[]);
+        let initial = launcher_rows(theme, 0, &[], &[]);
         assert_eq!(initial.len(), 17);
 
         for selected in 0..=4 {
-            let rows = launcher_rows(theme, selected, &[]);
+            let rows = launcher_rows(theme, selected, &[], &[]);
             assert_eq!(rows.len(), initial.len());
             assert_eq!(rows.iter().filter(|row| row.contains("Find software")).count(), 1);
             assert_eq!(rows.iter().filter(|row| row.contains("Clean up")).count(), 1);
         }
 
-        let clean_up = launcher_rows(theme, 4, &[]);
+        let clean_up = launcher_rows(theme, 4, &[], &[]);
         let clean_up_index = initial.iter().position(|row| row.contains("Clean up")).unwrap();
         for (index, (before, after)) in initial.iter().zip(clean_up.iter()).enumerate() {
             assert_eq!(

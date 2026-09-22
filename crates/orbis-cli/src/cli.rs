@@ -163,7 +163,8 @@ pub(crate) enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Read Orbis transaction and maintenance history.
+    /// Read Orbis operation activity (alias: activity).
+    #[command(aliases = ["activity"])]
     History {
         /// Show one exact operation ID instead of the recent list.
         operation_id: Option<String>,

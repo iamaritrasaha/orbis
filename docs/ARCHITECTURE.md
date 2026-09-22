@@ -13,6 +13,9 @@ orbis-cli
 orbis-core
   discovery and resolution
   normalized models
+  operation journal (outcomes)
+  APT observation / failure diagnosis
+  actionable system insight
   deterministic explanations
   diagnostics
   provider contract
@@ -20,10 +23,25 @@ orbis-core
   typed transaction plans
   normalized maintenance plans
   narrow privilege boundary
-  XDG transaction and maintenance history
+  XDG transaction history (legacy) + operations journal
         |
-  APT/Nala | Flatpak | Snap | Cargo | npm | pnpm | uv tool | pipx
+  APT (primary verified vertical slice) | Flatpak | Snap | Cargo | npm | pnpm | uv tool | pipx
 ~~~
+
+Provider execution is followed by scoped observation. For APT, observation
+checks installed versions, reboot-required, and dependency health, and
+classifies common failures. Results distinguish succeeded, partially verified,
+and failed; failed verification never becomes a successful journal status. After
+confirmation, Orbis writes an executing record, then atomically replaces it with
+the verified outcome under `$XDG_STATE_HOME/orbis/operations` (and the legacy
+transactions directory for compatibility).
+
+## Shell-history insights (demoted)
+
+`orbis commands` remains a local-only shell-history sanitizer for power users.
+It is **not** the launcher "Recent activity" model and is not treated as a
+record of system changes. The bare launcher shows operation-journal activity
+and cheap attention signals (reboot flag, recent failed operations) only.
 
 ## Provider boundary
 
@@ -68,7 +86,14 @@ The transaction planner produces a typed `ProviderOperation`, never an arbitrary
 
 APT planning invokes `apt-get -s -o Debug::NoLocking=true` with `LC_ALL=C` and `DEBIAN_FRONTEND=noninteractive` scoped to that process. The parser normalizes install/remove/configure lines and blocks plans that report additional removals. Flatpak planning uses read-only `remote-info` and scoped installed listings; it is marked partial because runtimes and extensions may be resolved at commit. Snap planning uses `snap info`, defaults to latest/stable when no channel is supplied, and is marked partial because Snap has no equivalent no-action impact simulation.
 
-Provider execution is followed by a scoped installed-state check. Results distinguish succeeded, partially verified, and failed. After confirmation, the core writes an `executing` record before invoking the provider operation, then atomically replaces the same operation ID with the final sanitized result under `$XDG_STATE_HOME/orbis/transactions`, falling back to `$HOME/.local/state/orbis/transactions`.
+Provider execution is followed by scoped observation. For APT, observation
+checks installed versions via `dpkg-query`, reboot-required flags, and
+dependency health, and classifies common failure causes. Results distinguish
+succeeded, partially verified, and failed; failed verification never becomes a
+successful journal status. After confirmation, Orbis writes an executing record,
+then atomically replaces it with the verified outcome under
+`$XDG_STATE_HOME/orbis/operations` (legacy `$XDG_STATE_HOME/orbis/transactions`
+records are still written for compatibility).
 
 ## Orbis Brief
 
@@ -102,26 +127,10 @@ The dashboard creates bounded, read-only standard-thread workers for source snap
 
 Milestones 3 and 4 add update inventories, coordinated upgrade and cleanup plans, history queries, provider-specific explanation evidence, and user-wide developer-tool coverage. Flatpak remote configuration, Snap retention, package indexes, developer-tool configuration, project manifests, and package-manager cleanup are never changed by planning. Privilege is requested only after an exact administrator-scoped maintenance plan is confirmed; Cargo, npm, pnpm, uv, and pipx operations never request it.
 
-## Shell-history insights
+## Shell-history insights (power-user only)
 
-`orbis-core::shell_history` is a read-only, local-only subsystem. A
-`ShellHistorySource` (Bash today) resolves the history file conservatively —
-`ORBIS_BASH_HISTFILE`, then `$HISTFILE` only with Bash evidence under the
-user's home (zsh/fish-named files are rejected outright), then
-`~/.bash_history` — and parses
-entries — `#<epoch>` lines are metadata, backslash continuations join — and
-`sanitize::sanitize_command` reduces each entry to a safe signature: the
-executable and, when provably safe, one benign subcommand. Paths, URLs,
-option values, credentials, and composite lines never appear; uncertain input
-degrades to the executable alone. `orbis commands` renders human or JSON
-output; nothing is persisted, transmitted, or merged with transaction
-history, and `ORBIS_HISTORY_INSIGHTS=off` disables the feature entirely. The
-bare launcher reuses the same sanitizer for at most three signatures drawn
-from a bounded recent tail of the history file (256 KiB), labeled "Recent
-commands" because the counts describe that sampled window only; the read is
-bounded so pathological history sizes never stall startup. `orbis commands`
-keeps the complete scan.
-
-See `docs/DECISIONS.md` for the APT backend decision (ADR-001), the
-read-only `update` semantics (ADR-002), the shell-history privacy design
-(ADR-003), and the provider capability matrix.
+`orbis-core::shell_history` remains a read-only, local-only subsystem for
+`orbis commands`. It is not the activity model. The bare launcher shows
+operation-journal Recent Activity and cheap attention signals instead of
+sanitized shell signatures. See the demoted note near the top of this file
+and ADR-003 for the privacy contract.
