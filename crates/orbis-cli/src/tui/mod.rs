@@ -3627,6 +3627,10 @@ mod tests {
             },
             verification: orbis_core::transaction::VerificationResult::Verified,
             status: orbis_core::transaction::TransactionStatus::Succeeded,
+            changes: Vec::new(),
+            warnings: Vec::new(),
+            diagnosis: None,
+            raw_commands: Vec::new(),
         });
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");

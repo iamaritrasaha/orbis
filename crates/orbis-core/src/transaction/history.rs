@@ -446,6 +446,10 @@ mod tests {
             },
             verification: crate::transaction::VerificationResult::Verified,
             status: crate::transaction::TransactionStatus::Succeeded,
+            changes: Vec::new(),
+            warnings: Vec::new(),
+            diagnosis: None,
+            raw_commands: Vec::new(),
         };
         let request = OperationRequest {
             action: OperationAction::Install,

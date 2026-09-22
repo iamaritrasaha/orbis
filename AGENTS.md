@@ -29,10 +29,11 @@ not a repository, and not a dependency resolver.
 ## Where things live
 
 - `crates/orbis-core` — models, provider contracts, planning, transaction and
-  maintenance execution, privilege boundary, history store, shell-history
-  insights, diagnostics.
+  maintenance execution, privilege boundary, **operation journal**, APT
+  outcome observation/diagnosis, system insight, legacy history store,
+  optional shell-history insights, diagnostics.
 - `crates/orbis-cli` — command parsing, orchestration, plain/transient
-  rendering, persistent TUI, self-update.
+  rendering (Recent Activity), persistent TUI, self-update.
 - `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`,
   `docs/ROADMAP.md`, `docs/CURRENT_STATE.md` — durable context.
   `CURRENT_STATE.md` is the single source of "where are we now".
