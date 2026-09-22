@@ -519,6 +519,9 @@ pub struct TransactionResult {
     /// Expandable raw command references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_commands: Vec<crate::facts::RawCommandRef>,
+    /// Verification evidence actually gathered (never reconstructed per-provider).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
 }
 
 /// Transaction failures that prevent or invalidate an operation.

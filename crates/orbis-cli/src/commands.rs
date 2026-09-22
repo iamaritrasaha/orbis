@@ -67,8 +67,9 @@ pub(crate) fn dispatch(
         }
         Some(Command::Health) => {
             let report = registry.diagnostics(None).with_environment();
-            let pending = registry.updates(Some(orbis_core::models::PackageSource::Apt)).total();
-            let insight = orbis_core::system::system_insight(registry.runner(), Some(pending));
+            let apt_updates = registry.updates(Some(orbis_core::models::PackageSource::Apt));
+            let pending = apt_updates.known_pending_count(orbis_core::models::PackageSource::Apt);
+            let insight = orbis_core::system::system_insight(registry.runner(), pending);
             if cli.json {
                 print_json(&serde_json::json!({"diagnostics": report, "insight": insight}))
             } else {
@@ -649,6 +650,7 @@ fn run_maintenance(
     } else {
         None
     };
+    let journal_session = begin_mutating_maintenance_journal(&plan)?;
     let progress = if json {
         None
     } else {
@@ -701,6 +703,7 @@ fn run_maintenance(
                 warnings: Vec::new(),
                 diagnosis: None,
                 raw_commands: Vec::new(),
+                checks: Vec::new(),
             }),
         }
     }
@@ -710,40 +713,7 @@ fn run_maintenance(
         status: maintenance_status(&providers),
         providers,
     };
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64);
-    // Prefer a single meaningful journal entry for the coordinated run.
-    if plan.mutates
-        && let Ok(journal) = orbis_core::operation::OperationJournal::default_location()
-    {
-        let changes = result
-            .providers
-            .iter()
-            .flat_map(|provider| provider.changes.iter().cloned())
-            .collect::<Vec<_>>();
-        let warnings = result
-            .providers
-            .iter()
-            .flat_map(|provider| provider.warnings.iter().cloned())
-            .collect::<Vec<_>>();
-        let diagnosis = result.providers.iter().find_map(|provider| provider.diagnosis.clone());
-        let raw_commands = result
-            .providers
-            .iter()
-            .flat_map(|provider| provider.raw_commands.iter().cloned())
-            .collect::<Vec<_>>();
-        let record = orbis_core::operation::from_maintenance(
-            &plan,
-            &result,
-            started_at.saturating_sub(1),
-            changes,
-            warnings,
-            diagnosis,
-            raw_commands,
-        );
-        let _ = journal.write(&record);
-    }
+    finish_mutating_maintenance_journal(journal_session, &plan, &result);
     let result_plans = plan.providers.clone();
     if let Some(history) = history {
         history
@@ -822,6 +792,8 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
         None
     };
 
+    let journal_session = begin_mutating_maintenance_journal(&plan)?;
+
     let mut providers = Vec::new();
     for provider_plan in &plan.providers {
         if !provider_plan.executable() {
@@ -844,6 +816,7 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
                 warnings: Vec::new(),
                 diagnosis: None,
                 raw_commands: Vec::new(),
+                checks: Vec::new(),
             }),
         }
     }
@@ -853,36 +826,7 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
         status: maintenance_status(&providers),
         providers,
     };
-    if plan.mutates
-        && let Ok(journal) = orbis_core::operation::OperationJournal::default_location()
-    {
-        let changes = result
-            .providers
-            .iter()
-            .flat_map(|provider| provider.changes.iter().cloned())
-            .collect::<Vec<_>>();
-        let warnings = result
-            .providers
-            .iter()
-            .flat_map(|provider| provider.warnings.iter().cloned())
-            .collect::<Vec<_>>();
-        let diagnosis = result.providers.iter().find_map(|provider| provider.diagnosis.clone());
-        let raw_commands = result
-            .providers
-            .iter()
-            .flat_map(|provider| provider.raw_commands.iter().cloned())
-            .collect::<Vec<_>>();
-        let record = orbis_core::operation::from_maintenance(
-            &plan,
-            &result,
-            0,
-            changes,
-            warnings,
-            diagnosis,
-            raw_commands,
-        );
-        let _ = journal.write(&record);
-    }
+    finish_mutating_maintenance_journal(journal_session, &plan, &result);
     if let Some(history) = history {
         history
             .write_maintenance(
@@ -895,6 +839,73 @@ pub(crate) fn execute_confirmed_maintenance_with_observer(
             .map_err(|e| format!("could not record maintenance: {e}"))?;
     }
     Ok(result)
+}
+
+fn begin_mutating_maintenance_journal(
+    plan: &orbis_core::maintenance::MaintenancePlan,
+) -> Result<Option<(orbis_core::operation::OperationJournal, u64)>, String> {
+    if !plan.mutates {
+        return Ok(None);
+    }
+    let journal = orbis_core::operation::OperationJournal::default_location()
+        .map_err(|error| format!("could not open operation journal: {error}"))?;
+    let started_at = orbis_core::operation::unix_now_ms();
+    let intent = match plan.action {
+        MaintenanceAction::Refresh => "Refresh package metadata",
+        MaintenanceAction::Upgrade => "Update the system",
+        MaintenanceAction::Cleanup => "Remove unused packages",
+    };
+    orbis_core::operation::begin_running(
+        &journal,
+        &plan.operation_id,
+        orbis_core::operation::type_for_maintenance(plan.action),
+        intent,
+        plan.source,
+        started_at,
+    )
+    .map_err(|error| format!("could not persist running operation journal: {error}"))?;
+    Ok(Some((journal, started_at)))
+}
+
+fn finish_mutating_maintenance_journal(
+    session: Option<(orbis_core::operation::OperationJournal, u64)>,
+    plan: &orbis_core::maintenance::MaintenancePlan,
+    result: &MaintenanceResult,
+) {
+    let Some((journal, started_at)) = session else {
+        return;
+    };
+    let changes = result
+        .providers
+        .iter()
+        .flat_map(|provider| provider.changes.iter().cloned())
+        .collect::<Vec<_>>();
+    let warnings = result
+        .providers
+        .iter()
+        .flat_map(|provider| provider.warnings.iter().cloned())
+        .collect::<Vec<_>>();
+    let diagnosis = result.providers.iter().find_map(|provider| provider.diagnosis.clone());
+    let raw_commands = result
+        .providers
+        .iter()
+        .flat_map(|provider| provider.raw_commands.iter().cloned())
+        .collect::<Vec<_>>();
+    let record = orbis_core::operation::from_maintenance(
+        plan,
+        result,
+        orbis_core::operation::OperationTiming {
+            started_at_unix_ms: started_at,
+            completed_at_unix_ms: orbis_core::operation::unix_now_ms(),
+        },
+        changes,
+        warnings,
+        diagnosis,
+        raw_commands,
+    );
+    if let Err(error) = journal.write(&record) {
+        eprintln!("Warning: could not persist operation journal: {error}");
+    }
 }
 
 fn skipped_provider(
@@ -914,6 +925,7 @@ fn skipped_provider(
         warnings: Vec::new(),
         diagnosis: None,
         raw_commands: Vec::new(),
+        checks: Vec::new(),
     }
 }
 fn maintenance_status(results: &[MaintenanceProviderResult]) -> MaintenanceStatus {
@@ -1204,5 +1216,18 @@ mod tests {
         for answer in ["", "y", "Y", "yes"] {
             assert!(!maintenance_confirmation_accepts(RiskLevel::HighImpact, answer));
         }
+    }
+
+    #[test]
+    fn normal_and_observer_maintenance_use_the_same_journal_lifecycle() {
+        let source = include_str!("commands.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        let begin = production.matches("begin_mutating_maintenance_journal").count();
+        let finish = production.matches("finish_mutating_maintenance_journal").count();
+        assert!(begin >= 3, "definition plus CLI and TUI/observer call sites, found {begin}");
+        assert!(finish >= 3, "definition plus CLI and TUI/observer call sites, found {finish}");
+        assert!(!production.contains("started_at.saturating_sub"));
+        assert!(!production.contains("started_at_unix_ms: 0"));
+        assert!(!production.contains("let _ = journal.write"));
     }
 }

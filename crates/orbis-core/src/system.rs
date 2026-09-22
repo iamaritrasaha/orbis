@@ -8,7 +8,8 @@ use std::{path::Path, sync::Arc, time::Duration};
 use serde::Serialize;
 
 use crate::apt_ops::{
-    AptOutcomeProbe, DependencyHealth, RebootPaths, RebootRequired, read_reboot_required,
+    AptOutcomeProbe, DependencyHealth, DependencyHealthStatus, RebootPaths, RebootRequired,
+    read_reboot_required,
 };
 use crate::models::PackageSource;
 use crate::operation::{OperationJournal, OperationRecord, OperationStatus};
@@ -88,16 +89,16 @@ impl From<RebootRequired> for RebootRequiredView {
 /// Serializable dependency health view.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DependencyHealthView {
-    /// True when broken.
-    pub broken: bool,
-    /// Summary when broken.
+    /// Tri-state health: healthy, broken, or unknown.
+    pub status: DependencyHealthStatus,
+    /// Summary when broken or when the probe failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
 
 impl From<DependencyHealth> for DependencyHealthView {
     fn from(value: DependencyHealth) -> Self {
-        Self { broken: value.broken, summary: value.summary }
+        Self { status: value.status, summary: value.summary }
     }
 }
 
@@ -221,7 +222,7 @@ fn build_attention(insight: &SystemInsight, recent: &[OperationRecord]) -> Vec<A
             severity: AttentionSeverity::Caution,
         });
     }
-    if insight.dependencies.broken {
+    if insight.dependencies.status == DependencyHealthStatus::Broken {
         items.push(AttentionItem {
             title: "Broken package dependencies".into(),
             detail: insight.dependencies.summary.clone(),
@@ -441,5 +442,15 @@ tmpfs              100000     90000     10000      90% /tmp
         assert!(attention.iter().any(|item| item.title.contains("12 update")));
         assert!(attention.iter().any(|item| item.title.contains("Reboot required")));
         assert!(attention.iter().any(|item| item.title.contains("failed")));
+    }
+
+    #[test]
+    fn unknown_pending_and_dependencies_are_not_treated_as_healthy_zero() {
+        let insight = SystemInsight::default();
+        assert_eq!(insight.pending_updates, None);
+        assert_eq!(insight.dependencies.status, DependencyHealthStatus::Unknown);
+        let attention = build_attention(&insight, &[]);
+        assert!(!attention.iter().any(|item| item.title.contains("update")));
+        assert!(!attention.iter().any(|item| item.title.contains("Broken")));
     }
 }
