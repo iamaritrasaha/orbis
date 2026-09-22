@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use crate::apt_ops::{
-    AptOutcomeProbe, diagnose_apt_failure, transaction_changes, upgrade_changes,
-    verify_package_state,
+    AptOutcomeProbe, DependencyHealthStatus, InstalledObservation, diagnose_apt_failure,
+    transaction_changes, upgrade_changes, verify_package_state,
 };
 use crate::facts::{ChangeKind, FailureCause, FailureDiagnosis, PackageChange, RawCommandRef};
 use crate::maintenance::{MaintenanceAction, ProviderMaintenancePlan};
@@ -94,46 +94,38 @@ pub fn observe_transaction(
     let probe = AptOutcomeProbe::new(runner);
     let package_id = plan.target.provider_id.clone();
     let after = probe.versions(std::slice::from_ref(&package_id));
-    let after_version = after.get(&package_id).cloned();
+    let lookup = after.lookup(&package_id);
+    let after_version = match lookup {
+        crate::apt_ops::PackageLookup::Installed(version) => Some(version.to_owned()),
+        _ => None,
+    };
     let action_install = plan.action == OperationAction::Install;
-    let (verification, checks) = verify_package_state(
-        action_install,
-        plan.target.version.as_deref(),
-        after_version.as_deref(),
-    );
+    let (verification, checks) =
+        verify_package_state(action_install, plan.target.version.as_deref(), lookup);
     outcome.verification = verification;
     outcome.checks = checks;
-    outcome.changes = transaction_changes(
-        &package_id,
-        &plan.target.name,
-        action_install,
-        None,
-        after_version.as_deref(),
-    );
-    if !action_install && after_version.is_none() {
-        outcome.changes = vec![PackageChange {
-            package_id,
-            name: Some(plan.target.name.clone()),
-            kind: ChangeKind::Removed,
-            from_version: plan.target.version.clone(),
-            to_version: None,
-        }];
+    if matches!(after, InstalledObservation::Observed(_)) {
+        outcome.changes = transaction_changes(
+            &package_id,
+            &plan.target.name,
+            action_install,
+            None,
+            after_version.as_deref(),
+        );
+        if !action_install && after_version.is_none() {
+            outcome.changes = vec![PackageChange {
+                package_id,
+                name: Some(plan.target.name.clone()),
+                kind: ChangeKind::Removed,
+                from_version: plan.target.version.clone(),
+                to_version: None,
+            }];
+        }
     }
     if let Some(warning) = probe.reboot_required().warning_line() {
         outcome.warnings.push(warning);
     }
-    let health = probe.dependency_health();
-    if health.broken {
-        outcome.verification = VerificationResult::Failed;
-        outcome.diagnosis = Some(FailureDiagnosis {
-            cause: FailureCause::BrokenDependencies,
-            summary: health
-                .summary
-                .unwrap_or_else(|| "Package dependencies are broken after the operation.".into()),
-            hint: Some("Inspect package state before retrying.".into()),
-        });
-        outcome.checks.push("Dependency health check failed".into());
-    }
+    apply_dependency_health(&mut outcome, probe.dependency_health());
     outcome
 }
 
@@ -183,39 +175,54 @@ pub fn observe_apt_maintenance(
                 .collect();
             let names: Vec<_> = planned.iter().map(|(id, _, _)| id.clone()).collect();
             let after = probe.versions(&names);
-            outcome.changes = upgrade_changes(&planned, &after);
-            outcome.checks.push(format!(
-                "Observed {} package version change{}",
-                outcome.changes.len(),
-                if outcome.changes.len() == 1 { "" } else { "s" }
-            ));
-            if remaining_candidates == 0 {
-                outcome.verification = VerificationResult::Verified;
-                outcome.checks.push("No remaining ordinary APT upgrades".into());
-            } else {
-                outcome.verification = VerificationResult::PartiallyVerified;
-                outcome.warnings.push(format!(
-                    "{remaining_candidates} package{} still pending upgrade",
-                    if remaining_candidates == 1 { "" } else { "s" }
-                ));
-                outcome.checks.push("Remaining upgrade candidates after execution".into());
-            }
-            // Planned candidates that did not move when an available version was known.
-            let stalled = planned
-                .iter()
-                .filter(|(id, from, expected)| {
-                    expected.is_some()
-                        && after
-                            .get(id)
-                            .and_then(|to| from.as_ref().map(|f| f == to))
-                            .unwrap_or(false)
-                })
-                .count();
-            if stalled > 0 && remaining_candidates > 0 {
-                outcome.warnings.push(format!(
-                    "{stalled} planned package{} did not change version",
-                    if stalled == 1 { "" } else { "s" }
-                ));
+            match after.versions() {
+                Some(versions) => {
+                    outcome.changes = upgrade_changes(&planned, versions);
+                    outcome.checks.push("dpkg package state observed".into());
+                    outcome.checks.push(format!(
+                        "Observed {} package version change{}",
+                        outcome.changes.len(),
+                        if outcome.changes.len() == 1 { "" } else { "s" }
+                    ));
+                    if remaining_candidates == 0 {
+                        outcome.verification = VerificationResult::Verified;
+                        outcome.checks.push("no remaining APT upgrades".into());
+                    } else {
+                        outcome.verification = VerificationResult::PartiallyVerified;
+                        outcome.warnings.push(format!(
+                            "{remaining_candidates} package{} still pending upgrade",
+                            if remaining_candidates == 1 { "" } else { "s" }
+                        ));
+                        outcome.checks.push("Remaining upgrade candidates after execution".into());
+                    }
+                    let stalled = planned
+                        .iter()
+                        .filter(|(id, from, expected)| {
+                            expected.is_some()
+                                && versions
+                                    .get(id)
+                                    .and_then(|to| from.as_ref().map(|f| f == to))
+                                    .unwrap_or(false)
+                        })
+                        .count();
+                    if stalled > 0 && remaining_candidates > 0 {
+                        outcome.warnings.push(format!(
+                            "{stalled} planned package{} did not change version",
+                            if stalled == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                None => {
+                    let reason = match after {
+                        InstalledObservation::Unavailable { reason } => reason.as_str(),
+                        InstalledObservation::Observed(_) => "unknown",
+                    };
+                    outcome.checks.push(format!(
+                        "planned candidate version observation unavailable ({reason})"
+                    ));
+                    outcome.warnings.push("Package-level verification incomplete".into());
+                    outcome.verification = VerificationResult::PartiallyVerified;
+                }
             }
         }
         MaintenanceAction::Cleanup => {
@@ -231,18 +238,33 @@ pub fn observe_apt_maintenance(
     if let Some(warning) = probe.reboot_required().warning_line() {
         outcome.warnings.push(warning);
     }
-    let health = probe.dependency_health();
-    if health.broken {
-        outcome.verification = VerificationResult::Failed;
-        outcome.diagnosis = Some(FailureDiagnosis {
-            cause: FailureCause::BrokenDependencies,
-            summary: health
-                .summary
-                .unwrap_or_else(|| "Broken dependencies detected after maintenance.".into()),
-            hint: Some("Resolve dependency problems before further package changes.".into()),
-        });
-    }
+    apply_dependency_health(&mut outcome, probe.dependency_health());
     outcome
+}
+
+fn apply_dependency_health(
+    outcome: &mut ObservedOutcome,
+    health: crate::apt_ops::DependencyHealth,
+) {
+    match health.status {
+        DependencyHealthStatus::Healthy => {
+            outcome.checks.push("apt-get check passed".into());
+        }
+        DependencyHealthStatus::Broken => {
+            outcome.verification = VerificationResult::Failed;
+            outcome.diagnosis = Some(FailureDiagnosis {
+                cause: FailureCause::BrokenDependencies,
+                summary: health.summary.unwrap_or_else(|| {
+                    "Package dependencies are broken after the operation.".into()
+                }),
+                hint: Some("Inspect package state before retrying.".into()),
+            });
+            outcome.checks.push("Dependency health check failed".into());
+        }
+        DependencyHealthStatus::Unknown => {
+            outcome.checks.push("dependency health could not be observed".into());
+        }
+    }
 }
 
 fn raw_command_for(operation: &ProviderOperation, exit_status: Option<i32>) -> RawCommandRef {
@@ -396,5 +418,108 @@ mod tests {
         assert_eq!(outcome.operation_status(true), OperationStatus::Succeeded);
         assert_eq!(outcome.changes.len(), 1);
         assert_eq!(outcome.changes[0].to_version.as_deref(), Some("8.5.0-1"));
+        assert!(outcome.checks.iter().any(|c| c.contains("installed version observed")));
+    }
+
+    fn dpkg_query_failure() -> CommandOutput {
+        CommandOutput {
+            stdout: String::new(),
+            stderr: "dpkg-query: error: failed to open package info file `/var/lib/dpkg/status'"
+                .into(),
+            status: Some(1),
+        }
+    }
+
+    fn check_ok() -> (String, CommandOutput) {
+        (
+            "apt-get check".into(),
+            CommandOutput { stdout: String::new(), stderr: String::new(), status: Some(0) },
+        )
+    }
+
+    #[test]
+    fn remove_with_failed_dpkg_query_is_never_verified() {
+        let runner = Arc::new(ScriptedRunner {
+            responses: Mutex::new(vec![("dpkg-query".into(), dpkg_query_failure()), check_ok()]),
+        });
+        let output = CommandOutput {
+            stdout: "Removing curl".into(),
+            stderr: String::new(),
+            status: Some(0),
+        };
+        let operation =
+            ProviderOperation::Apt { action: OperationAction::Remove, package_id: "curl".into() };
+        let outcome =
+            observe_transaction(runner, &plan(OperationAction::Remove), &output, &operation);
+        assert_ne!(outcome.verification, VerificationResult::Verified);
+        assert_eq!(outcome.verification, VerificationResult::Failed);
+    }
+
+    #[test]
+    fn install_with_failed_dpkg_query_is_never_verified() {
+        let runner = Arc::new(ScriptedRunner {
+            responses: Mutex::new(vec![("dpkg-query".into(), dpkg_query_failure()), check_ok()]),
+        });
+        let output = CommandOutput {
+            stdout: "Setting up curl".into(),
+            stderr: String::new(),
+            status: Some(0),
+        };
+        let operation =
+            ProviderOperation::Apt { action: OperationAction::Install, package_id: "curl".into() };
+        let outcome =
+            observe_transaction(runner, &plan(OperationAction::Install), &output, &operation);
+        assert_ne!(outcome.verification, VerificationResult::Verified);
+        assert_eq!(outcome.verification, VerificationResult::Failed);
+    }
+
+    fn upgrade_plan() -> crate::maintenance::ProviderMaintenancePlan {
+        crate::maintenance::ProviderMaintenancePlan {
+            operation_id: "mnt-obs-1".into(),
+            source: PackageSource::Apt,
+            action: crate::maintenance::MaintenanceAction::Upgrade,
+            scope: Some(InstallScope::System),
+            candidates: vec![crate::maintenance::UpdateCandidate {
+                source: PackageSource::Apt,
+                provider_id: "openssl".into(),
+                name: "openssl".into(),
+                current_version: Some("1.0".into()),
+                available_version: Some("3.0".into()),
+                architecture: None,
+                scope: Some(InstallScope::System),
+                channel: None,
+                held: Some(false),
+                security_relevance: None,
+                notes: Vec::new(),
+                metadata: Default::default(),
+            }],
+            cleanup_candidates: Vec::new(),
+            privilege: PrivilegeRequirement::Administrator,
+            completeness: PlanCompleteness::Complete,
+            confidence: PlanConfidence::High,
+            authoritative_simulation: true,
+            risk: RiskLevel::Normal,
+            supported: true,
+            mutates: true,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        }
+    }
+
+    #[test]
+    fn upgrade_with_failed_version_observation_is_never_fully_verified() {
+        let runner = Arc::new(ScriptedRunner {
+            responses: Mutex::new(vec![("dpkg-query".into(), dpkg_query_failure()), check_ok()]),
+        });
+        let output = CommandOutput {
+            stdout: "Setting up openssl".into(),
+            stderr: String::new(),
+            status: Some(0),
+        };
+        let outcome = observe_apt_maintenance(runner, &upgrade_plan(), &output, 0);
+        assert_ne!(outcome.verification, VerificationResult::Verified);
+        assert_eq!(outcome.verification, VerificationResult::PartiallyVerified);
     }
 }

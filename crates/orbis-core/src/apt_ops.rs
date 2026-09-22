@@ -12,7 +12,7 @@ use std::{
 
 use crate::facts::{ChangeKind, FailureCause, FailureDiagnosis, PackageChange};
 use crate::models::PackageSource;
-use crate::process::{CommandRunner, CommandSpec, SharedRunner};
+use crate::process::{CommandOutput, CommandRunner, CommandSpec, ProcessError, SharedRunner};
 use crate::providers::{execute, short_timeout};
 use crate::transaction::VerificationResult;
 
@@ -220,19 +220,109 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Probe outcome for dependency health. Failure to probe is never "healthy".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyHealthStatus {
+    /// Packages appear consistent (`apt-get check` succeeded).
+    Healthy,
+    /// Unmet dependencies or interrupted dpkg were observed.
+    Broken,
+    /// The probe could not run or its result is not evidence of health.
+    #[default]
+    Unknown,
+}
+
 /// Broken-dependency observation from `apt-get check` / `dpkg --audit`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DependencyHealth {
-    /// True when checks reported a problem.
-    pub broken: bool,
-    /// Short diagnosis when broken.
+    /// Tri-state probe result.
+    pub status: DependencyHealthStatus,
+    /// Short diagnosis when broken or when the probe failed.
     pub summary: Option<String>,
+}
+
+impl DependencyHealth {
+    /// True only when a probe positively observed a broken state.
+    pub fn is_broken(&self) -> bool {
+        self.status == DependencyHealthStatus::Broken
+    }
+}
+
+/// Why installed-version observation could not be completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationFailure {
+    /// `dpkg-query` is not available on PATH.
+    CommandUnavailable,
+    /// The query could not be executed or returned an unclassified failure.
+    QueryFailed,
+    /// Output was present but could not be parsed as package status rows.
+    ParseFailed,
+}
+
+impl ObservationFailure {
+    /// Stable short label for verification evidence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandUnavailable => "dpkg-query unavailable",
+            Self::QueryFailed => "dpkg-query failed",
+            Self::ParseFailed => "dpkg-query output could not be parsed",
+        }
+    }
+}
+
+/// Distinguishes a completed installed-state query from an unavailable probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InstalledObservation {
+    /// Query completed. The map contains only packages that are `install ok installed`.
+    /// Names omitted from the map are absent, not unknown.
+    Observed(BTreeMap<String, String>),
+    /// The probe did not produce authoritative installed-state evidence.
+    Unavailable {
+        /// Why observation could not be completed.
+        reason: ObservationFailure,
+    },
+}
+
+impl InstalledObservation {
+    /// Lookup one package without collapsing unavailable into absent.
+    pub fn lookup<'a>(&'a self, package_id: &str) -> PackageLookup<'a> {
+        match self {
+            Self::Observed(versions) => match versions.get(package_id) {
+                Some(version) => PackageLookup::Installed(version),
+                None => PackageLookup::Absent,
+            },
+            Self::Unavailable { reason } => PackageLookup::Unavailable(*reason),
+        }
+    }
+
+    /// Observed version map when the probe completed.
+    pub fn versions(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::Observed(versions) => Some(versions),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// Result of looking up one package after an installed-state observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageLookup<'a> {
+    /// Package is `install ok installed` at this version.
+    Installed(&'a str),
+    /// Query completed and the package is not installed.
+    Absent,
+    /// Installed state could not be observed.
+    Unavailable(ObservationFailure),
 }
 
 /// Runs read-only dependency health checks through the injected runner.
 pub fn check_dependency_health(runner: &SharedRunner) -> DependencyHealth {
     if !runner.is_available("apt-get") {
-        return DependencyHealth::default();
+        return DependencyHealth {
+            status: DependencyHealthStatus::Unknown,
+            summary: Some("apt-get is unavailable".into()),
+        };
     }
     let Ok(output) = execute(
         runner,
@@ -243,42 +333,96 @@ pub fn check_dependency_health(runner: &SharedRunner) -> DependencyHealth {
             .with_env("DEBIAN_FRONTEND", "noninteractive")
             .with_timeout(Duration::from_secs(30)),
     ) else {
-        return DependencyHealth::default();
+        return DependencyHealth {
+            status: DependencyHealthStatus::Unknown,
+            summary: Some("Dependency health could not be probed".into()),
+        };
     };
     if output.success() {
-        return DependencyHealth { broken: false, summary: None };
+        return DependencyHealth { status: DependencyHealthStatus::Healthy, summary: None };
     }
     let diagnosis = diagnose_apt_failure(&output.stdout, &output.stderr, output.status);
     // A busy lock is not proof of broken packages; leave dependency health unknown.
     if matches!(diagnosis.cause, FailureCause::AptLock | FailureCause::PermissionFailure) {
-        return DependencyHealth { broken: false, summary: None };
+        return DependencyHealth {
+            status: DependencyHealthStatus::Unknown,
+            summary: Some(diagnosis.summary),
+        };
     }
-    DependencyHealth {
-        broken: matches!(
-            diagnosis.cause,
-            FailureCause::BrokenDependencies | FailureCause::InterruptedDpkg
-        ) || diagnosis.cause == FailureCause::Unknown,
-        summary: Some(diagnosis.summary),
+    if matches!(
+        diagnosis.cause,
+        FailureCause::BrokenDependencies | FailureCause::InterruptedDpkg | FailureCause::Unknown
+    ) {
+        return DependencyHealth {
+            status: DependencyHealthStatus::Broken,
+            summary: Some(diagnosis.summary),
+        };
     }
+    DependencyHealth { status: DependencyHealthStatus::Unknown, summary: Some(diagnosis.summary) }
 }
 
-/// Read installed versions for exact package names via `dpkg-query`.
-pub fn installed_versions(runner: &SharedRunner, names: &[String]) -> BTreeMap<String, String> {
-    if names.is_empty() || !runner.is_available("dpkg-query") {
-        return BTreeMap::new();
+/// Observe installed versions for exact package names via `dpkg-query`.
+///
+/// Absent packages and probe failures are distinct. Callers must not treat an
+/// empty map from an unavailable probe as proof of removal.
+pub fn observe_installed_versions(runner: &SharedRunner, names: &[String]) -> InstalledObservation {
+    if names.is_empty() {
+        return InstalledObservation::Observed(BTreeMap::new());
+    }
+    if !runner.is_available("dpkg-query") {
+        return InstalledObservation::Unavailable {
+            reason: ObservationFailure::CommandUnavailable,
+        };
     }
     let mut args =
         vec!["-W".to_owned(), "-f=${binary:Package}\t${Status}\t${Version}\n".to_owned()];
     args.extend(names.iter().cloned());
-    let Ok(output) = execute(
-        runner,
-        PackageSource::Apt,
-        "read installed package versions",
-        CommandSpec::new("dpkg-query", args).with_timeout(short_timeout()),
-    ) else {
-        return BTreeMap::new();
+    let output = match runner
+        .run(&CommandSpec::new("dpkg-query", args).with_timeout(short_timeout()))
+    {
+        Ok(output) => output,
+        Err(ProcessError::NotFound { .. }) => {
+            return InstalledObservation::Unavailable {
+                reason: ObservationFailure::CommandUnavailable,
+            };
+        }
+        Err(_) => {
+            return InstalledObservation::Unavailable { reason: ObservationFailure::QueryFailed };
+        }
     };
-    parse_dpkg_versions(&output.stdout)
+    classify_dpkg_output(&output)
+}
+
+fn classify_dpkg_output(output: &CommandOutput) -> InstalledObservation {
+    let parsed = parse_dpkg_versions(&output.stdout);
+    let stdout_blank = output.stdout.trim().is_empty();
+    if !stdout_blank && parsed.is_empty() {
+        return InstalledObservation::Unavailable { reason: ObservationFailure::ParseFailed };
+    }
+    if output.success() {
+        return InstalledObservation::Observed(parsed);
+    }
+    if package_absent_stderr(&output.stderr) {
+        return InstalledObservation::Observed(parsed);
+    }
+    InstalledObservation::Unavailable { reason: ObservationFailure::QueryFailed }
+}
+
+fn package_absent_stderr(stderr: &str) -> bool {
+    let lines: Vec<_> = stderr.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    !lines.is_empty()
+        && lines.iter().all(|line| {
+            line.contains("no packages found matching") || line.contains("no packages found")
+        })
+}
+
+/// Read installed versions, collapsing unavailable probes to an empty map.
+/// Prefer [`observe_installed_versions`] at verification boundaries.
+pub fn installed_versions(runner: &SharedRunner, names: &[String]) -> BTreeMap<String, String> {
+    match observe_installed_versions(runner, names) {
+        InstalledObservation::Observed(versions) => versions,
+        InstalledObservation::Unavailable { .. } => BTreeMap::new(),
+    }
 }
 
 /// Pure parser for dpkg-query tabular version output.
@@ -360,37 +504,46 @@ pub fn upgrade_changes(
 }
 
 /// Verify an install/remove against observed installed state and version.
+///
+/// Unavailable observation never becomes [`VerificationResult::Verified`].
 pub fn verify_package_state(
     action_install: bool,
     expected_version: Option<&str>,
-    after_version: Option<&str>,
+    after: PackageLookup<'_>,
 ) -> (VerificationResult, Vec<String>) {
     let mut checks = Vec::new();
-    if action_install {
-        match after_version {
-            Some(version) => {
-                checks.push(format!("Package is installed at version {version}"));
-                if let Some(expected) = expected_version
-                    && expected != version
-                {
-                    checks.push(format!(
-                        "Installed version {version} differs from planned {expected}"
-                    ));
-                    return (VerificationResult::PartiallyVerified, checks);
-                }
-                (VerificationResult::Verified, checks)
-            }
-            None => {
-                checks.push("Package is not installed after install".into());
-                (VerificationResult::Failed, checks)
-            }
+    match after {
+        PackageLookup::Unavailable(reason) => {
+            checks
+                .push(format!("dpkg package state observation unavailable ({})", reason.as_str()));
+            (VerificationResult::Failed, checks)
         }
-    } else if after_version.is_none() {
-        checks.push("Package is no longer installed".into());
-        (VerificationResult::Verified, checks)
-    } else {
-        checks.push("Package is still installed after remove".into());
-        (VerificationResult::Failed, checks)
+        PackageLookup::Installed(version) if action_install => {
+            checks.push("dpkg package state observed".into());
+            checks.push(format!("installed version observed: {version}"));
+            if let Some(expected) = expected_version
+                && expected != version
+            {
+                checks.push(format!("Installed version {version} differs from planned {expected}"));
+                return (VerificationResult::PartiallyVerified, checks);
+            }
+            (VerificationResult::Verified, checks)
+        }
+        PackageLookup::Absent if action_install => {
+            checks.push("dpkg package state observed".into());
+            checks.push("Package is not installed after install".into());
+            (VerificationResult::Failed, checks)
+        }
+        PackageLookup::Absent => {
+            checks.push("dpkg package state observed".into());
+            checks.push("package is not installed".into());
+            (VerificationResult::Verified, checks)
+        }
+        PackageLookup::Installed(_) => {
+            checks.push("dpkg package state observed".into());
+            checks.push("Package is still installed after remove".into());
+            (VerificationResult::Failed, checks)
+        }
     }
 }
 
@@ -421,9 +574,9 @@ impl AptOutcomeProbe {
         check_dependency_health(&self.runner)
     }
 
-    /// Installed versions for the given package ids.
-    pub fn versions(&self, names: &[String]) -> BTreeMap<String, String> {
-        installed_versions(&self.runner, names)
+    /// Installed versions for the given package ids, distinguishing absent from unavailable.
+    pub fn versions(&self, names: &[String]) -> InstalledObservation {
+        observe_installed_versions(&self.runner, names)
     }
 }
 
@@ -507,12 +660,54 @@ mod tests {
 
     #[test]
     fn verify_install_requires_installed_version() {
-        let (ok, _) = verify_package_state(true, Some("1.2"), Some("1.2"));
+        let (ok, _) = verify_package_state(true, Some("1.2"), PackageLookup::Installed("1.2"));
         assert_eq!(ok, VerificationResult::Verified);
-        let (missing, _) = verify_package_state(true, Some("1.2"), None);
+        let (missing, _) = verify_package_state(true, Some("1.2"), PackageLookup::Absent);
         assert_eq!(missing, VerificationResult::Failed);
-        let (removed, _) = verify_package_state(false, None, None);
+        let (removed, _) = verify_package_state(false, None, PackageLookup::Absent);
         assert_eq!(removed, VerificationResult::Verified);
+        let (unavailable_remove, _) = verify_package_state(
+            false,
+            None,
+            PackageLookup::Unavailable(ObservationFailure::QueryFailed),
+        );
+        assert_ne!(unavailable_remove, VerificationResult::Verified);
+        let (unavailable_install, _) = verify_package_state(
+            true,
+            Some("1.2"),
+            PackageLookup::Unavailable(ObservationFailure::QueryFailed),
+        );
+        assert_ne!(unavailable_install, VerificationResult::Verified);
+    }
+
+    #[test]
+    fn dpkg_query_failure_is_unavailable_not_absent() {
+        let failed = classify_dpkg_output(&CommandOutput {
+            stdout: String::new(),
+            stderr: "dpkg-query: error: failed to open package info file".into(),
+            status: Some(1),
+        });
+        assert_eq!(
+            failed,
+            InstalledObservation::Unavailable { reason: ObservationFailure::QueryFailed }
+        );
+
+        let absent = classify_dpkg_output(&CommandOutput {
+            stdout: String::new(),
+            stderr: "dpkg-query: no packages found matching curl".into(),
+            status: Some(1),
+        });
+        assert_eq!(absent, InstalledObservation::Observed(BTreeMap::new()));
+
+        let unparsed = classify_dpkg_output(&CommandOutput {
+            stdout: "this is not a dpkg status table".into(),
+            stderr: String::new(),
+            status: Some(0),
+        });
+        assert_eq!(
+            unparsed,
+            InstalledObservation::Unavailable { reason: ObservationFailure::ParseFailed }
+        );
     }
 
     #[test]
@@ -523,5 +718,24 @@ mod tests {
         assert_eq!(map.get("ripgrep").map(String::as_str), Some("14.1.0-1"));
         assert_eq!(map.get("libssl3:amd64").map(String::as_str), Some("3.0.13"));
         assert_eq!(map.get("libssl3").map(String::as_str), Some("3.0.13"));
+    }
+
+    #[test]
+    fn apt_health_probe_unavailable_is_unknown() {
+        struct NoneRunner;
+        impl CommandRunner for NoneRunner {
+            fn is_available(&self, _: &str) -> bool {
+                false
+            }
+            fn run(
+                &self,
+                command: &CommandSpec,
+            ) -> Result<CommandOutput, crate::process::ProcessError> {
+                Err(crate::process::ProcessError::NotFound { program: command.program.clone() })
+            }
+        }
+        let health = check_dependency_health(&(std::sync::Arc::new(NoneRunner) as SharedRunner));
+        assert_eq!(health.status, DependencyHealthStatus::Unknown);
+        assert!(!health.is_broken());
     }
 }

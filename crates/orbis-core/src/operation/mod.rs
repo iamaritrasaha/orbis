@@ -235,6 +235,27 @@ fn format_duration(duration_ms: u64) -> String {
     }
 }
 
+/// Start and completion timestamps for a journaled operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationTiming {
+    /// When the mutating work began (unix ms).
+    pub started_at_unix_ms: u64,
+    /// When observation finished (unix ms).
+    pub completed_at_unix_ms: u64,
+}
+
+impl OperationTiming {
+    /// Duration in milliseconds.
+    pub fn duration_ms(self) -> u64 {
+        self.completed_at_unix_ms.saturating_sub(self.started_at_unix_ms)
+    }
+}
+
+/// Unix epoch milliseconds. Shared so start and finish records use one clock.
+pub fn unix_now_ms() -> u64 {
+    now_unix_ms()
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -243,13 +264,13 @@ fn now_unix_ms() -> u64 {
 pub fn from_transaction(
     request: &OperationRequest,
     result: &TransactionResult,
-    started_at_unix_ms: u64,
+    timing: OperationTiming,
     changes: Vec<PackageChange>,
     warnings: Vec<String>,
     diagnosis: Option<FailureDiagnosis>,
     raw_commands: Vec<RawCommandRef>,
 ) -> OperationRecord {
-    let completed = now_unix_ms();
+    let completed = timing.completed_at_unix_ms;
     let operation_type = match request.action {
         OperationAction::Install => OperationType::Install,
         OperationAction::Remove => OperationType::Remove,
@@ -296,28 +317,23 @@ pub fn from_transaction(
             }),
         OperationStatus::Running => intent.clone(),
     };
-    let checks = match request.action {
-        OperationAction::Install => vec![
-            "Confirmed package is installed via dpkg".into(),
-            "Recorded installed version when available".into(),
-        ],
-        OperationAction::Remove => {
-            vec!["Confirmed package is no longer installed via dpkg".into()]
-        }
-    };
     OperationRecord {
         schema_version: SCHEMA_VERSION,
         id: result.plan.operation_id.clone(),
         operation_type,
         intent,
         status,
-        started_at_unix_ms,
+        started_at_unix_ms: timing.started_at_unix_ms,
         completed_at_unix_ms: Some(completed),
-        duration_ms: Some(completed.saturating_sub(started_at_unix_ms)),
+        duration_ms: Some(timing.duration_ms()),
         source: Some(result.plan.target.source),
         summary,
         changes,
-        verification: Some(VerificationReport { result: result.verification, verified, checks }),
+        verification: Some(VerificationReport {
+            result: result.verification,
+            verified,
+            checks: result.checks.clone(),
+        }),
         warnings,
         diagnosis,
         raw_commands,
@@ -329,25 +345,43 @@ pub fn from_transaction(
 pub fn from_maintenance(
     plan: &MaintenancePlan,
     result: &MaintenanceResult,
-    started_at_unix_ms: u64,
+    timing: OperationTiming,
     changes: Vec<PackageChange>,
     warnings: Vec<String>,
     diagnosis: Option<FailureDiagnosis>,
     raw_commands: Vec<RawCommandRef>,
 ) -> OperationRecord {
-    let completed = now_unix_ms();
+    let completed = timing.completed_at_unix_ms;
     let operation_type = match plan.action {
         MaintenanceAction::Refresh => OperationType::Refresh,
         MaintenanceAction::Upgrade => OperationType::SystemUpdate,
         MaintenanceAction::Cleanup => OperationType::Cleanup,
     };
-    let status = match result.status {
+    let mut status = match result.status {
         MaintenanceStatus::Succeeded => OperationStatus::Succeeded,
         MaintenanceStatus::PartiallySucceeded => OperationStatus::PartiallyVerified,
         MaintenanceStatus::Failed | MaintenanceStatus::Cancelled | MaintenanceStatus::Blocked => {
             OperationStatus::Failed
         }
     };
+    let upgraded = changes.iter().filter(|c| c.kind == ChangeKind::Upgraded).count();
+    let planned_candidates: usize =
+        plan.providers.iter().map(|provider| provider.candidates.len()).sum();
+    let observation_incomplete = result.providers.iter().any(|provider| {
+        provider.checks.iter().any(|check| {
+            check.contains("observation unavailable")
+                || check.contains("verification incomplete")
+                || check.contains("Package-level verification incomplete")
+        }) || matches!(provider.verification, Some(VerificationResult::PartiallyVerified))
+            && provider.checks.iter().any(|check| check.contains("unavailable"))
+    });
+    if plan.action == MaintenanceAction::Upgrade
+        && planned_candidates > 0
+        && status == OperationStatus::Succeeded
+        && (observation_incomplete || upgraded == 0)
+    {
+        status = OperationStatus::PartiallyVerified;
+    }
     let verified = result.providers.iter().all(|provider| {
         matches!(
             provider.status,
@@ -361,23 +395,23 @@ pub fn from_maintenance(
         MaintenanceAction::Upgrade => "Update the system".into(),
         MaintenanceAction::Cleanup => "Remove unused packages".into(),
     };
-    let upgraded = changes.iter().filter(|c| c.kind == ChangeKind::Upgraded).count();
     let summary = match (plan.action, status) {
+        (MaintenanceAction::Upgrade, OperationStatus::Succeeded) if planned_candidates == 0 => {
+            "System already up to date".into()
+        }
         (MaintenanceAction::Upgrade, OperationStatus::Succeeded) if upgraded > 0 => {
             format!(
                 "{upgraded} package{} upgraded and verified",
                 if upgraded == 1 { "" } else { "s" }
             )
         }
+        (MaintenanceAction::Upgrade, OperationStatus::PartiallyVerified)
+            if planned_candidates > 0 =>
+        {
+            "System update completed; package-level verification incomplete".into()
+        }
         (MaintenanceAction::Upgrade, OperationStatus::Succeeded) => {
             "System already up to date".into()
-        }
-        (MaintenanceAction::Upgrade, OperationStatus::PartiallyVerified) => {
-            format!(
-                "Upgrade finished with {} package change{}; verification incomplete",
-                changes.len(),
-                if changes.len() == 1 { "" } else { "s" }
-            )
         }
         (MaintenanceAction::Refresh, OperationStatus::Succeeded) => {
             "Package metadata refreshed".into()
@@ -396,26 +430,22 @@ pub fn from_maintenance(
             .unwrap_or_else(|| format!("{} failed", operation_type.failed_title())),
         _ => intent.clone(),
     };
-    let verification =
-        result.providers.iter().find_map(|provider| provider.verification).map(|v| {
-            VerificationReport {
-                result: v,
-                verified,
-                checks: vec![
-                    "Re-checked package state after the operation".into(),
-                    "Inspected reboot-required and dependency health when available".into(),
-                ],
-            }
-        });
+    let checks: Vec<String> =
+        result.providers.iter().flat_map(|provider| provider.checks.iter().cloned()).collect();
+    let verification = result
+        .providers
+        .iter()
+        .find_map(|provider| provider.verification)
+        .map(|v| VerificationReport { result: v, verified, checks });
     OperationRecord {
         schema_version: SCHEMA_VERSION,
         id: result.operation_id.clone(),
         operation_type,
         intent,
         status,
-        started_at_unix_ms,
+        started_at_unix_ms: timing.started_at_unix_ms,
         completed_at_unix_ms: Some(completed),
-        duration_ms: Some(completed.saturating_sub(started_at_unix_ms)),
+        duration_ms: Some(timing.duration_ms()),
         source: plan.source,
         summary,
         changes,
@@ -434,13 +464,24 @@ pub fn running(
     intent: impl Into<String>,
     source: Option<PackageSource>,
 ) -> OperationRecord {
+    running_at(id, operation_type, intent, source, now_unix_ms())
+}
+
+/// Running marker with an explicit start timestamp that later records must reuse.
+pub fn running_at(
+    id: impl Into<String>,
+    operation_type: OperationType,
+    intent: impl Into<String>,
+    source: Option<PackageSource>,
+    started_at_unix_ms: u64,
+) -> OperationRecord {
     OperationRecord {
         schema_version: SCHEMA_VERSION,
         id: id.into(),
         operation_type,
         intent: intent.into(),
         status: OperationStatus::Running,
-        started_at_unix_ms: now_unix_ms(),
+        started_at_unix_ms,
         completed_at_unix_ms: None,
         duration_ms: None,
         source,
@@ -452,6 +493,20 @@ pub fn running(
         raw_commands: Vec::new(),
         message: None,
     }
+}
+
+/// Fail-closed write of a Running journal record. Mutation must not begin if this fails.
+pub fn begin_running(
+    journal: &OperationJournal,
+    id: impl Into<String>,
+    operation_type: OperationType,
+    intent: impl Into<String>,
+    source: Option<PackageSource>,
+    started_at_unix_ms: u64,
+) -> Result<u64, String> {
+    let id = id.into();
+    journal.write(&running_at(id, operation_type, intent, source, started_at_unix_ms))?;
+    Ok(started_at_unix_ms)
 }
 
 /// Filesystem-backed operation journal under XDG state.
@@ -692,11 +747,12 @@ mod tests {
             warnings: Vec::new(),
             diagnosis: None,
             raw_commands: Vec::new(),
+            checks: Vec::new(),
         };
         let record = from_transaction(
             &request,
             &result,
-            1,
+            OperationTiming { started_at_unix_ms: 1, completed_at_unix_ms: 2 },
             Vec::new(),
             Vec::new(),
             Some(FailureDiagnosis {
@@ -734,11 +790,12 @@ mod tests {
             warnings: Vec::new(),
             diagnosis: None,
             raw_commands: Vec::new(),
+            checks: vec!["dpkg package state observed".into()],
         };
         let record = from_transaction(
             &request,
             &result,
-            10,
+            OperationTiming { started_at_unix_ms: 10, completed_at_unix_ms: 20 },
             vec![PackageChange {
                 package_id: "ripgrep".into(),
                 name: Some("ripgrep".into()),
@@ -761,5 +818,264 @@ mod tests {
         let mut record = running("../etc", OperationType::Install, "bad", None);
         record.id = "../etc".into();
         assert!(journal.write(&record).is_err());
+    }
+
+    fn apt_upgrade_provider_plan(
+        candidates: Vec<crate::maintenance::UpdateCandidate>,
+    ) -> crate::maintenance::ProviderMaintenancePlan {
+        crate::maintenance::ProviderMaintenancePlan {
+            operation_id: "mnt-test-1".into(),
+            source: PackageSource::Apt,
+            action: crate::maintenance::MaintenanceAction::Upgrade,
+            scope: Some(InstallScope::System),
+            candidates,
+            cleanup_candidates: Vec::new(),
+            privilege: PrivilegeRequirement::Administrator,
+            completeness: PlanCompleteness::Complete,
+            confidence: PlanConfidence::High,
+            authoritative_simulation: true,
+            risk: RiskLevel::Normal,
+            supported: true,
+            mutates: true,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            download_size_bytes: None,
+            disk_delta_bytes: None,
+        }
+    }
+
+    fn openssl_candidate() -> crate::maintenance::UpdateCandidate {
+        crate::maintenance::UpdateCandidate {
+            source: PackageSource::Apt,
+            provider_id: "openssl".into(),
+            name: "openssl".into(),
+            current_version: Some("1.0".into()),
+            available_version: Some("3.0".into()),
+            architecture: None,
+            scope: Some(InstallScope::System),
+            channel: None,
+            held: Some(false),
+            security_relevance: None,
+            notes: Vec::new(),
+            metadata: Default::default(),
+        }
+    }
+
+    fn maintenance_result(
+        status: crate::maintenance::MaintenanceStatus,
+        provider_status: crate::maintenance::MaintenanceProviderStatus,
+        verification: Option<VerificationResult>,
+        checks: Vec<String>,
+        source: PackageSource,
+    ) -> crate::maintenance::MaintenanceResult {
+        crate::maintenance::MaintenanceResult {
+            operation_id: "mnt-test-1".into(),
+            action: crate::maintenance::MaintenanceAction::Upgrade,
+            status,
+            providers: vec![crate::maintenance::MaintenanceProviderResult {
+                source,
+                action: crate::maintenance::MaintenanceAction::Upgrade,
+                status: provider_status,
+                candidate_count: 1,
+                verification,
+                message: None,
+                changes: Vec::new(),
+                warnings: Vec::new(),
+                diagnosis: None,
+                raw_commands: Vec::new(),
+                checks,
+            }],
+        }
+    }
+
+    #[test]
+    fn preexisting_zero_candidate_plan_is_already_up_to_date() {
+        let provider = apt_upgrade_provider_plan(Vec::new());
+        let mut plan = crate::maintenance::MaintenancePlan::new(
+            crate::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            vec![provider],
+        );
+        plan.operation_id = "mnt-test-1".into();
+        let result = maintenance_result(
+            crate::maintenance::MaintenanceStatus::Succeeded,
+            crate::maintenance::MaintenanceProviderStatus::Succeeded,
+            Some(VerificationResult::Verified),
+            vec!["no remaining APT upgrades".into()],
+            PackageSource::Apt,
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1500 },
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.summary, "System already up to date");
+        assert_eq!(record.status, OperationStatus::Succeeded);
+        assert_eq!(record.duration_ms, Some(500));
+        assert_eq!(record.started_at_unix_ms, 1000);
+    }
+
+    #[test]
+    fn candidate_bearing_upgrade_with_unknown_changes_is_not_already_up_to_date() {
+        let provider = apt_upgrade_provider_plan(vec![openssl_candidate()]);
+        let mut plan = crate::maintenance::MaintenancePlan::new(
+            crate::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            vec![provider],
+        );
+        plan.operation_id = "mnt-test-1".into();
+        let result = maintenance_result(
+            crate::maintenance::MaintenanceStatus::Succeeded,
+            crate::maintenance::MaintenanceProviderStatus::Succeeded,
+            Some(VerificationResult::Verified),
+            vec!["planned candidate version observation unavailable (dpkg-query failed)".into()],
+            PackageSource::Apt,
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1400 },
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_ne!(record.summary, "System already up to date");
+        assert!(record.summary.contains("package-level verification incomplete"));
+        assert_eq!(record.status, OperationStatus::PartiallyVerified);
+        assert_eq!(record.duration_ms, Some(400));
+    }
+
+    #[test]
+    fn running_journal_is_written_before_executor_and_interrupted_stays_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbis-journal-running-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let journal = OperationJournal::at(&dir);
+        let started = begin_running(
+            &journal,
+            "mnt-run-1",
+            OperationType::SystemUpdate,
+            "Update the system",
+            Some(PackageSource::Apt),
+            42,
+        )
+        .expect("running write");
+        assert_eq!(started, 42);
+        let recorded = journal.get("mnt-run-1").expect("read").expect("present");
+        assert_eq!(recorded.status, OperationStatus::Running);
+        assert_eq!(recorded.started_at_unix_ms, 42);
+        assert!(recorded.completed_at_unix_ms.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duration_uses_actual_operation_start() {
+        let provider = apt_upgrade_provider_plan(Vec::new());
+        let mut plan = crate::maintenance::MaintenancePlan::new(
+            crate::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            vec![provider],
+        );
+        plan.operation_id = "mnt-test-1".into();
+        let result = maintenance_result(
+            crate::maintenance::MaintenanceStatus::Succeeded,
+            crate::maintenance::MaintenanceProviderStatus::Succeeded,
+            Some(VerificationResult::Verified),
+            Vec::new(),
+            PackageSource::Apt,
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 10_000, completed_at_unix_ms: 12_250 },
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.started_at_unix_ms, 10_000);
+        assert_eq!(record.completed_at_unix_ms, Some(12_250));
+        assert_eq!(record.duration_ms, Some(2_250));
+    }
+
+    #[test]
+    fn non_apt_verification_text_never_claims_dpkg() {
+        let plan = sample_plan(OperationAction::Install);
+        let mut npm_plan = plan.clone();
+        npm_plan.target.source = PackageSource::Npm;
+        npm_plan.target.name = "left-pad".into();
+        let request = OperationRequest {
+            action: OperationAction::Install,
+            package: PackageRefJson { source: Some(PackageSource::Npm), query: "left-pad".into() },
+            scope: Some(InstallScope::User),
+            channel: None,
+        };
+        let result = TransactionResult {
+            plan: npm_plan,
+            execution: ExecutionSummary {
+                exit_status: Some(0),
+                process_succeeded: true,
+                message: None,
+            },
+            verification: VerificationResult::Verified,
+            status: TransactionStatus::Succeeded,
+            changes: Vec::new(),
+            warnings: Vec::new(),
+            diagnosis: None,
+            raw_commands: Vec::new(),
+            checks: vec!["Provider installed-state verification".into()],
+        };
+        let record = from_transaction(
+            &request,
+            &result,
+            OperationTiming { started_at_unix_ms: 1, completed_at_unix_ms: 2 },
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        let checks = record.verification.unwrap().checks.join(" ");
+        assert!(!checks.to_ascii_lowercase().contains("dpkg"));
+
+        for source in [PackageSource::Snap, PackageSource::Flatpak, PackageSource::Npm] {
+            let provider = apt_upgrade_provider_plan(Vec::new());
+            let mut snap_plan = crate::maintenance::MaintenancePlan::new(
+                crate::maintenance::MaintenanceAction::Upgrade,
+                Some(source),
+                vec![provider],
+            );
+            snap_plan.operation_id = "mnt-test-1".into();
+            snap_plan.source = Some(source);
+            let result = maintenance_result(
+                crate::maintenance::MaintenanceStatus::Succeeded,
+                crate::maintenance::MaintenanceProviderStatus::Succeeded,
+                Some(VerificationResult::Verified),
+                vec!["Provider maintenance verification".into()],
+                source,
+            );
+            let record = from_maintenance(
+                &snap_plan,
+                &result,
+                OperationTiming { started_at_unix_ms: 1, completed_at_unix_ms: 2 },
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+            );
+            let text = record
+                .verification
+                .as_ref()
+                .map(|report| report.checks.join(" "))
+                .unwrap_or_default();
+            assert!(!text.to_ascii_lowercase().contains("dpkg"), "{source:?}");
+        }
     }
 }

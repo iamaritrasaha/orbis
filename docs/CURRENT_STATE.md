@@ -1,6 +1,7 @@
 # Orbis current state
 
-Updated: 2026-09-22. Baseline before this session: `0.1.0-beta.1.dev.17`.
+Updated: 2026-09-22. Baseline: `0.1.0-beta.1.dev.18` outcome-integrity
+correction on `flagship-dev18`. Not merged; no `dev.19`.
 
 ## Version
 
@@ -8,8 +9,23 @@ Updated: 2026-09-22. Baseline before this session: `0.1.0-beta.1.dev.17`.
 
 ## Completed work (this session)
 
-Product-model correction: Orbis now thinks in **operations / outcomes**, not
-shell commands.
+Outcome-integrity correction on the operations/outcomes model:
+
+- APT installed-version observation is typed (`Observed` vs `Unavailable`).
+  dpkg-query failure, missing binary, and parse failure no longer collapse
+  into an empty map that verified removals.
+- APT update summaries: "already up to date" only when the reviewed plan had
+  zero candidates. Incomplete package-level observation is
+  `PartiallyVerified`, never inferred from an empty change list.
+- Mutating maintenance writes `OperationStatus::Running` fail-closed before
+  the executor; CLI and TUI share that lifecycle. Journal start/end reuse one
+  timestamp. Final journal write failures are surfaced, not ignored.
+- Journal verification checks carry actual observation evidence. Non-APT
+  records never claim "via dpkg".
+- Health is tri-state: probe/inventory failure renders `unknown`, not ok/zero.
+
+Product-model from the same development line: Orbis thinks in **operations /
+outcomes**, not shell commands.
 
 - **Operation journal.** New durable store under
   `$XDG_STATE_HOME/orbis/operations` records one meaningful operation per user
@@ -40,15 +56,20 @@ shell commands.
 - `cargo fmt --all -- --check` clean (after fmt).
 - `cargo check --workspace` clean.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- `cargo test --workspace`: 220 tests green (91 CLI + 129 core; was 207).
+- `cargo test --workspace`: 233 tests green (92 CLI + 141 core; was 220).
 - `cargo build --workspace --release` succeeds.
 - `git diff --check` clean.
 
 ## Known failures
 
-None known at this commit. Standing limitations remain by design: Flatpak
-upgrades are not auto-executable; Cargo upgrade remains blocked; non-APT
-providers still use lighter verification than the APT vertical slice.
+Release workflow `plan` job fails on PRs: `dist plan` refuses
+`.github/workflows/release.yml` as stale because a curated GitHub Release
+notes block was added after cargo-dist generated the file. cargo-dist 0.32.0
+wants the stock `gh release create` notes path. Not changed in this
+correction (release infrastructure left untouched). Standing product
+limitations remain by design: Flatpak upgrades are not auto-executable; Cargo
+upgrade remains blocked; non-APT providers still use lighter verification
+than the APT vertical slice.
 
 ## Manual QA remaining (needs a human; Orbis performed none of these)
 

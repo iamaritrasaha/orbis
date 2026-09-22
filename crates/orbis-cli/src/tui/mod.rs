@@ -3631,6 +3631,7 @@ mod tests {
             warnings: Vec::new(),
             diagnosis: None,
             raw_commands: Vec::new(),
+            checks: Vec::new(),
         });
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");

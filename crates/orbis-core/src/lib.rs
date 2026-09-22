@@ -301,6 +301,7 @@ impl ProviderRegistry {
             warnings: observed.warnings,
             diagnosis: observed.diagnosis,
             raw_commands: observed.raw_commands,
+            checks: observed.checks,
         })
     }
 
@@ -360,10 +361,9 @@ impl ProviderRegistry {
             .map_err(TransactionError::History)?;
 
         let journal = operation_journal_for_history(history);
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_millis() as u64);
-        let _ = journal.write(&operation::running(
+        let started_at = operation::unix_now_ms();
+        operation::begin_running(
+            &journal,
             &operation_id,
             operation::type_for_plan(&plan),
             match request.action {
@@ -375,7 +375,9 @@ impl ProviderRegistry {
                 }
             },
             Some(plan.target.source),
-        ));
+            started_at,
+        )
+        .map_err(TransactionError::History)?;
 
         match self.execute_transaction_with_observer(plan.clone(), executor, observer) {
             Ok(result) => {
@@ -395,13 +397,19 @@ impl ProviderRegistry {
                 let record = operation::from_transaction(
                     request,
                     &result,
-                    started_at,
+                    operation::OperationTiming {
+                        started_at_unix_ms: started_at,
+                        completed_at_unix_ms: operation::unix_now_ms(),
+                    },
                     result.changes.clone(),
                     result.warnings.clone(),
                     result.diagnosis.clone(),
                     result.raw_commands.clone(),
                 );
-                let _ = journal.write(&record);
+                let mut result = result;
+                if let Err(error) = journal.write(&record) {
+                    result.warnings.push(format!("Could not persist operation journal: {error}"));
+                }
 
                 let final_stage = if result.status == TransactionStatus::Failed {
                     progress::ExecutionStage::Failed
@@ -432,6 +440,7 @@ impl ProviderRegistry {
                     warnings: Vec::new(),
                     diagnosis: None,
                     raw_commands: Vec::new(),
+                    checks: Vec::new(),
                 };
                 let _ = history.write(
                     &transaction::history::TransactionRecord::completed(
@@ -443,13 +452,24 @@ impl ProviderRegistry {
                 let record = operation::from_transaction(
                     request,
                     &failed,
-                    started_at,
+                    operation::OperationTiming {
+                        started_at_unix_ms: started_at,
+                        completed_at_unix_ms: operation::unix_now_ms(),
+                    },
                     Vec::new(),
                     Vec::new(),
                     None,
                     Vec::new(),
                 );
-                let _ = journal.write(&record);
+                if journal.write(&record).is_err() {
+                    // Mutation did not succeed; still surface journal persistence failure.
+                    observer.on_event(&progress::OperationEvent::Finished {
+                        stage: progress::ExecutionStage::Failed,
+                        message: Some(format!("{error}; also could not persist operation journal")),
+                        operation_id,
+                    });
+                    return Err(error);
+                }
                 observer.on_event(&progress::OperationEvent::Finished {
                     stage: progress::ExecutionStage::Failed,
                     message: Some(error.to_string()),
@@ -728,6 +748,7 @@ impl ProviderRegistry {
                     warnings: Vec::new(),
                     diagnosis: None,
                     raw_commands: Vec::new(),
+                    checks: Vec::new(),
                 }],
             });
         }
@@ -838,6 +859,7 @@ impl ProviderRegistry {
                     warnings: observed.warnings,
                     diagnosis: observed.diagnosis,
                     raw_commands: observed.raw_commands,
+                    checks: observed.checks,
                 }],
             });
         }
@@ -890,6 +912,7 @@ impl ProviderRegistry {
         } else {
             crate::outcome::ObservedOutcome {
                 verification: remaining,
+                checks: vec!["Provider maintenance verification".into()],
                 ..crate::outcome::ObservedOutcome::default()
             }
         };
@@ -951,6 +974,7 @@ impl ProviderRegistry {
                 warnings: observed.warnings,
                 diagnosis: observed.diagnosis,
                 raw_commands: observed.raw_commands,
+                checks: observed.checks,
             }],
         })
     }

@@ -890,16 +890,24 @@ impl Renderer {
         if let Some(kernel) = &insight.kernel {
             output.push_str(&format!("  Kernel         {kernel}\n"));
         }
-        if let Some(pending) = insight.pending_updates {
-            output.push_str(&format!("  Pending updates  {pending}\n"));
-        }
+        output.push_str(&format!(
+            "  Pending updates  {}\n",
+            insight
+                .pending_updates
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
         output.push_str(&format!(
             "  Reboot required  {}\n",
             if insight.reboot.required { "yes" } else { "no" }
         ));
         output.push_str(&format!(
             "  Dependencies     {}\n",
-            if insight.dependencies.broken { "broken" } else { "ok" }
+            match insight.dependencies.status {
+                orbis_core::apt_ops::DependencyHealthStatus::Healthy => "ok",
+                orbis_core::apt_ops::DependencyHealthStatus::Broken => "broken",
+                orbis_core::apt_ops::DependencyHealthStatus::Unknown => "unknown",
+            }
         ));
         if !insight.failed_units.is_empty() {
             output.push_str(&format!("  Failed units     {}\n", insight.failed_units.join(", ")));
@@ -2046,7 +2054,11 @@ mod tests {
             read_only: true,
         };
         let insight = orbis_core::system::SystemInsight::default();
-        assert!(renderer.health(&doctor, &insight).contains("HEALTH"));
+        let health = renderer.health(&doctor, &insight);
+        assert!(health.contains("HEALTH"));
+        assert!(health.contains("Pending updates  unknown"));
+        assert!(health.contains("Dependencies     unknown"));
+        assert!(!health.contains("Dependencies     ok"));
     }
 
     #[test]
@@ -2189,6 +2201,7 @@ mod tests {
                     warnings: Vec::new(),
                     diagnosis: None,
                     raw_commands: Vec::new(),
+                    checks: Vec::new(),
                 },
                 MaintenanceProviderResult {
                     source: PackageSource::Flatpak,
@@ -2201,6 +2214,7 @@ mod tests {
                     warnings: Vec::new(),
                     diagnosis: None,
                     raw_commands: Vec::new(),
+                    checks: Vec::new(),
                 },
                 MaintenanceProviderResult {
                     source: PackageSource::Flatpak,
@@ -2213,6 +2227,7 @@ mod tests {
                     warnings: Vec::new(),
                     diagnosis: None,
                     raw_commands: Vec::new(),
+                    checks: Vec::new(),
                 },
             ],
         };

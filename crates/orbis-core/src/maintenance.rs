@@ -97,6 +97,17 @@ impl UpdateInventoryReport {
     pub fn total(&self) -> usize {
         self.candidates.len()
     }
+
+    /// Known pending-update count for `source`. Inventory failure is unknown, not zero.
+    pub fn known_pending_count(&self, source: PackageSource) -> Option<usize> {
+        if self.issues.iter().any(|issue| issue.source == source) {
+            return None;
+        }
+        match self.inventories.iter().find(|inventory| inventory.source == source) {
+            Some(inventory) if inventory.available => Some(inventory.candidates.len()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,6 +296,9 @@ pub struct MaintenanceProviderResult {
     /// Expandable raw command references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_commands: Vec<crate::facts::RawCommandRef>,
+    /// Verification evidence actually gathered for this provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -655,5 +669,26 @@ mod tests {
                 package_ids: vec!["example".into(), "second".into()]
             })
         );
+    }
+
+    #[test]
+    fn apt_update_inventory_failure_makes_pending_count_unknown() {
+        let report = UpdateInventoryReport {
+            inventories: vec![ProviderUpdateInventory {
+                source: PackageSource::Apt,
+                available: false,
+                candidates: Vec::new(),
+                notes: vec!["Provider could not answer this read-only inventory query.".into()],
+                metadata_state: None,
+            }],
+            candidates: Vec::new(),
+            issues: vec![crate::models::ProviderIssue {
+                source: PackageSource::Apt,
+                message: "APT is unavailable".into(),
+                technical: None,
+            }],
+        };
+        assert_eq!(report.known_pending_count(PackageSource::Apt), None);
+        assert_eq!(report.total(), 0);
     }
 }
