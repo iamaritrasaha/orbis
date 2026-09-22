@@ -13,8 +13,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::maintenance::{
-    MaintenanceAction, MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult,
-    MaintenanceStatus,
+    MaintenanceAction, MaintenancePlan, MaintenanceProviderResult, MaintenanceProviderStatus,
+    MaintenanceResult, MaintenanceStatus,
 };
 use crate::models::PackageSource;
 use crate::transaction::{
@@ -375,21 +375,32 @@ pub fn from_maintenance(
         }) || matches!(provider.verification, Some(VerificationResult::PartiallyVerified))
             && provider.checks.iter().any(|check| check.contains("unavailable"))
     });
-    if plan.action == MaintenanceAction::Upgrade
+    let upgrade_outcome_downgraded = plan.action == MaintenanceAction::Upgrade
         && planned_candidates > 0
-        && status == OperationStatus::Succeeded
-        && (observation_incomplete || upgraded == 0)
-    {
+        && (observation_incomplete || upgraded == 0);
+    if upgrade_outcome_downgraded && status == OperationStatus::Succeeded {
         status = OperationStatus::PartiallyVerified;
     }
-    let verified = result.providers.iter().all(|provider| {
+    // Aggregate verification over executed providers only. Skipped/blocked
+    // providers were never executed, so they contribute neither evidence nor
+    // doubt; a coverage limitation must not read as failed verification.
+    let verification_result = match aggregate_provider_verification(&result.providers) {
+        Some(VerificationResult::Verified) if upgrade_outcome_downgraded => {
+            Some(VerificationResult::PartiallyVerified)
+        }
+        other => other,
+    };
+    let verified = matches!(verification_result, Some(VerificationResult::Verified));
+    let executed_failed = result
+        .providers
+        .iter()
+        .any(|provider| provider.status == MaintenanceProviderStatus::Failed);
+    let coverage_incomplete = result.providers.iter().any(|provider| {
         matches!(
             provider.status,
-            MaintenanceProviderStatus::Succeeded
-                | MaintenanceProviderStatus::Skipped
-                | MaintenanceProviderStatus::Blocked
-        ) && provider.verification.is_none_or(|v| matches!(v, VerificationResult::Verified))
-    }) && status == OperationStatus::Succeeded;
+            MaintenanceProviderStatus::Skipped | MaintenanceProviderStatus::Blocked
+        )
+    });
     let intent: String = match plan.action {
         MaintenanceAction::Refresh => "Refresh package metadata".into(),
         MaintenanceAction::Upgrade => "Update the system".into(),
@@ -408,7 +419,23 @@ pub fn from_maintenance(
         (MaintenanceAction::Upgrade, OperationStatus::PartiallyVerified)
             if planned_candidates > 0 =>
         {
-            "System update completed; package-level verification incomplete".into()
+            if executed_failed {
+                "System update partially failed".into()
+            } else if matches!(verification_result, Some(VerificationResult::PartiallyVerified)) {
+                "System update completed; package-level verification incomplete".into()
+            } else {
+                // Executed providers verified; the partial status is a coverage limitation.
+                format!(
+                    "{upgraded} package{} upgraded and verified; some providers were not covered",
+                    if upgraded == 1 { "" } else { "s" }
+                )
+            }
+        }
+        (MaintenanceAction::Upgrade, OperationStatus::PartiallyVerified) if executed_failed => {
+            "System update partially failed".into()
+        }
+        (MaintenanceAction::Upgrade, OperationStatus::PartiallyVerified) if coverage_incomplete => {
+            "System already up to date; some providers were not covered".into()
         }
         (MaintenanceAction::Upgrade, OperationStatus::Succeeded) => {
             "System already up to date".into()
@@ -432,11 +459,11 @@ pub fn from_maintenance(
     };
     let checks: Vec<String> =
         result.providers.iter().flat_map(|provider| provider.checks.iter().cloned()).collect();
-    let verification = result
-        .providers
-        .iter()
-        .find_map(|provider| provider.verification)
-        .map(|v| VerificationReport { result: v, verified, checks });
+    let verification = verification_result.map(|aggregate| VerificationReport {
+        result: aggregate,
+        verified,
+        checks,
+    });
     OperationRecord {
         schema_version: SCHEMA_VERSION,
         id: result.operation_id.clone(),
@@ -455,6 +482,47 @@ pub fn from_maintenance(
         raw_commands,
         message: result.providers.iter().find_map(|provider| provider.message.clone()),
     }
+}
+
+/// Aggregates per-provider verification into one report result.
+///
+/// Only executed providers (succeeded, partially succeeded, or failed) count.
+/// Skipped/blocked providers were not executed and can neither verify nor
+/// invalidate anything. Failure dominates, then partial verification; executed
+/// providers without verification evidence keep the aggregate incomplete.
+fn aggregate_provider_verification(
+    providers: &[MaintenanceProviderResult],
+) -> Option<VerificationResult> {
+    let executed: Vec<&MaintenanceProviderResult> = providers
+        .iter()
+        .filter(|provider| {
+            matches!(
+                provider.status,
+                MaintenanceProviderStatus::Succeeded
+                    | MaintenanceProviderStatus::PartiallySucceeded
+                    | MaintenanceProviderStatus::Failed
+            )
+        })
+        .collect();
+    if executed.is_empty() {
+        return None;
+    }
+    if executed.iter().any(|provider| {
+        provider.status == MaintenanceProviderStatus::Failed
+            || provider.verification == Some(VerificationResult::Failed)
+    }) {
+        return Some(VerificationResult::Failed);
+    }
+    if executed
+        .iter()
+        .any(|provider| provider.verification == Some(VerificationResult::PartiallyVerified))
+    {
+        return Some(VerificationResult::PartiallyVerified);
+    }
+    if executed.iter().all(|provider| provider.verification == Some(VerificationResult::Verified)) {
+        return Some(VerificationResult::Verified);
+    }
+    Some(VerificationResult::PartiallyVerified)
 }
 
 /// Running marker written before mutation.
@@ -1004,6 +1072,265 @@ mod tests {
         assert_eq!(record.started_at_unix_ms, 10_000);
         assert_eq!(record.completed_at_unix_ms, Some(12_250));
         assert_eq!(record.duration_ms, Some(2_250));
+    }
+
+    fn provider_result(
+        source: PackageSource,
+        status: crate::maintenance::MaintenanceProviderStatus,
+        verification: Option<VerificationResult>,
+        checks: Vec<String>,
+    ) -> crate::maintenance::MaintenanceProviderResult {
+        crate::maintenance::MaintenanceProviderResult {
+            source,
+            action: crate::maintenance::MaintenanceAction::Upgrade,
+            status,
+            candidate_count: 0,
+            verification,
+            message: None,
+            changes: Vec::new(),
+            warnings: Vec::new(),
+            diagnosis: None,
+            raw_commands: Vec::new(),
+            checks,
+        }
+    }
+
+    fn upgrade_result(
+        status: crate::maintenance::MaintenanceStatus,
+        providers: Vec<crate::maintenance::MaintenanceProviderResult>,
+    ) -> crate::maintenance::MaintenanceResult {
+        crate::maintenance::MaintenanceResult {
+            operation_id: "mnt-test-1".into(),
+            action: crate::maintenance::MaintenanceAction::Upgrade,
+            status,
+            providers,
+        }
+    }
+
+    /// APT plan with one candidate plus a blocked-by-design optional provider.
+    fn apt_plus_optional_plan(
+        optional_source: PackageSource,
+    ) -> crate::maintenance::MaintenancePlan {
+        let apt = apt_upgrade_provider_plan(vec![openssl_candidate()]);
+        let mut optional = apt.clone();
+        optional.source = optional_source;
+        optional.candidates = Vec::new();
+        let mut plan = crate::maintenance::MaintenancePlan::new(
+            crate::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            vec![apt, optional],
+        );
+        plan.operation_id = "mnt-test-1".into();
+        plan
+    }
+
+    fn upgraded_change() -> PackageChange {
+        PackageChange {
+            package_id: "openssl".into(),
+            name: Some("openssl".into()),
+            kind: ChangeKind::Upgraded,
+            from_version: Some("1.0".into()),
+            to_version: Some("3.0".into()),
+        }
+    }
+
+    fn report_of(record: &OperationRecord) -> crate::facts::VerificationReport {
+        record.verification.clone().expect("verification report present")
+    }
+
+    #[test]
+    fn apt_verified_with_blocked_provider_reports_coverage_not_verification_gap() {
+        let plan = apt_plus_optional_plan(PackageSource::Cargo);
+        let result = upgrade_result(
+            crate::maintenance::MaintenanceStatus::PartiallySucceeded,
+            vec![
+                provider_result(
+                    PackageSource::Apt,
+                    crate::maintenance::MaintenanceProviderStatus::Succeeded,
+                    Some(VerificationResult::Verified),
+                    vec!["dpkg package state observed".into(), "no remaining APT upgrades".into()],
+                ),
+                provider_result(
+                    PackageSource::Cargo,
+                    crate::maintenance::MaintenanceProviderStatus::Skipped,
+                    None,
+                    Vec::new(),
+                ),
+            ],
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1100 },
+            vec![upgraded_change()],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.status, OperationStatus::PartiallyVerified);
+        let report = report_of(&record);
+        assert_eq!(report.result, VerificationResult::Verified);
+        assert!(report.verified);
+        assert_eq!(
+            record.summary,
+            "1 package upgraded and verified; some providers were not covered"
+        );
+        // Internal consistency: result and verified never contradict each other.
+        assert!(!(report.result == VerificationResult::Verified && !report.verified));
+    }
+
+    #[test]
+    fn apt_partially_verified_reports_package_level_incompleteness() {
+        let plan = apt_plus_optional_plan(PackageSource::Cargo);
+        let result = upgrade_result(
+            crate::maintenance::MaintenanceStatus::PartiallySucceeded,
+            vec![
+                provider_result(
+                    PackageSource::Apt,
+                    crate::maintenance::MaintenanceProviderStatus::PartiallySucceeded,
+                    Some(VerificationResult::PartiallyVerified),
+                    vec![
+                        "planned candidate version observation unavailable (dpkg-query failed)"
+                            .into(),
+                    ],
+                ),
+                provider_result(
+                    PackageSource::Cargo,
+                    crate::maintenance::MaintenanceProviderStatus::Skipped,
+                    None,
+                    Vec::new(),
+                ),
+            ],
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1100 },
+            vec![upgraded_change()],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.status, OperationStatus::PartiallyVerified);
+        let report = report_of(&record);
+        assert_eq!(report.result, VerificationResult::PartiallyVerified);
+        assert!(!report.verified);
+        assert_eq!(
+            record.summary,
+            "System update completed; package-level verification incomplete"
+        );
+    }
+
+    #[test]
+    fn failed_provider_makes_aggregate_verification_failed() {
+        let plan = apt_plus_optional_plan(PackageSource::Snap);
+        let result = upgrade_result(
+            crate::maintenance::MaintenanceStatus::PartiallySucceeded,
+            vec![
+                provider_result(
+                    PackageSource::Apt,
+                    crate::maintenance::MaintenanceProviderStatus::Succeeded,
+                    Some(VerificationResult::Verified),
+                    vec!["no remaining APT upgrades".into()],
+                ),
+                provider_result(
+                    PackageSource::Snap,
+                    crate::maintenance::MaintenanceProviderStatus::Failed,
+                    None,
+                    Vec::new(),
+                ),
+            ],
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1100 },
+            vec![upgraded_change()],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.status, OperationStatus::PartiallyVerified);
+        let report = report_of(&record);
+        assert_eq!(report.result, VerificationResult::Failed);
+        assert!(!report.verified);
+        assert_eq!(record.summary, "System update partially failed");
+    }
+
+    #[test]
+    fn single_source_apt_verified_upgrade_stays_fully_verified() {
+        let provider = apt_upgrade_provider_plan(vec![openssl_candidate()]);
+        let mut plan = crate::maintenance::MaintenancePlan::new(
+            crate::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            vec![provider],
+        );
+        plan.operation_id = "mnt-test-1".into();
+        let result = maintenance_result(
+            crate::maintenance::MaintenanceStatus::Succeeded,
+            crate::maintenance::MaintenanceProviderStatus::Succeeded,
+            Some(VerificationResult::Verified),
+            vec!["dpkg package state observed".into(), "no remaining APT upgrades".into()],
+            PackageSource::Apt,
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1100 },
+            vec![upgraded_change()],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.status, OperationStatus::Succeeded);
+        let report = report_of(&record);
+        assert_eq!(report.result, VerificationResult::Verified);
+        assert!(report.verified);
+        assert_eq!(record.summary, "1 package upgraded and verified");
+    }
+
+    #[test]
+    fn zero_candidate_upgrade_with_skipped_provider_keeps_coverage_wording() {
+        let apt = apt_upgrade_provider_plan(Vec::new());
+        let mut cargo = apt.clone();
+        cargo.source = PackageSource::Cargo;
+        let mut plan = crate::maintenance::MaintenancePlan::new(
+            crate::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            vec![apt, cargo],
+        );
+        plan.operation_id = "mnt-test-1".into();
+        let result = upgrade_result(
+            crate::maintenance::MaintenanceStatus::PartiallySucceeded,
+            vec![
+                provider_result(
+                    PackageSource::Apt,
+                    crate::maintenance::MaintenanceProviderStatus::Succeeded,
+                    Some(VerificationResult::Verified),
+                    Vec::new(),
+                ),
+                provider_result(
+                    PackageSource::Cargo,
+                    crate::maintenance::MaintenanceProviderStatus::Skipped,
+                    None,
+                    Vec::new(),
+                ),
+            ],
+        );
+        let record = from_maintenance(
+            &plan,
+            &result,
+            OperationTiming { started_at_unix_ms: 1000, completed_at_unix_ms: 1100 },
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(record.status, OperationStatus::PartiallyVerified);
+        let report = report_of(&record);
+        assert_eq!(report.result, VerificationResult::Verified);
+        assert!(report.verified);
+        assert_eq!(record.summary, "System already up to date; some providers were not covered");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Orbis current state
 
-Updated: 2026-09-22. Baseline: `0.1.0-beta.1.dev.18` outcome-integrity
+Updated: 2026-09-22. Baseline: `0.1.0-beta.1.dev.18` final outcome-integrity
 correction on `flagship-dev18`. Not merged; no `dev.19`.
 
 ## Version
@@ -9,7 +9,38 @@ correction on `flagship-dev18`. Not merged; no `dev.19`.
 
 ## Completed work (this session)
 
-Outcome-integrity correction on the operations/outcomes model:
+Final outcome-integrity correction (four semantic defects fixed on top of the
+earlier dev.18 correction; no regressions to it):
+
+- dpkg non-installed states are authoritative absence, not probe failures.
+  `dpkg-query` rows such as `deinstall ok config-files` or
+  `purge ok not-installed` now parse as valid rows, so a removal of a
+  known-but-removed package verifies as `Absent` instead of failing the probe.
+  The parser distinguishes valid installed rows, valid non-installed rows,
+  malformed lines (fail closed → `ParseFailed`), absent-stderr, and query
+  failure. Malformed output is never treated as absence.
+- `dpkg-query` observation runs under `LC_ALL=C` so dpkg status/error parsing
+  is deterministic regardless of host locale; a test asserts the generated
+  `CommandSpec` pins the locale.
+- Dependency health is honestly tri-state. Only observed evidence
+  (`BrokenDependencies`, `InterruptedDpkg`) produces `Broken`; locks,
+  permission failures, unavailable commands, and unclassified errors produce
+  `Unknown` with the summary retained. Uncertainty is never converted into
+  broken or healthy.
+- Maintenance verification is aggregated explicitly. The journal report is
+  computed over executed providers only (any failed → `Failed`, else any
+  partial → `PartiallyVerified`, else all verified → `Verified`, else
+  incomplete); skipped/blocked providers contribute neither evidence nor
+  doubt. `verified` is always consistent with `result`, so no record can
+  serialize `result = verified` with `verified = false`.
+- Coverage is distinguished from verification in summaries: executed
+  verification incomplete → "System update completed; package-level
+  verification incomplete"; executed providers verified with others
+  skipped/blocked → "N packages upgraded and verified; some providers were
+  not covered"; an executed provider failure → "System update partially
+  failed".
+
+Outcome-integrity correction from earlier in this line (preserved):
 
 - APT installed-version observation is typed (`Observed` vs `Unavailable`).
   dpkg-query failure, missing binary, and parse failure no longer collapse
@@ -56,9 +87,11 @@ outcomes**, not shell commands.
 - `cargo fmt --all -- --check` clean (after fmt).
 - `cargo check --workspace` clean.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- `cargo test --workspace`: 233 tests green (92 CLI + 141 core; was 220).
+- `cargo test --workspace`: 243 tests green (92 CLI + 151 core; was 233).
 - `cargo build --workspace --release` succeeds.
 - `git diff --check` clean.
+- Read-only host QA: `orbis health` renders tri-state dependency health; the
+  host's real `deinstall ok config-files` dpkg rows match the new parser.
 
 ## Known failures
 
