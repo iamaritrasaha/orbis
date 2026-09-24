@@ -110,16 +110,16 @@ impl Theme {
         if self.unicode {
             match token {
                 Token::Primary => "◈",
-                Token::Positive => "●",
-                Token::Unavailable => "○",
+                Token::Positive => "✓",
+                Token::Unavailable => "?",
                 Token::Caution | Token::Destructive => "!",
                 _ => "·",
             }
         } else {
             match token {
                 Token::Primary => "*",
-                Token::Positive => "*",
-                Token::Unavailable => "o",
+                Token::Positive => "+",
+                Token::Unavailable => "?",
                 Token::Caution => "!",
                 _ => "-",
             }
@@ -128,7 +128,7 @@ impl Theme {
 
     /// Returns a single-line compact header mark.
     pub(crate) fn brand_compact(self) -> &'static str {
-        if self.unicode { "◈ ORBIS" } else { "* ORBIS" }
+        if self.unicode { "◈ Orbis" } else { "* Orbis" }
     }
 
     /// Returns the Orbis tagline.
@@ -140,13 +140,13 @@ impl Theme {
     pub(crate) fn stage_mark(self, state: StageState) -> &'static str {
         if self.unicode {
             match state {
-                StageState::Done => "●",
+                StageState::Done => "✓",
                 StageState::Active => "⠹",
                 StageState::Pending => "○",
             }
         } else {
             match state {
-                StageState::Done => "*",
+                StageState::Done => "+",
                 StageState::Active => ">",
                 StageState::Pending => ".",
             }
@@ -209,9 +209,9 @@ mod tests {
     #[test]
     fn unicode_theme_provides_the_compact_orbis_brand() {
         let theme = Theme { color: true, unicode: true, width: 80, mode: ColorMode::TrueColor };
-        assert_eq!(theme.brand_compact(), "◈ ORBIS");
+        assert_eq!(theme.brand_compact(), "◈ Orbis");
         assert_eq!(Theme::brand_tagline(), "Your Linux software, in one place.");
-        assert_eq!(theme.stage_mark(StageState::Done), "●");
+        assert_eq!(theme.stage_mark(StageState::Done), "✓");
         assert_eq!(theme.stage_mark(StageState::Active), "⠹");
         assert_eq!(theme.stage_mark(StageState::Pending), "○");
     }
@@ -219,8 +219,8 @@ mod tests {
     #[test]
     fn ascii_theme_provides_safe_ascii_fallback() {
         let theme = Theme { color: false, unicode: false, width: 80, mode: ColorMode::None };
-        assert_eq!(theme.brand_compact(), "* ORBIS");
-        assert_eq!(theme.stage_mark(StageState::Done), "*");
+        assert_eq!(theme.brand_compact(), "* Orbis");
+        assert_eq!(theme.stage_mark(StageState::Done), "+");
         assert_eq!(theme.stage_mark(StageState::Active), ">");
         assert_eq!(theme.stage_mark(StageState::Pending), ".");
     }

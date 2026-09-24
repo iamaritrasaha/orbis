@@ -1,6 +1,8 @@
-use crate::render::theme::{StageState, Theme, Token};
+use crate::render::theme::{Theme, Token};
 use orbis_core::{
-    maintenance::{MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult},
+    maintenance::{
+        MaintenanceAction, MaintenancePlan, MaintenanceProviderStatus, MaintenanceResult,
+    },
     models::PackageSource,
     progress::{ExecutionStage, OperationEvent, OperationHeader, OutputStream, ProgressObserver},
     transaction::InstallScope,
@@ -43,7 +45,7 @@ enum ProviderViewState {
 #[derive(Clone)]
 enum RenderMode {
     Standard { header: OperationHeader, stages: &'static [ExecutionStage], refresh: bool },
-    Maintenance { rows: Vec<MaintenanceRowMeta> },
+    Maintenance { rows: Vec<MaintenanceRowMeta>, action: MaintenanceAction },
 }
 
 struct ActivityLine {
@@ -110,7 +112,13 @@ impl PlainProgressRenderer {
         preserve_raw_output: bool,
     ) -> Self {
         let rows = maintenance_rows(plan);
-        Self::with_mode(theme, RenderMode::Maintenance { rows }, is_tty, 5, preserve_raw_output)
+        Self::with_mode(
+            theme,
+            RenderMode::Maintenance { rows, action: plan.action },
+            is_tty,
+            2,
+            preserve_raw_output,
+        )
     }
 
     fn with_mode(
@@ -124,7 +132,7 @@ impl PlainProgressRenderer {
             RenderMode::Standard { stages, .. } => {
                 (stages.first().copied().unwrap_or(ExecutionStage::Preparing), Vec::new())
             }
-            RenderMode::Maintenance { rows } => (
+            RenderMode::Maintenance { rows, .. } => (
                 ExecutionStage::Preparing,
                 rows.iter()
                     .map(|row| {
@@ -187,7 +195,7 @@ impl PlainProgressRenderer {
             }
             let has_active_animation = match &self.mode {
                 RenderMode::Standard { .. } => true,
-                RenderMode::Maintenance { rows } => {
+                RenderMode::Maintenance { rows, .. } => {
                     rows.iter().any(|row| row.executable && row.mutates)
                 }
             };
@@ -257,14 +265,14 @@ impl PlainProgressRenderer {
     }
 
     pub(crate) fn finish_maintenance(&self, result: &MaintenanceResult) {
-        let RenderMode::Maintenance { rows } = &self.mode else { return };
+        let RenderMode::Maintenance { rows, .. } = &self.mode else { return };
         if let Ok(mut state) = self.state.lock() {
             for (row_index, row) in rows.iter().enumerate() {
                 state.provider_states[row_index] = maintenance_row_state(row, &result.providers);
             }
             state.active_provider = None;
             state.activity_lines.clear();
-            state.final_summary = Some(maintenance_summary(&state.provider_states));
+            state.final_summary = Some(maintenance_summary(result));
             state.running = false;
         }
         self.join_spinner();
@@ -272,7 +280,7 @@ impl PlainProgressRenderer {
     }
 
     pub(crate) fn mark_provider_failure(&self, source: PackageSource) {
-        let RenderMode::Maintenance { rows } = &self.mode else { return };
+        let RenderMode::Maintenance { rows, .. } = &self.mode else { return };
         if let Ok(mut state) = self.state.lock()
             && let Some((row_index, _)) = rows.iter().enumerate().find(|(row_index, row)| {
                 row.sources.contains(&source)
@@ -374,17 +382,9 @@ impl PlainProgressRenderer {
                 self.output_lines.lock().expect("output lines lock poisoned").clear();
                 if self.is_tty {
                     self.redraw();
-                } else {
-                    let state =
-                        if stage.is_terminal() { StageState::Done } else { StageState::Active };
-                    let token =
-                        if state == StageState::Done { Token::Positive } else { Token::Caution };
+                } else if *stage == ExecutionStage::Authenticating {
                     let _guard = output_lock();
-                    eprintln!(
-                        "  {} {}",
-                        self.theme.paint(self.theme.stage_mark(state), token),
-                        self.theme.paint(display_stage_label(*stage, refresh), Token::Foreground)
-                    );
+                    eprintln!("Administrator permission required…");
                 }
             }
             OperationEvent::ProviderOutput(line) => {
@@ -407,7 +407,7 @@ impl PlainProgressRenderer {
                 drop(inspected);
                 if self.is_tty {
                     self.redraw();
-                } else {
+                } else if self.preserve_raw_output {
                     let display_content = if self.preserve_raw_output {
                         content
                     } else {
@@ -424,13 +424,11 @@ impl PlainProgressRenderer {
             }
             OperationEvent::Finished { stage, message, .. } => {
                 self.finish_standard(*stage);
-                if let Some(message) = message {
+                if self.preserve_raw_output
+                    && let Some(message) = message
+                {
                     let _guard = output_lock();
-                    eprintln!(
-                        "\n  {} {}",
-                        self.theme.paint("Result", Token::Primary),
-                        sanitize_output(message)
-                    );
+                    eprintln!("{}", sanitize_output(message));
                 }
             }
             OperationEvent::Warning { message } => {
@@ -470,7 +468,7 @@ impl PlainProgressRenderer {
     }
 
     fn on_maintenance_event(&self, event: &OperationEvent) {
-        let RenderMode::Maintenance { rows } = &self.mode else { return };
+        let RenderMode::Maintenance { rows, .. } = &self.mode else { return };
         match event {
             OperationEvent::ProviderStarted { source } => {
                 if let Ok(mut state) = self.state.lock()
@@ -592,7 +590,9 @@ fn draw_tty_to_region<W: Write>(
         RenderMode::Standard { header, stages, refresh } => {
             standard_frame_lines(theme, header.privileged, stages, *refresh, state)
         }
-        RenderMode::Maintenance { rows } => maintenance_frame_lines(theme, rows, state),
+        RenderMode::Maintenance { rows, action } => {
+            maintenance_frame_lines(theme, rows, *action, state)
+        }
     };
     let meaningful_height = frame.len();
     let _ = region.render(writer, &frame);
@@ -611,7 +611,9 @@ fn draw_tty_to<W: Write>(
         RenderMode::Standard { header, stages, refresh } => {
             standard_frame_lines(theme, header.privileged, stages, *refresh, state)
         }
-        RenderMode::Maintenance { rows } => maintenance_frame_lines(theme, rows, state),
+        RenderMode::Maintenance { rows, action } => {
+            maintenance_frame_lines(theme, rows, *action, state)
+        }
     };
     let region = TransientRegion::new(state.rendered_line_count.max(frame.len()));
     let _ = region.render(writer, &frame);
@@ -619,78 +621,46 @@ fn draw_tty_to<W: Write>(
 }
 
 fn progress_region_height(mode: &RenderMode, max_output_lines: usize) -> usize {
-    match mode {
-        RenderMode::Standard { stages, .. } => stages.len() + max_output_lines + 1,
-        RenderMode::Maintenance { rows } => rows.len() + max_output_lines + 3,
-    }
+    let _ = (mode, max_output_lines);
+    2
 }
 
 fn standard_frame_lines(
     theme: Theme,
     privileged: bool,
-    stages: &'static [ExecutionStage],
+    _stages: &'static [ExecutionStage],
     refresh: bool,
     state: &ProgressState,
 ) -> Vec<String> {
-    let effective_current = match state.current_stage {
-        ExecutionStage::Authenticating => ExecutionStage::Executing,
-        stage => stage,
+    let title = match state.current_stage {
+        ExecutionStage::Authenticating if privileged => "Administrator permission required…",
+        ExecutionStage::Authenticating => "Preparing…",
+        ExecutionStage::Completed => "Done",
+        ExecutionStage::Failed => "Could not finish",
+        ExecutionStage::Executing if refresh => "Refreshing software information…",
+        ExecutionStage::Verifying => "Checking changes…",
+        ExecutionStage::SavingResult => "Finishing up…",
+        _ => "Working…",
     };
-    let current_index = stages.iter().position(|stage| *stage == effective_current);
-    let terminal = state.current_stage.is_terminal();
-    let mut lines = Vec::with_capacity(stages.len() + state.activity_lines.len() + 1);
-    for (index, &stage) in stages.iter().enumerate() {
-        if stage == ExecutionStage::Authenticating && !privileged {
-            continue;
-        }
-        let stage_state = if terminal || (stage == ExecutionStage::Authenticating && privileged) {
-            StageState::Done
-        } else if current_index == Some(index) {
-            StageState::Active
-        } else if current_index.is_some_and(|current| index < current) {
-            StageState::Done
-        } else {
-            StageState::Pending
-        };
-        let token = match stage_state {
-            StageState::Done => Token::Positive,
-            StageState::Active => Token::Caution,
-            StageState::Pending => Token::Muted,
-        };
-        let mark = if stage_state == StageState::Active {
-            spinner(theme, state.spinner_index)
-        } else {
-            theme.stage_mark(stage_state)
-        };
-        let label_token =
-            if stage_state == StageState::Pending { Token::Muted } else { Token::Foreground };
-        lines.push(format!(
-            "  {} {}{}",
-            theme.paint(mark, token),
-            theme.paint(display_stage_label(stage, refresh), label_token),
-            if stage_state == StageState::Active { " …" } else { "" }
-        ));
-        if stage_state == StageState::Active {
-            for activity in &state.activity_lines {
-                let pipe = if theme.unicode { "┊" } else { "|" };
-                lines.push(format!(
-                    "  {} {}",
-                    theme.paint(pipe, Token::Muted),
-                    theme.paint(&activity.text, Token::Muted)
-                ));
-            }
-        }
-    }
-    if terminal {
-        let label = if state.current_stage == ExecutionStage::Completed {
-            "Done"
-        } else {
-            "Could not finish"
-        };
+    let (mark, token) = match state.current_stage {
+        ExecutionStage::Completed => (theme.mark(Token::Positive), Token::Positive),
+        ExecutionStage::Failed => (theme.mark(Token::Destructive), Token::Destructive),
+        _ => (spinner(theme, state.spinner_index), Token::Primary),
+    };
+    let mut lines = vec![format!(
+        "{} {}",
+        theme.paint(mark, token),
+        theme.paint(
+            title,
+            if state.current_stage.is_terminal() { Token::Foreground } else { Token::Primary }
+        )
+    )];
+    if !state.activity_lines.is_empty() && !state.current_stage.is_terminal() {
+        let activity = state.activity_lines.back().expect("activity line exists");
         lines.push(format!(
             "  {} {}",
-            theme.paint(theme.stage_mark(StageState::Done), Token::Positive),
-            theme.paint(label, Token::Foreground)
+            theme.paint("·", Token::Muted),
+            theme.paint(&activity.text, Token::Muted)
         ));
     }
     lines
@@ -698,72 +668,36 @@ fn standard_frame_lines(
 
 fn maintenance_frame_lines(
     theme: Theme,
-    rows: &[MaintenanceRowMeta],
+    _rows: &[MaintenanceRowMeta],
+    action: MaintenanceAction,
     state: &ProgressState,
 ) -> Vec<String> {
-    let label_width = theme.width.saturating_sub(25).clamp(24, 34);
-    let mut lines = Vec::with_capacity(rows.len() + state.activity_lines.len() + 3);
-    for (index, row) in rows.iter().enumerate() {
-        let row_state = state.provider_states[index];
-        let (mark, token, status) = provider_view(row_state, theme, state.spinner_index);
+    let label = match action {
+        MaintenanceAction::Refresh => "Refreshing software information",
+        MaintenanceAction::Upgrade => "Updating software",
+        MaintenanceAction::Cleanup => "Cleaning up",
+    };
+    let label = state
+        .active_provider
+        .and_then(|index| _rows.get(index))
+        .map(|row| format!("{label} · {}", row.label))
+        .unwrap_or_else(|| label.to_owned());
+    let (mark, token, text) = if let Some(summary) = &state.final_summary {
+        let token = if summary.starts_with("!") { Token::Caution } else { Token::Positive };
+        (theme.mark(token), token, summary.clone())
+    } else {
+        let text = format!("{label}…");
+        (spinner(theme, state.spinner_index), Token::Primary, text)
+    };
+    let mut lines = vec![format!("{} {}", theme.paint(mark, token), theme.paint(&text, token))];
+    if let Some(activity) = state.activity_lines.back() {
         lines.push(format!(
-            "  {} {:<label_width$} {}",
-            theme.paint(mark, token),
-            theme.paint(&row.label, token),
-            theme.paint(status, token),
-            label_width = label_width
+            "  {} {}",
+            theme.paint("·", Token::Muted),
+            theme.paint(&activity.text, Token::Muted)
         ));
-        if state.active_provider == Some(index) {
-            for activity in &state.activity_lines {
-                let pipe = if theme.unicode { "┊" } else { "|" };
-                lines.push(format!(
-                    "  {} {}",
-                    theme.paint(pipe, Token::Muted),
-                    theme.paint(&activity.text, Token::Muted)
-                ));
-            }
-        }
     }
-    lines.push(String::new());
-    let rule = if theme.unicode { "─" } else { "-" };
-    lines.push(theme.paint(&rule.repeat(theme.width.clamp(40, 72)), Token::Divider));
-    let summary = state
-        .final_summary
-        .clone()
-        .unwrap_or_else(|| maintenance_live_summary(&state.provider_states));
-    lines.push(format!("  {}", theme.paint(&summary, Token::Muted)));
     lines
-}
-
-fn provider_view(
-    state: ProviderViewState,
-    theme: Theme,
-    spinner_index: usize,
-) -> (&'static str, Token, &'static str) {
-    match state {
-        ProviderViewState::Waiting => {
-            (if theme.unicode { "○" } else { "o" }, Token::Muted, "waiting")
-        }
-        ProviderViewState::Active => (spinner(theme, spinner_index), Token::Primary, "refreshing"),
-        ProviderViewState::Refreshed => {
-            (if theme.unicode { "●" } else { "*" }, Token::Positive, "refreshed")
-        }
-        ProviderViewState::PartiallyRefreshed => {
-            (if theme.unicode { "●" } else { "*" }, Token::Caution, "partially refreshed")
-        }
-        ProviderViewState::ManagedAutomatically => {
-            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "managed by snapd")
-        }
-        ProviderViewState::OnDemand => {
-            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "metadata on demand")
-        }
-        ProviderViewState::Skipped => {
-            (if theme.unicode { "○" } else { "o" }, Token::Muted, "unavailable")
-        }
-        ProviderViewState::Failed => {
-            (if theme.unicode { "×" } else { "x" }, Token::Destructive, "failed")
-        }
-    }
 }
 
 fn maintenance_rows(plan: &MaintenancePlan) -> Vec<MaintenanceRowMeta> {
@@ -827,40 +761,23 @@ fn maintenance_row_state(
     }
 }
 
-fn maintenance_live_summary(states: &[ProviderViewState]) -> String {
-    let refreshed = states
-        .iter()
-        .filter(|state| {
-            matches!(state, ProviderViewState::Refreshed | ProviderViewState::PartiallyRefreshed)
-        })
-        .count();
-    let active = states.iter().filter(|state| **state == ProviderViewState::Active).count();
-    let waiting = states.iter().filter(|state| **state == ProviderViewState::Waiting).count();
-    format!("{refreshed} refreshed   {active} active   {waiting} waiting")
-}
-
-fn maintenance_summary(states: &[ProviderViewState]) -> String {
-    let checked = states.len();
-    let refreshed = states
-        .iter()
-        .filter(|state| {
-            matches!(state, ProviderViewState::Refreshed | ProviderViewState::PartiallyRefreshed)
-        })
-        .count();
-    let no_refresh = states
-        .iter()
-        .filter(|state| {
-            matches!(state, ProviderViewState::ManagedAutomatically | ProviderViewState::OnDemand)
-        })
-        .count();
-    let failed = states.iter().filter(|state| **state == ProviderViewState::Failed).count();
-    if failed > 0 {
-        format!("{failed} source{} need attention", if failed == 1 { "" } else { "s" })
-    } else {
-        format!(
-            "{checked} source{} checked · {refreshed} refreshed · {no_refresh} require no refresh",
-            if checked == 1 { "" } else { "s" }
-        )
+fn maintenance_summary(result: &MaintenanceResult) -> String {
+    match result.status {
+        orbis_core::maintenance::MaintenanceStatus::Succeeded => {
+            let changed =
+                result.providers.iter().map(|provider| provider.changes.len()).sum::<usize>();
+            if changed == 0 {
+                "Done".into()
+            } else {
+                format!("{} package{} changed", changed, if changed == 1 { "" } else { "s" })
+            }
+        }
+        orbis_core::maintenance::MaintenanceStatus::PartiallySucceeded => {
+            "! Completed with limited verification".into()
+        }
+        orbis_core::maintenance::MaintenanceStatus::Failed
+        | orbis_core::maintenance::MaintenanceStatus::Blocked => "! Could not finish".into(),
+        orbis_core::maintenance::MaintenanceStatus::Cancelled => "Cancelled".into(),
     }
 }
 
@@ -960,21 +877,6 @@ fn spinner(theme: Theme, index: usize) -> &'static str {
         FRAMES[index % FRAMES.len()]
     } else {
         ["|", "/", "-", "\\"][index % 4]
-    }
-}
-
-fn display_stage_label(stage: ExecutionStage, refresh: bool) -> &'static str {
-    match stage {
-        ExecutionStage::Preparing => "Preparing",
-        ExecutionStage::AwaitingConfirmation => "Ready to continue",
-        ExecutionStage::Authenticating => "Permission granted",
-        ExecutionStage::Executing if refresh => "Refreshing information",
-        ExecutionStage::Executing => "Working",
-        ExecutionStage::Verifying if refresh => "Checking result",
-        ExecutionStage::Verifying => "Checking changes",
-        ExecutionStage::SavingResult => "Finishing up",
-        ExecutionStage::Completed => "Done",
-        ExecutionStage::Failed => "Could not finish",
     }
 }
 
@@ -1136,8 +1038,9 @@ mod tests {
         }
         assert_eq!(owned_lines, visible.len());
         assert!(String::from_utf8_lossy(&capture).matches("\x1b[").count() >= 19);
-        assert_eq!(visible.iter().filter(|line| line.contains("Preparing")).count(), 1);
-        assert_eq!(visible.iter().filter(|line| line.contains("Finishing up")).count(), 1);
+        assert!(visible.iter().all(|line| !line.contains("Preparing")));
+        assert!(visible.iter().all(|line| !line.contains("Finishing up")));
+        assert_eq!(visible.len(), 1);
     }
 
     #[test]
@@ -1145,7 +1048,7 @@ mod tests {
         let stages = ExecutionStage::transaction_stages();
         let renderer =
             PlainProgressRenderer::new(Theme::test(80), create_header(), stages, true, 8);
-        assert_eq!(renderer.region.expect("TTY region").height(), stages.len() + 8 + 1);
+        assert_eq!(renderer.region.expect("TTY region").height(), 2);
     }
 
     #[test]
@@ -1201,9 +1104,9 @@ mod tests {
             &RenderMode::Standard { header: create_header(), stages, refresh: true },
             &mut progress,
         );
-        assert_eq!(progress.rendered_line_count, stages.len() + 1);
+        assert_eq!(progress.rendered_line_count, 1);
         let ansi = String::from_utf8_lossy(&capture);
-        assert!(ansi.contains("\x1b[5A") || ansi.contains("\x1b[6A"));
+        assert!(ansi.matches("\x1b[2K").count() >= 4);
         assert!(ansi.contains("archive.ubuntu.com"));
         assert!(ansi.contains("security.ubuntu.com"));
     }
@@ -1216,12 +1119,13 @@ mod tests {
         user.current_stage = ExecutionStage::Executing;
         let labels = standard_frame_lines(theme, false, stages, true, &user).join("\n");
         assert!(!labels.contains("Permission granted"));
-        assert!(labels.contains("Refreshing information"));
-        assert!(labels.contains("Checking result"));
-        let admin = state();
+        assert!(labels.contains("Refreshing software information"));
+        assert!(!labels.contains("Checking result"));
+        let mut admin = state();
+        admin.current_stage = ExecutionStage::Authenticating;
         let labels = standard_frame_lines(theme, true, stages, false, &admin).join("\n");
-        assert!(labels.contains("Permission granted"));
-        assert!(!labels.contains("Getting permission"));
+        assert!(labels.contains("Administrator permission required"));
+        assert!(!labels.contains("Permission granted"));
     }
 
     #[test]
@@ -1336,19 +1240,12 @@ mod tests {
                 })
                 .collect();
         state.active_provider = Some(0);
-        let frame = maintenance_frame_lines(Theme::test(80), &rows, &state).join("\n");
-        for label in [
-            "Ubuntu repositories",
-            "Flatpak · system",
-            "Flatpak · user",
-            "Snap Store",
-            "Rust tools",
-            "Node.js tools",
-            "Python tools",
-        ] {
-            assert_eq!(frame.matches(label).count(), 1, "{label} should have one row");
-        }
+        let frame =
+            maintenance_frame_lines(Theme::test(80), &rows, MaintenanceAction::Refresh, &state)
+                .join("\n");
+        assert!(frame.contains("Refreshing software information"));
         assert!(!frame.contains("Preparing"));
+        assert!(!frame.contains("Snap Store"));
         assert!(!frame.contains("Permission granted"));
     }
 }

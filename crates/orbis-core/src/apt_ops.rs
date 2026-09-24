@@ -275,7 +275,8 @@ impl ObservationFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InstalledObservation {
     /// Query completed. The map contains only packages that are `install ok installed`.
-    /// Names omitted from the map are absent, not unknown.
+    /// Names omitted from the map are absent, not unknown; this includes packages
+    /// dpkg knows in a non-installed state such as `deinstall ok config-files`.
     Observed(BTreeMap<String, String>),
     /// The probe did not produce authoritative installed-state evidence.
     Unavailable {
@@ -342,23 +343,15 @@ pub fn check_dependency_health(runner: &SharedRunner) -> DependencyHealth {
         return DependencyHealth { status: DependencyHealthStatus::Healthy, summary: None };
     }
     let diagnosis = diagnose_apt_failure(&output.stdout, &output.stderr, output.status);
-    // A busy lock is not proof of broken packages; leave dependency health unknown.
-    if matches!(diagnosis.cause, FailureCause::AptLock | FailureCause::PermissionFailure) {
-        return DependencyHealth {
-            status: DependencyHealthStatus::Unknown,
-            summary: Some(diagnosis.summary),
-        };
-    }
-    if matches!(
-        diagnosis.cause,
-        FailureCause::BrokenDependencies | FailureCause::InterruptedDpkg | FailureCause::Unknown
-    ) {
-        return DependencyHealth {
-            status: DependencyHealthStatus::Broken,
-            summary: Some(diagnosis.summary),
-        };
-    }
-    DependencyHealth { status: DependencyHealthStatus::Unknown, summary: Some(diagnosis.summary) }
+    // Only observed evidence of breakage may produce Broken. A busy lock,
+    // missing permissions, or an unclassified failure leave health unknown.
+    let status = match diagnosis.cause {
+        FailureCause::BrokenDependencies | FailureCause::InterruptedDpkg => {
+            DependencyHealthStatus::Broken
+        }
+        _ => DependencyHealthStatus::Unknown,
+    };
+    DependencyHealth { status, summary: Some(diagnosis.summary) }
 }
 
 /// Observe installed versions for exact package names via `dpkg-query`.
@@ -377,9 +370,10 @@ pub fn observe_installed_versions(runner: &SharedRunner, names: &[String]) -> In
     let mut args =
         vec!["-W".to_owned(), "-f=${binary:Package}\t${Status}\t${Version}\n".to_owned()];
     args.extend(names.iter().cloned());
-    let output = match runner
-        .run(&CommandSpec::new("dpkg-query", args).with_timeout(short_timeout()))
-    {
+    let output = match runner.run(
+        // The C locale keeps dpkg status/error text deterministic for parsing.
+        &CommandSpec::new("dpkg-query", args).with_env("LC_ALL", "C").with_timeout(short_timeout()),
+    ) {
         Ok(output) => output,
         Err(ProcessError::NotFound { .. }) => {
             return InstalledObservation::Unavailable {
@@ -394,16 +388,18 @@ pub fn observe_installed_versions(runner: &SharedRunner, names: &[String]) -> In
 }
 
 fn classify_dpkg_output(output: &CommandOutput) -> InstalledObservation {
-    let parsed = parse_dpkg_versions(&output.stdout);
+    let rows = parse_dpkg_status_rows(&output.stdout);
     let stdout_blank = output.stdout.trim().is_empty();
-    if !stdout_blank && parsed.is_empty() {
+    // Non-blank output that yields no valid row, or that contains a malformed
+    // row, is not evidence about any package. Fail closed; never treat it as absence.
+    if !stdout_blank && (rows.malformed > 0 || rows.is_empty()) {
         return InstalledObservation::Unavailable { reason: ObservationFailure::ParseFailed };
     }
     if output.success() {
-        return InstalledObservation::Observed(parsed);
+        return InstalledObservation::Observed(rows.installed);
     }
     if package_absent_stderr(&output.stderr) {
-        return InstalledObservation::Observed(parsed);
+        return InstalledObservation::Observed(rows.installed);
     }
     InstalledObservation::Unavailable { reason: ObservationFailure::QueryFailed }
 }
@@ -425,22 +421,82 @@ pub fn installed_versions(runner: &SharedRunner, names: &[String]) -> BTreeMap<S
     }
 }
 
-/// Pure parser for dpkg-query tabular version output.
-pub fn parse_dpkg_versions(stdout: &str) -> BTreeMap<String, String> {
-    let mut installed = BTreeMap::new();
+/// Parsed `dpkg-query -W -f=${binary:Package}\t${Status}\t${Version}` rows.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DpkgStatusRows {
+    /// Packages whose dpkg state is `install … installed`, keyed by name.
+    /// Architecture-qualified names (`libssl3:amd64`) also insert their base name.
+    pub installed: BTreeMap<String, String>,
+    /// Packages dpkg knows in a state other than `installed` (for example
+    /// `deinstall ok config-files` or `purge ok not-installed`), keyed by name.
+    /// These are authoritatively not installed.
+    pub not_installed: BTreeMap<String, String>,
+    /// Lines that could not be parsed as dpkg status rows.
+    pub malformed: usize,
+}
+
+impl DpkgStatusRows {
+    /// True when no line parsed as a valid row.
+    pub fn is_empty(&self) -> bool {
+        self.installed.is_empty() && self.not_installed.is_empty()
+    }
+}
+
+/// Pure parser for dpkg-query tabular status output. It distinguishes valid
+/// installed rows, valid non-installed rows, and malformed lines so that a
+/// known-but-removed package can never look like a probe failure.
+pub fn parse_dpkg_status_rows(stdout: &str) -> DpkgStatusRows {
+    let mut rows = DpkgStatusRows::default();
     for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let mut fields = line.split('\t');
-        let Some(name) = fields.next().map(str::to_owned) else { continue };
-        let Some(status) = fields.next() else { continue };
-        let Some(version) = fields.next().map(str::to_owned) else { continue };
-        if status.contains("install ok installed") {
-            installed.insert(name.clone(), version.clone());
-            if let Some(base_name) = name.split_once(':').map(|(base, _)| base) {
-                installed.entry(base_name.to_owned()).or_insert(version);
-            }
+        let Some(name) = fields.next().map(str::trim).filter(|name| !name.is_empty()) else {
+            rows.malformed += 1;
+            continue;
+        };
+        let Some(status) = fields.next().map(str::trim) else {
+            rows.malformed += 1;
+            continue;
+        };
+        let Some(version) = fields.next().map(str::trim).map(str::to_owned) else {
+            rows.malformed += 1;
+            continue;
+        };
+        if fields.next().is_some() || !is_dpkg_status_triple(status) {
+            rows.malformed += 1;
+            continue;
+        }
+        // The status vocabulary is validated above, so ending in ` installed`
+        // means the state token itself is `installed`.
+        let installed = status.ends_with(" installed");
+        let target = if installed { &mut rows.installed } else { &mut rows.not_installed };
+        target.insert(name.to_owned(), version.clone());
+        if let Some(base_name) = name.split_once(':').map(|(base, _)| base) {
+            target.entry(base_name.to_owned()).or_insert(version);
         }
     }
-    installed
+    rows
+}
+
+/// dpkg `Status` values are `want flag state` triples with a fixed vocabulary.
+fn is_dpkg_status_triple(status: &str) -> bool {
+    let parts: Vec<&str> = status.split(' ').collect();
+    let [want, flag, state] = parts.as_slice() else { return false };
+    matches!(*want, "install" | "hold" | "deinstall" | "purge")
+        && matches!(*flag, "ok" | "reinstreq")
+        && matches!(
+            *state,
+            "not-installed"
+                | "config-files"
+                | "half-installed"
+                | "unpacked"
+                | "half-configured"
+                | "triggers-awaited"
+                | "triggers-pending"
+                | "installed"
+        )
 }
 
 /// Build package changes for an install/remove by comparing before/after maps.
@@ -712,12 +768,163 @@ mod tests {
 
     #[test]
     fn parses_dpkg_query_versions() {
-        let map = parse_dpkg_versions(
+        let map = parse_dpkg_status_rows(
             "ripgrep\tinstall ok installed\t14.1.0-1\nlibssl3:amd64\tinstall ok installed\t3.0.13\n",
-        );
+        )
+        .installed;
         assert_eq!(map.get("ripgrep").map(String::as_str), Some("14.1.0-1"));
         assert_eq!(map.get("libssl3:amd64").map(String::as_str), Some("3.0.13"));
         assert_eq!(map.get("libssl3").map(String::as_str), Some("3.0.13"));
+    }
+
+    #[test]
+    fn non_installed_dpkg_states_are_observed_absence() {
+        let config_files = classify_dpkg_output(&CommandOutput {
+            stdout: "curl\tdeinstall ok config-files\t8.x\n".into(),
+            stderr: String::new(),
+            status: Some(0),
+        });
+        assert_eq!(config_files, InstalledObservation::Observed(BTreeMap::new()));
+        assert_eq!(config_files.lookup("curl"), PackageLookup::Absent);
+        let (verified, checks) = verify_package_state(false, None, config_files.lookup("curl"));
+        assert_eq!(verified, VerificationResult::Verified);
+        assert!(checks.iter().any(|check| check.contains("package is not installed")));
+
+        // A package dpkg has never installed records an empty version but is
+        // still a valid, authoritatively absent row.
+        let purged = classify_dpkg_output(&CommandOutput {
+            stdout: "oldpkg\tpurge ok not-installed\t\n".into(),
+            stderr: String::new(),
+            status: Some(0),
+        });
+        assert_eq!(purged, InstalledObservation::Observed(BTreeMap::new()));
+        assert_eq!(purged.lookup("oldpkg"), PackageLookup::Absent);
+    }
+
+    #[test]
+    fn installed_and_non_installed_rows_parse_together() {
+        let rows = parse_dpkg_status_rows(
+            "ripgrep\tinstall ok installed\t14.1.0-1\ncurl\tdeinstall ok config-files\t8.x\nlibssl3:amd64\thold ok installed\t3.0.13\n",
+        );
+        assert_eq!(rows.malformed, 0);
+        assert_eq!(rows.installed.get("ripgrep").map(String::as_str), Some("14.1.0-1"));
+        assert_eq!(rows.installed.get("libssl3:amd64").map(String::as_str), Some("3.0.13"));
+        assert_eq!(rows.installed.get("libssl3").map(String::as_str), Some("3.0.13"));
+        assert_eq!(rows.not_installed.get("curl").map(String::as_str), Some("8.x"));
+        let observation = InstalledObservation::Observed(rows.installed);
+        assert_eq!(observation.lookup("curl"), PackageLookup::Absent);
+        assert_eq!(observation.lookup("ripgrep"), PackageLookup::Installed("14.1.0-1"));
+    }
+
+    #[test]
+    fn malformed_dpkg_output_fails_closed_even_with_valid_rows() {
+        let garbage_beside_valid_row = classify_dpkg_output(&CommandOutput {
+            stdout: "curl\tdeinstall ok config-files\t8.x\nthis line has no tabs\n".into(),
+            stderr: String::new(),
+            status: Some(0),
+        });
+        assert_eq!(
+            garbage_beside_valid_row,
+            InstalledObservation::Unavailable { reason: ObservationFailure::ParseFailed }
+        );
+
+        let invalid_status_vocabulary = classify_dpkg_output(&CommandOutput {
+            stdout: "curl\tsome nonsense status\t8.x\n".into(),
+            stderr: String::new(),
+            status: Some(0),
+        });
+        assert_eq!(
+            invalid_status_vocabulary,
+            InstalledObservation::Unavailable { reason: ObservationFailure::ParseFailed }
+        );
+    }
+
+    struct CapturingRunner {
+        specs: std::sync::Mutex<Vec<CommandSpec>>,
+    }
+
+    impl CommandRunner for CapturingRunner {
+        fn is_available(&self, _: &str) -> bool {
+            true
+        }
+        fn run(
+            &self,
+            command: &CommandSpec,
+        ) -> Result<CommandOutput, crate::process::ProcessError> {
+            self.specs.lock().unwrap().push(command.clone());
+            Err(crate::process::ProcessError::NotFound { program: command.program.clone() })
+        }
+    }
+
+    #[test]
+    fn observation_command_pins_the_c_locale() {
+        let runner = Arc::new(CapturingRunner { specs: std::sync::Mutex::new(Vec::new()) });
+        let observation =
+            observe_installed_versions(&(runner.clone() as SharedRunner), &["curl".to_owned()]);
+        assert_eq!(
+            observation,
+            InstalledObservation::Unavailable { reason: ObservationFailure::CommandUnavailable }
+        );
+        let specs = runner.specs.lock().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program, "dpkg-query");
+        assert_eq!(specs[0].env.get("LC_ALL").map(String::as_str), Some("C"));
+    }
+
+    struct ScriptedAptRunner {
+        check: CommandOutput,
+    }
+
+    impl CommandRunner for ScriptedAptRunner {
+        fn is_available(&self, program: &str) -> bool {
+            program == "apt-get"
+        }
+        fn run(
+            &self,
+            command: &CommandSpec,
+        ) -> Result<CommandOutput, crate::process::ProcessError> {
+            if command.program == "apt-get"
+                && command.args.first().map(String::as_str) == Some("check")
+            {
+                return Ok(self.check.clone());
+            }
+            Err(crate::process::ProcessError::NotFound { program: command.program.clone() })
+        }
+    }
+
+    #[test]
+    fn dependency_health_maps_only_observed_breakage_to_broken() {
+        let scripted = |stderr: &str, status: Option<i32>| {
+            check_dependency_health(
+                &(Arc::new(ScriptedAptRunner {
+                    check: CommandOutput { stdout: String::new(), stderr: stderr.into(), status },
+                }) as SharedRunner),
+            )
+        };
+
+        let healthy = scripted("", Some(0));
+        assert_eq!(healthy.status, DependencyHealthStatus::Healthy);
+        assert!(healthy.summary.is_none());
+
+        let unmet = scripted("The following packages have unmet dependencies:", Some(100));
+        assert_eq!(unmet.status, DependencyHealthStatus::Broken);
+
+        let interrupted = scripted(
+            "E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem.",
+            Some(100),
+        );
+        assert_eq!(interrupted.status, DependencyHealthStatus::Broken);
+
+        let lock = scripted("E: Could not get lock /var/lib/dpkg/lock-frontend", Some(100));
+        assert_eq!(lock.status, DependencyHealthStatus::Unknown);
+        assert!(lock.summary.is_some());
+
+        let permission = scripted("E: Could not open lock file ... are you root?", Some(100));
+        assert_eq!(permission.status, DependencyHealthStatus::Unknown);
+
+        let unclassified = scripted("E: some unprecedented failure occurred", Some(42));
+        assert_eq!(unclassified.status, DependencyHealthStatus::Unknown);
+        assert!(unclassified.summary.is_some());
     }
 
     #[test]

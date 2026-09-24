@@ -370,7 +370,7 @@ pub(crate) fn report_for_check(check: &CheckReport) -> SelfUpdateReport {
             current_version: current,
             available_version: check.latest.as_ref().map(|release| release.version.to_string()),
             installed_version: None,
-            message: "This is a development build. It will not replace itself. Pull the latest source, then reinstall with cargo install --path crates/orbis-cli --locked --force.".into(),
+            message: "Self-update is disabled for development builds. Reinstall from source to update this build.".into(),
         };
     }
     match &check.latest {
@@ -1066,7 +1066,7 @@ mod tests {
             CheckReport { current_version: current, current_is_development: true, latest: None };
         let report = report_for_check(&check);
         assert_eq!(report.state, SelfUpdateState::DevelopmentBuild);
-        assert!(report.message.contains("will not replace itself"));
+        assert!(report.message.contains("Self-update is disabled"));
     }
 
     #[test]

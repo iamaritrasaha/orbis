@@ -3,7 +3,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::theme::{Theme, Token};
+use super::{
+    brand::compact_identity,
+    theme::{Theme, Token},
+};
 use orbis_core::{
     SearchReport,
     diagnostics::DoctorReport,
@@ -26,40 +29,24 @@ impl Renderer {
     }
 
     pub(crate) fn home(&self, _sources: &[SourceInfo]) -> String {
-        let mut output = String::new();
-        output.push_str(&format!(
-            "{}\n  {}\n\n",
-            self.theme.paint(self.theme.brand_compact(), Token::Primary),
-            self.theme.paint(Theme::brand_tagline(), Token::Muted)
-        ));
-        let selected = if self.theme.unicode { "▸" } else { ">" };
-        let controls = if self.theme.unicode {
-            "↑↓ move  Enter choose  q cancel"
-        } else {
-            "j/k move  Enter choose  q cancel"
-        };
-        output.push_str(&format!("{selected} Find software\n  Show software\n  Check updates\n  Refresh information\n  Clean up\n  Health\n  History\n  Full interface\n\n"));
+        let mut output =
+            format!("{}\n\n", self.theme.paint(self.theme.brand_compact(), Token::Primary));
         let activity = super::transient::recent_activity();
         let attention = orbis_core::system::launcher_insight(&activity).attention;
         if !attention.is_empty() {
-            output.push_str(&format!("  {}\n", self.theme.paint("Needs attention", Token::Muted)));
             for item in attention.iter().take(3) {
-                output.push_str(&format!("  {}\n", item.title));
+                output.push_str(&format!("  ! {}\n", item.title));
             }
             output.push('\n');
         }
         if !activity.is_empty() {
             output.push_str(&format!("  {}\n", self.theme.paint("Recent activity", Token::Muted)));
             for record in activity.iter().take(3) {
-                output.push_str(&format!("  {}\n", record.activity_title()));
-                for detail in record.activity_details().into_iter().take(2) {
-                    output.push_str(&format!("    {detail}\n"));
-                }
+                output.push_str(&format!("  ✓ {}\n", record.activity_title()));
             }
             output.push('\n');
         }
-        output.push_str(controls);
-        output.push('\n');
+        output.push_str("  find · install · update · activity · health\n");
         output
     }
 
@@ -132,61 +119,63 @@ impl Renderer {
         issues: &[orbis_core::models::ProviderIssue],
     ) -> String {
         let package = &brief.package;
-        let mut output = self.heading("SHOW", "Software dossier");
-        output.push_str(&format!("{}\n\n", self.theme.paint(&package.name, Token::Primary)));
-        output.push_str(&format!("{}\n\n", brief.headline));
-        output.push_str("WHAT IT DOES\n");
+        let mut output = self.heading("Software", "");
+        let version = package.version.as_deref().unwrap_or("version unknown");
+        output.push_str(&format!(
+            "{}  {} · {}\n\n",
+            self.theme.paint(&package.name, Token::Primary),
+            version,
+            package.source.label()
+        ));
+        output.push_str(&format!("{}\n", wrap(&brief.headline, self.theme.width)));
         if brief.paragraphs.is_empty() {
             output.push_str(
                 "Orbis does not have enough reliable information to describe this software yet.\n",
             );
         } else {
             for paragraph in &brief.paragraphs {
-                output.push_str(&format!("{}\n", wrap(paragraph, self.theme.width)));
+                let paragraph = paragraph.strip_prefix(&brief.headline).unwrap_or(paragraph).trim();
+                if !paragraph.is_empty() {
+                    output.push_str(&format!("\n{}\n", wrap(paragraph, self.theme.width)));
+                }
             }
+        }
+        output.push('\n');
+        output.push_str(match package.installed {
+            Some(true) => "Installed\n",
+            Some(false) => "Available\n",
+            None => "? Availability unknown\n",
+        });
+        if let Some(scope) = package.metadata.get("scope") {
+            output.push_str(&format!("{} scope\n", scope_label(scope)));
+        } else if package.source == PackageSource::Apt {
+            output.push_str("System package\n");
+        } else if let Some(kind) = package.kind
+            && kind != orbis_core::models::PackageKind::Unknown
+        {
+            output.push_str(&format!("{}\n", kind.label()));
+        }
+        if package.installed != Some(true) {
+            output.push_str(&format!(
+                "\nInstall with: orbis install {}:{}\n",
+                package.source.label().to_ascii_lowercase(),
+                package.provider_id
+            ));
         }
         if !brief.examples.is_empty() {
-            output.push_str("\nWHY IT'S USEFUL\n");
-            for example in &brief.examples {
-                output.push_str(&format!("  {} {example}\n", self.theme.mark(Token::Positive)));
-            }
-        }
-        output.push_str("\nSTATUS\n");
-        self.field(&mut output, "Status", installed_state(package.installed));
-        self.field(&mut output, "Source", friendly_source(package.source));
-        if let Some(version) = &package.version {
-            self.field(&mut output, "Version", version);
-        }
-        if let Some(scope) = package.metadata.get("scope") {
-            self.field(&mut output, "Scope", scope);
+            output.push('\n');
+            output.push_str(&format!("Try: {}\n", brief.examples.join("; ")));
         }
         if let Some(why) = why {
-            output.push_str("\nWHY IS IT INSTALLED?\n");
-            output.push_str(&format!("{}\n", why.installed_as));
+            output.push_str(&format!("\nInstalled because: {}\n", why.installed_as));
             if !why.orbis_history.is_empty() {
                 output.push_str("  Orbis has a matching installation record.\n");
             }
         }
         if let Some(caution) = &brief.caution {
-            output.push_str(&format!("\nNOTE\n{}\n", wrap(caution, self.theme.width)));
+            output
+                .push_str(&format!("\n! {}\n", wrap(caution, self.theme.width.saturating_sub(2))));
         }
-        output.push_str("\nEVIDENCE\n");
-        self.field(&mut output, "Confidence", &brief.confidence);
-        self.field(
-            &mut output,
-            "Evidence",
-            &brief
-                .evidence
-                .iter()
-                .map(|evidence| match evidence.kind {
-                    orbis_core::explain::EvidenceKind::ProviderMetadata => "source metadata",
-                    orbis_core::explain::EvidenceKind::OrbisInterpretation => {
-                        "Orbis interpretation"
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
         self.render_issues(output, issues)
     }
 
@@ -221,7 +210,7 @@ impl Renderer {
     }
 
     pub(crate) fn brief(&self, brief: &orbis_core::explain::PackageBrief) -> String {
-        let mut output = self.heading("ORBIS Brief", &brief.package.name);
+        let mut output = self.heading("Brief", &brief.package.name);
         output.push_str(&format!("{}\n\n", self.theme.paint(&brief.headline, Token::Primary)));
         for paragraph in &brief.paragraphs {
             output.push_str(&format!("{}\n\n", wrap(paragraph, self.theme.width)));
@@ -264,89 +253,137 @@ impl Renderer {
     ) -> String {
         let verb = plan.action.label();
         let mut output = self.heading(verb, "");
+        let version = plan.target.version.as_deref().unwrap_or("version unknown");
+        let source = plan.target.source.label();
         if let Some(brief) = brief {
-            output
-                .push_str(&format!("{}\n", self.theme.paint(&brief.package.name, Token::Primary)));
-            output.push_str(&format!("{}\n\n", brief.headline));
+            output.push_str(&format!(
+                "{} {} from {}\n",
+                self.theme.paint(&brief.package.name, Token::Primary),
+                version,
+                source
+            ));
         } else {
-            output.push_str(&format!("{}\n", self.theme.paint(&plan.target.name, Token::Primary)));
-        }
-        output.push('\n');
-        self.field(&mut output, "Source", friendly_source(plan.target.source));
-        self.field(
-            &mut output,
-            "Version",
-            plan.target.version.as_deref().unwrap_or("Not confirmed"),
-        );
-        self.field(&mut output, verb, plan.scope.label());
-        if plan.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator {
-            self.field(&mut output, "Admin", "required");
+            output.push_str(&format!(
+                "{} {} from {}\n",
+                self.theme.paint(&plan.target.name, Token::Primary),
+                version,
+                source
+            ));
         }
         output.push_str(&format!(
-            "\nThis will {} {}.\n",
-            verb.to_ascii_lowercase(),
-            plan.target.name
+            "{} scope · {} permission\n",
+            scope_label(plan.scope.label()),
+            if plan.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator {
+                "administrator"
+            } else {
+                "user"
+            }
         ));
-        output.push_str(&format!("Risk  {}\n", plan.risk.label()));
+        output.push('\n');
+        let changed = plan
+            .changes
+            .iter()
+            .filter(|change| !matches!(change.kind, orbis_core::transaction::ChangeKind::Configure))
+            .count()
+            .max(1);
+        let removed = plan
+            .changes
+            .iter()
+            .filter(|change| change.kind == orbis_core::transaction::ChangeKind::Remove)
+            .count();
+        output.push_str(&format!(
+            "{} package{} will be {}.\n",
+            changed,
+            if changed == 1 { "" } else { "s" },
+            if plan.action == orbis_core::transaction::OperationAction::Install {
+                "installed"
+            } else {
+                "removed"
+            }
+        ));
+        if plan.action == orbis_core::transaction::OperationAction::Install {
+            output.push_str(&format!(
+                "{} unrelated package{} removed.\n",
+                removed,
+                if removed == 1 { "" } else { "s" }
+            ));
+        }
         for warning in &plan.warnings {
-            output.push_str(&format!("  {} {}\n", warning_marker(warning.level), warning.message));
+            if warning.level != orbis_core::transaction::WarningLevel::Info {
+                output.push_str(&format!("\n! {}\n", warning.message));
+            }
         }
-        if plan.action == orbis_core::transaction::OperationAction::Remove {
-            output.push_str(
-                "Removing the selected software does not remove unrelated application data.\n",
-            );
+        if plan.action == orbis_core::transaction::OperationAction::Remove && removed == 0 {
+            output.push_str("\nNo unrelated packages will be removed.\n");
         }
-        output.push_str("\nNo package state has been changed by this review.\n");
         output
     }
 
-    pub(crate) fn transaction_result(&self, result: &TransactionResult) -> String {
-        let (label, token) = match result.status {
-            TransactionStatus::Succeeded => ("Successful", Token::Positive),
-            TransactionStatus::PartiallyVerified => {
-                ("Completed with limited verification", Token::Caution)
+    pub(crate) fn transaction_result(
+        &self,
+        result: &TransactionResult,
+        diagnostic: bool,
+    ) -> String {
+        let (mark, token, suffix) = match result.status {
+            TransactionStatus::Succeeded => {
+                (self.theme.mark(Token::Positive), Token::Positive, "done")
             }
-            TransactionStatus::Failed => ("Failed", Token::Destructive),
+            TransactionStatus::PartiallyVerified => (
+                self.theme.mark(Token::Caution),
+                Token::Caution,
+                "completed with limited verification",
+            ),
+            TransactionStatus::Failed => {
+                (self.theme.mark(Token::Destructive), Token::Destructive, "failed")
+            }
         };
-        let mut output = self.heading(
-            "Result",
-            &format!("{} {}", result.plan.action.label(), result.plan.target.name),
-        );
-        output.push_str(&format!("  Status          {}\n", self.theme.paint(label, token)));
-        let verified = matches!(
-            (result.status, result.verification),
-            (TransactionStatus::Succeeded, VerificationResult::Verified)
-        );
-        output.push_str(&format!("  Verified        {}\n", if verified { "yes" } else { "no" }));
+        let mut output = self.heading(result.plan.action.label(), "");
+        let version = result
+            .changes
+            .iter()
+            .find_map(|change| change.to_version.clone())
+            .or_else(|| result.plan.target.version.clone())
+            .unwrap_or_else(|| "version unknown".into());
+        output.push_str(&format!(
+            "{} {} {} {}\n",
+            self.theme.paint(mark, token),
+            self.theme.paint(&result.plan.target.name, Token::Foreground),
+            version,
+            suffix
+        ));
         for change in &result.changes {
             if let Some(span) = change.version_span() {
                 let name = change.name.as_deref().unwrap_or(change.package_id.as_str());
-                output.push_str(&format!("  Change          {name}: {span}\n"));
+                output.push_str(&format!("  {name}: {span}\n"));
             } else {
                 output.push_str(&format!(
-                    "  Change          {}\n",
+                    "  {}\n",
                     change.name.as_deref().unwrap_or(&change.package_id)
                 ));
             }
         }
         for warning in &result.warnings {
-            output.push_str(&format!("  Warning         {warning}\n"));
+            output.push_str(&format!("! {warning}\n"));
         }
         if let Some(diagnosis) = &result.diagnosis {
-            output.push_str(&format!("  Diagnosis       {}\n", diagnosis.summary));
+            output.push_str(&format!("! {}\n", diagnosis.summary));
             if let Some(hint) = &diagnosis.hint {
-                output.push_str(&format!("  Next step       {hint}\n"));
+                output.push_str(&format!("  {hint}\n"));
             }
         } else if let Some(message) = &result.execution.message {
-            output.push_str(&format!("  Detail          {message}\n"));
+            output.push_str(&format!("! {message}\n"));
         }
-        if !result.raw_commands.is_empty() {
-            output.push_str("\n  Technical detail\n");
+        if diagnostic && !result.raw_commands.is_empty() {
+            output.push_str("\nTechnical detail\n");
             for command in &result.raw_commands {
-                output.push_str(&format!("    {} {}\n", command.program, command.args.join(" ")));
+                output.push_str(&format!("  {} {}\n", command.program, command.args.join(" ")));
             }
         }
-        output.push_str(&format!("  Operation ID    {}\n", result.plan.operation_id));
+        if diagnostic {
+            output.push_str(&format!("\nOperation ID  {}\n", result.plan.operation_id));
+            output
+                .push_str(&format!("Verification  {}\n", verification_label(result.verification)));
+        }
         output
     }
 
@@ -362,10 +399,20 @@ impl Renderer {
         let coverage = coverage_rows(report);
         let mut output = if report.candidates.is_empty() {
             if coverage.incomplete_sources == 0 {
-                "Everything checked is up to date.".into()
+                let subject = if report.inventories.len() == 1 {
+                    report.inventories[0].source.label().to_owned()
+                } else {
+                    "Everything checked".into()
+                };
+                format!(
+                    "{} {} up to date\n  Nothing needs to be changed.",
+                    self.theme.mark(Token::Positive),
+                    subject
+                )
             } else {
                 format!(
-                    "No updates found in checked sources.\n{} source{} could not report a complete status.",
+                    "{} No updates found in checked sources.\n{} source{} could not report a complete status.",
+                    self.theme.mark(Token::Caution),
                     coverage.incomplete_sources,
                     if coverage.incomplete_sources == 1 { "" } else { "s" }
                 )
@@ -388,10 +435,10 @@ impl Renderer {
         }
 
         if !coverage.rows.is_empty() {
-            output.push_str("\nCoverage\n");
+            output.push_str("\n\nCoverage\n");
             for (label, detail) in coverage.rows {
                 output.push_str(&format!(
-                    "  {} {:<23} {}\n",
+                    "  {} {} · {}\n",
                     self.theme.mark(Token::Unavailable),
                     self.theme.paint(&label, Token::Muted),
                     self.theme.paint(&detail, Token::Caution)
@@ -404,17 +451,23 @@ impl Renderer {
             ));
         }
 
-        output.push_str(&format!(
-            "\n{}\n",
-            self.theme.paint("Read-only check · nothing changed", Token::Muted)
-        ));
         if !report.candidates.is_empty() {
             output.push_str(&format!(
                 "{}\n",
-                self.theme.paint("Review changes with `orbis update --apply`", Token::Primary)
+                self.theme.paint("Run orbis update --apply to review changes", Token::Primary)
             ));
         }
         output
+    }
+
+    pub(crate) fn maintenance_noop(&self, plan: &MaintenancePlan) -> String {
+        let subject = plan.source.map_or("Software sources", |source| source.label());
+        format!(
+            "{}\n\n{} {} up to date\n  Nothing needs to be changed.\n",
+            compact_identity(self.theme, "Update"),
+            self.theme.paint(self.theme.mark(Token::Positive), Token::Positive),
+            subject
+        )
     }
 
     pub(crate) fn updates_checking(
@@ -444,8 +497,11 @@ impl Renderer {
         }
         let title = maintenance_title(plan.action);
         let mut output = self.heading(title, "");
-        output.push_str("SOFTWARE SOURCES\n\n");
-        for row in maintenance_review_rows(plan) {
+        let rows = maintenance_review_rows(plan);
+        if rows.is_empty() {
+            output.push_str("No software sources are available.\n");
+        }
+        for row in rows {
             let action = match plan.action {
                 orbis_core::maintenance::MaintenanceAction::Refresh => {
                     if !row.executable {
@@ -461,12 +517,12 @@ impl Renderer {
                 orbis_core::maintenance::MaintenanceAction::Upgrade => "update",
                 orbis_core::maintenance::MaintenanceAction::Cleanup => "clean",
             };
-            let admin = if row.admin { "admin" } else { "" };
+            let privilege = if row.admin { " · administrator" } else { "" };
             output.push_str(&format!(
-                "  {:<32} {:<12} {}\n",
+                "  {} · {}{}\n",
                 self.theme.paint(&row.label, Token::Provider),
                 self.theme.paint(action, if row.mutates { Token::Primary } else { Token::Muted }),
-                self.theme.paint(admin, Token::Muted)
+                self.theme.paint(privilege, Token::Muted)
             ));
             if diagnostic && row.scope_unknown {
                 output.push_str("    scope not reported\n");
@@ -502,16 +558,17 @@ impl Renderer {
             ),
         };
         output.push_str(&summary);
-        output.push_str(&format!("Risk  {}\n", plan.risk.label()));
         if diagnostic {
             output.push_str(&format!("Maintenance ID  {}\n", plan.operation_id));
             for provider in &plan.providers {
                 for warning in &provider.warnings {
-                    output.push_str(&format!(
-                        "  {} {}\n",
-                        warning_marker(warning.level),
-                        warning.message
-                    ));
+                    if warning.level != orbis_core::transaction::WarningLevel::Info {
+                        output.push_str(&format!(
+                            "{} {}\n",
+                            warning_marker(warning.level),
+                            warning.message
+                        ));
+                    }
                 }
             }
         }
@@ -534,68 +591,44 @@ impl Renderer {
 
         for (label, group) in grouped_update_candidates(&candidates) {
             output.push('\n');
-            let admin = if plan
-                .providers
-                .iter()
-                .filter(|provider| provider.executable() && !provider.candidates.is_empty())
-                .filter(|provider| {
-                    provider
-                        .candidates
-                        .iter()
-                        .any(|candidate| update_group_label(candidate) == label)
-                })
-                .any(|provider| {
-                    provider.privilege
-                        == orbis_core::transaction::PrivilegeRequirement::Administrator
-                }) {
-                " · admin"
-            } else {
-                ""
-            };
-            output.push_str(&format!(
-                "{}{}\n",
-                self.theme.paint(&label, Token::Muted),
-                self.theme.paint(admin, Token::Muted)
-            ));
+            output.push_str(&format!("{}\n", self.theme.paint(&label, Token::Muted)));
             output.push_str(&render_update_group(self, &group));
         }
 
         let coverage = maintenance_upgrade_coverage(plan);
         if !coverage.is_empty() {
-            output.push_str("\nCoverage\n");
+            output.push_str("\n! Some sources could not be checked completely\n");
             for (label, detail) in coverage {
                 output.push_str(&format!(
-                    "  {} {:<23} {}\n",
+                    "  {} {} · {}\n",
                     self.theme.mark(Token::Unavailable),
                     self.theme.paint(&label, Token::Muted),
                     self.theme.paint(&detail, Token::Caution)
                 ));
             }
-            output.push_str(&format!(
-                "  {}\n",
-                self.theme
-                    .paint("Incomplete sources are excluded from the update count.", Token::Muted)
-            ));
-            output
-                .push_str(&format!("Coverage  {}\n", self.theme.paint("limited", Token::Caution)));
         }
 
-        output.push_str(&format!(
-            "\nRisk  {}\n",
-            self.theme.paint(plan.risk.label(), risk_token(plan.risk))
-        ));
-        if !candidates.is_empty() {
-            output.push_str(&format!(
-                "{}\n",
-                self.theme.paint("Only the updates listed above will be changed.", Token::Muted)
-            ));
+        if let Some(provider) = plan
+            .providers
+            .iter()
+            .find(|provider| provider.executable() && !provider.candidates.is_empty())
+        {
+            if provider.privilege == orbis_core::transaction::PrivilegeRequirement::Administrator {
+                output.push_str("\nSystem-wide · administrator permission\n");
+            }
+            if let Some(bytes) = provider.download_size_bytes {
+                output.push_str(&format!("Download  {}\n", format_size(bytes)));
+            }
+            if let Some(delta) = provider.disk_delta_bytes {
+                output.push_str(&format!("Disk      {}\n", format_disk_delta(delta)));
+            }
         }
         if diagnostic {
-            output.push_str(&format!("Maintenance ID  {}\n", plan.operation_id));
+            output.push_str(&format!("\nOperation ID  {}\n", plan.operation_id));
             for provider in &plan.providers {
                 for warning in &provider.warnings {
                     output.push_str(&format!(
-                        "  {} {}\n",
+                        "{} {}\n",
                         warning_marker(warning.level),
                         warning.message
                     ));
@@ -612,19 +645,7 @@ impl Renderer {
         diagnostic: bool,
     ) -> String {
         if result.action == orbis_core::maintenance::MaintenanceAction::Refresh {
-            let failed = result.status != MaintenanceStatus::Succeeded;
-            let mut output: String = if failed { "\nATTENTION\n".into() } else { "\n".into() };
             let rows = maintenance_review_rows_from_plans(plans);
-            for row in &rows {
-                let state = maintenance_result_state(row, result);
-                let (mark, token, status) = refresh_row_view(state, self.theme);
-                output.push_str(&format!(
-                    "  {} {:<32} {}\n",
-                    self.theme.paint(mark, token),
-                    self.theme.paint(&row.label, token),
-                    self.theme.paint(status, token)
-                ));
-            }
             let refreshed = rows
                 .iter()
                 .filter(|row| {
@@ -634,7 +655,7 @@ impl Renderer {
                     )
                 })
                 .count();
-            let no_refresh = rows
+            let unchanged = rows
                 .iter()
                 .filter(|row| {
                     matches!(
@@ -649,101 +670,150 @@ impl Renderer {
                     matches!(maintenance_result_state(row, result), RefreshRowState::Failed)
                 })
                 .count();
-            output.push('\n');
-            if failed > 0 {
+            let attention = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        maintenance_result_state(row, result),
+                        RefreshRowState::Failed | RefreshRowState::Partial
+                    )
+                })
+                .count();
+            let mut output = self.heading("Refresh", "");
+            if result.status != MaintenanceStatus::Succeeded {
+                let token = if failed > 0 { Token::Destructive } else { Token::Caution };
+                output.push_str(&format!(
+                    "{} Software information refresh incomplete\n",
+                    self.theme.paint(self.theme.mark(token), token)
+                ));
                 output.push_str(&format!(
                     "  {} source{} need attention\n",
-                    failed,
-                    if failed == 1 { "" } else { "s" }
+                    attention,
+                    if attention == 1 { "" } else { "s" }
                 ));
                 for row in rows.iter().filter(|row| {
-                    matches!(maintenance_result_state(row, result), RefreshRowState::Failed)
+                    matches!(
+                        maintenance_result_state(row, result),
+                        RefreshRowState::Failed | RefreshRowState::Partial
+                    )
                 }) {
                     if let Some(message) = row_failure_message(row, result) {
-                        output.push_str(&format!("\n  {}\n  {}\n", row.label, message));
+                        output.push_str(&format!("  ! {}\n    {}\n", row.label, message));
                     }
                 }
-                output.push_str("\n  See orbis history or --plain for details.\n");
             } else {
                 output.push_str(&format!(
-                    "  {} sources checked · {} refreshed · {} require no refresh\n",
-                    rows.len(),
-                    refreshed,
-                    no_refresh
+                    "{} Software information refreshed\n",
+                    self.theme.paint(self.theme.mark(Token::Positive), Token::Positive)
                 ));
+                output.push_str(&format!(
+                    "  {} source{} refreshed",
+                    refreshed,
+                    if refreshed == 1 { "" } else { "s" }
+                ));
+                if unchanged > 0 {
+                    output.push_str(&format!(" · {} checked on demand", unchanged));
+                }
+                output.push('\n');
             }
-            if diagnostic || failed > 0 {
-                output.push_str(&format!("\n  Maintenance ID  {}\n", result.operation_id));
+            if diagnostic {
+                output.push_str("\nSources\n");
+                for row in &rows {
+                    let state = maintenance_result_state(row, result);
+                    let (mark, token, status) = refresh_row_view(state, self.theme);
+                    output.push_str(&format!(
+                        "  {} {} · {}\n",
+                        self.theme.paint(mark, token),
+                        self.theme.paint(&row.label, token),
+                        self.theme.paint(status, token)
+                    ));
+                }
+                output.push_str(&format!("\nOperation ID  {}\n", result.operation_id));
             }
             return output;
         }
 
-        let title = match result.status {
-            MaintenanceStatus::Succeeded => "Successful",
-            MaintenanceStatus::PartiallySucceeded => "Partially verified",
-            MaintenanceStatus::Failed => "Failed",
-            MaintenanceStatus::Cancelled => "Cancelled",
-            MaintenanceStatus::Blocked => "Blocked",
-        };
-        let mut output =
-            self.heading(title, &format!("{} across available sources", result.action.label()));
-        let verified = result.status == MaintenanceStatus::Succeeded
-            && result.providers.iter().all(|provider| {
-                provider.verification.is_none_or(|value| {
-                    matches!(value, orbis_core::transaction::VerificationResult::Verified)
-                })
-            });
-        output.push_str(&format!("  Verified        {}\n", if verified { "yes" } else { "no" }));
+        let mut output = self.heading(result.action.label(), "");
         let changes: Vec<_> =
             result.providers.iter().flat_map(|provider| provider.changes.iter()).collect();
-        if !changes.is_empty() {
-            output.push_str(&format!(
-                "  Changes         {} package{}\n",
-                changes.len(),
-                if changes.len() == 1 { "" } else { "s" }
-            ));
-            for change in changes.iter().take(8) {
-                let name = change.name.as_deref().unwrap_or(change.package_id.as_str());
-                if let Some(span) = change.version_span() {
-                    output.push_str(&format!("    {name}: {span}\n"));
+        match result.status {
+            MaintenanceStatus::Succeeded => {
+                output.push_str(&format!(
+                    "{} System updated\n",
+                    self.theme.paint(self.theme.mark(Token::Positive), Token::Positive)
+                ));
+                if !changes.is_empty() {
+                    let verification = result.providers.iter().all(|provider| {
+                        provider.verification
+                            == Some(orbis_core::transaction::VerificationResult::Verified)
+                    });
+                    output.push_str(&format!(
+                        "  {} package{} changed{}\n",
+                        changes.len(),
+                        if changes.len() == 1 { "" } else { "s" },
+                        if verification { " · verified" } else { "" }
+                    ));
                 } else {
-                    output.push_str(&format!("    {name}\n"));
+                    output.push_str("  Nothing needed to be changed.\n");
                 }
             }
-            if changes.len() > 8 {
-                output.push_str(&format!("    … and {} more\n", changes.len() - 8));
+            MaintenanceStatus::PartiallySucceeded => {
+                output.push_str(&format!(
+                    "{} System update completed\n",
+                    self.theme.paint(self.theme.mark(Token::Caution), Token::Caution)
+                ));
+                output.push_str("  Verification or provider coverage was incomplete.\n");
             }
+            MaintenanceStatus::Failed | MaintenanceStatus::Blocked => {
+                output.push_str(&format!(
+                    "{} System update failed\n",
+                    self.theme.paint(self.theme.mark(Token::Destructive), Token::Destructive)
+                ));
+            }
+            MaintenanceStatus::Cancelled => {
+                output.push_str("  Operation cancelled.\n");
+            }
+        }
+        for change in changes.iter().take(8) {
+            let name = change.name.as_deref().unwrap_or(change.package_id.as_str());
+            if let Some(span) = change.version_span() {
+                output.push_str(&format!("  {name}: {span}\n"));
+            } else {
+                output.push_str(&format!("  {name}\n"));
+            }
+        }
+        if changes.len() > 8 {
+            output.push_str(&format!("  … and {} more\n", changes.len() - 8));
         }
         for provider in &result.providers {
             for warning in &provider.warnings {
-                output.push_str(&format!("  Warning         {warning}\n"));
+                output.push_str(&format!("! {warning}\n"));
             }
             if let Some(diagnosis) = &provider.diagnosis {
-                output.push_str(&format!("  Diagnosis       {}\n", diagnosis.summary));
+                output.push_str(&format!("! {}\n", diagnosis.summary));
                 if let Some(hint) = &diagnosis.hint {
-                    output.push_str(&format!("  Next step       {hint}\n"));
+                    output.push_str(&format!("  {hint}\n"));
                 }
             }
-            let status = match provider.status {
-                MaintenanceProviderStatus::Succeeded => "succeeded",
-                MaintenanceProviderStatus::PartiallySucceeded => "partially succeeded",
-                MaintenanceProviderStatus::Failed => "failed",
-                MaintenanceProviderStatus::Skipped => "skipped",
-                MaintenanceProviderStatus::Blocked => "blocked",
-            };
-            output.push_str(&format!(
-                "  {:<24} {:<22} {} item{}\n",
-                maintenance_source_label(provider.source, None),
-                status,
-                provider.candidate_count,
-                if provider.candidate_count == 1 { "" } else { "s" }
-            ));
-            if let Some(message) = &provider.message {
-                output.push_str(&format!("    {message}\n"));
+            if diagnostic {
+                let status = match provider.status {
+                    MaintenanceProviderStatus::Succeeded => "succeeded",
+                    MaintenanceProviderStatus::PartiallySucceeded => "partially succeeded",
+                    MaintenanceProviderStatus::Failed => "failed",
+                    MaintenanceProviderStatus::Skipped => "skipped",
+                    MaintenanceProviderStatus::Blocked => "blocked",
+                };
+                output.push_str(&format!(
+                    "  {} · {status}\n",
+                    maintenance_source_label(provider.source, None)
+                ));
+                if let Some(message) = &provider.message {
+                    output.push_str(&format!("    {message}\n"));
+                }
             }
         }
         if diagnostic || result.status != MaintenanceStatus::Succeeded {
-            output.push_str(&format!("\n  Operation ID    {}\n", result.operation_id));
+            output.push_str(&format!("\nOperation ID  {}\n", result.operation_id));
         }
         output
     }
@@ -759,7 +829,7 @@ impl Renderer {
         }
         for entry in entries {
             let status = history_status(&entry.status, self.theme);
-            let age = relative_time(entry.recorded_at_unix_ms, current_time_ms());
+            let age = relative_time_at(entry.recorded_at_unix_ms, current_time_ms());
             let action = human_history_action(entry);
             output.push_str(&format!("{}  {:<10} {}\n", status.glyph, age, action));
             output.push_str(&format!(
@@ -872,77 +942,104 @@ impl Renderer {
         report: &DoctorReport,
         insight: &orbis_core::system::SystemInsight,
     ) -> String {
-        let mut output = self.heading("Health", "Actionable system state Orbis can use.");
+        let mut output = self.heading("Health", "");
         if !insight.attention.is_empty() {
-            output.push_str("NEEDS ATTENTION\n");
             for item in &insight.attention {
-                output.push_str(&format!("  {}\n", item.title));
+                let token = match item.severity {
+                    orbis_core::system::AttentionSeverity::Critical => Token::Destructive,
+                    orbis_core::system::AttentionSeverity::Caution => Token::Caution,
+                    orbis_core::system::AttentionSeverity::Info => Token::Primary,
+                };
+                output.push_str(&format!(
+                    "{} {}\n",
+                    self.theme.paint(self.theme.mark(token), token),
+                    self.theme.paint(&item.title, token)
+                ));
                 if let Some(detail) = &item.detail {
-                    output.push_str(&format!("    {detail}\n"));
+                    output.push_str(&format!(
+                        "  {}\n",
+                        wrap(detail, self.theme.width.saturating_sub(2))
+                    ));
                 }
                 if let Some(action) = &item.action {
-                    output.push_str(&format!("    Try: {action}\n"));
+                    output.push_str(&format!("  Try: {action}\n"));
                 }
             }
             output.push('\n');
         }
-        output.push_str("SYSTEM\n");
-        if let Some(kernel) = &insight.kernel {
-            output.push_str(&format!("  Kernel         {kernel}\n"));
+        let failed_checks = report.checks.iter().filter(|check| !check.passed).count();
+        if failed_checks == 0
+            && insight.dependencies.status == orbis_core::apt_ops::DependencyHealthStatus::Healthy
+        {
+            output.push_str(&format!(
+                "{} Package dependencies healthy\n",
+                self.theme.paint(self.theme.mark(Token::Positive), Token::Positive)
+            ));
+        } else if insight.dependencies.status == orbis_core::apt_ops::DependencyHealthStatus::Broken
+        {
+            output.push_str(&format!(
+                "{} Package dependencies need attention\n",
+                self.theme.paint(self.theme.mark(Token::Destructive), Token::Destructive)
+            ));
+        } else {
+            output.push_str(&format!(
+                "{} Package dependencies unknown\n",
+                self.theme.paint(self.theme.mark(Token::Unavailable), Token::Unavailable)
+            ));
         }
         output.push_str(&format!(
-            "  Pending updates  {}\n",
-            insight
-                .pending_updates
-                .map(|count| count.to_string())
-                .unwrap_or_else(|| "unknown".into())
+            "{} {}\n",
+            self.theme.paint(
+                if insight.reboot.required { "!" } else { self.theme.mark(Token::Positive) },
+                if insight.reboot.required { Token::Caution } else { Token::Positive }
+            ),
+            if insight.reboot.required { "Reboot required" } else { "No reboot required" }
         ));
-        output.push_str(&format!(
-            "  Reboot required  {}\n",
-            if insight.reboot.required { "yes" } else { "no" }
-        ));
-        output.push_str(&format!(
-            "  Dependencies     {}\n",
-            match insight.dependencies.status {
-                orbis_core::apt_ops::DependencyHealthStatus::Healthy => "ok",
-                orbis_core::apt_ops::DependencyHealthStatus::Broken => "broken",
-                orbis_core::apt_ops::DependencyHealthStatus::Unknown => "unknown",
-            }
-        ));
-        if !insight.failed_units.is_empty() {
-            output.push_str(&format!("  Failed units     {}\n", insight.failed_units.join(", ")));
+        if insight.failed_units.is_empty() {
+            output.push_str(&format!(
+                "{} No failed services\n",
+                self.theme.paint(self.theme.mark(Token::Positive), Token::Positive)
+            ));
+        } else {
+            output.push_str(&format!(
+                "{} {} failed service{}\n",
+                self.theme.paint(self.theme.mark(Token::Destructive), Token::Destructive),
+                insight.failed_units.len(),
+                if insight.failed_units.len() == 1 { "" } else { "s" }
+            ));
         }
         for disk in &insight.disk_pressure {
-            output
-                .push_str(&format!("  Disk {}         {}% used\n", disk.mount, disk.used_percent));
+            let already_reported = insight
+                .attention
+                .iter()
+                .any(|item| item.title == format!("Disk pressure on {}", disk.mount));
+            if already_reported {
+                continue;
+            }
+            output.push_str(&format!(
+                "{} {} is {}% full\n",
+                self.theme.paint("!", Token::Caution),
+                disk.mount,
+                disk.used_percent
+            ));
         }
         if !insight.held_packages.is_empty() {
             output.push_str(&format!(
-                "  Held packages   {}\n",
-                insight.held_packages.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                "{} {} held package{}\n  {}\n",
+                self.theme.paint("!", Token::Caution),
+                insight.held_packages.len(),
+                if insight.held_packages.len() == 1 { "" } else { "s" },
+                insight.held_packages.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
             ));
         }
-        output.push('\n');
-        let failed = report.checks.iter().filter(|check| !check.passed).count();
-        output.push_str(&format!(
-            "{}\n\n",
-            if failed == 0 && insight.attention.is_empty() {
-                "Everything checked looks good."
-            } else {
-                "Some things need attention."
-            }
-        ));
-        output.push_str("PROVIDERS\n");
-        for check in &report.checks {
-            if check.area == "Environment" {
-                continue;
-            }
-            let mark = if check.passed {
-                self.theme.paint(if self.theme.unicode { "✓" } else { "+" }, Token::Positive)
-            } else {
-                self.theme.paint(if self.theme.unicode { "×" } else { "x" }, Token::Destructive)
-            };
-            output.push_str(&format!("  {mark} {:<16} {}\n", check.area, check.message));
+        if let Some(kernel) = &insight.kernel {
+            output.push_str(&format!("\nKernel  {kernel}\n"));
+        }
+        if let Some(count) = insight.pending_updates {
+            output.push_str(&format!(
+                "Updates  {}\n",
+                if count == 0 { "none".into() } else { count.to_string() }
+            ));
         }
         output
     }
@@ -952,37 +1049,26 @@ impl Renderer {
         records: &[orbis_core::operation::OperationRecord],
         diagnostic: bool,
     ) -> String {
-        let mut output = self.heading("Recent activity", "Meaningful Orbis operations.");
+        let mut output = self.heading("Activity", "");
         if records.is_empty() {
             return output + "No operations recorded yet.\n";
         }
         for record in records {
-            let status = match record.status {
-                orbis_core::operation::OperationStatus::Succeeded => {
-                    self.theme.paint("ok", Token::Positive)
-                }
-                orbis_core::operation::OperationStatus::PartiallyVerified => {
-                    self.theme.paint("partial", Token::Caution)
-                }
-                orbis_core::operation::OperationStatus::Failed => {
-                    self.theme.paint("failed", Token::Destructive)
-                }
-                orbis_core::operation::OperationStatus::Running => {
-                    self.theme.paint("running", Token::Muted)
-                }
-            };
-            output.push_str(&format!("  {}  {}\n", status, record.activity_title()));
-            for detail in record.activity_details().into_iter().take(4) {
-                output.push_str(&format!("      {detail}\n"));
+            let token = operation_token(record.status);
+            output.push_str(&format!(
+                "{} {}  {}\n",
+                self.theme.paint(self.theme.mark(token), token),
+                record.activity_title(),
+                relative_time(record.completed_at_unix_ms.unwrap_or(record.started_at_unix_ms))
+            ));
+            for detail in record.activity_details().into_iter().take(if diagnostic { 4 } else { 1 })
+            {
+                output.push_str(&format!("  {detail}\n"));
             }
             if diagnostic {
-                output.push_str(&format!("      id {}\n", record.id));
+                output.push_str(&format!("  id {}\n", record.id));
                 for command in &record.raw_commands {
-                    output.push_str(&format!(
-                        "      {} {}\n",
-                        command.program,
-                        command.args.join(" ")
-                    ));
+                    output.push_str(&format!("  {} {}\n", command.program, command.args.join(" ")));
                 }
             }
             output.push('\n');
@@ -1027,18 +1113,9 @@ impl Renderer {
     }
 
     fn heading(&self, title: &str, subtitle: &str) -> String {
-        let divider_width = self.theme.width.clamp(40, 64);
-        let mut output = format!(
-            "{} // {}\n{}\n",
-            self.theme.paint(self.theme.brand_compact(), Token::Primary),
-            self.theme.paint(&title.to_ascii_uppercase(), Token::Primary),
-            self.theme.paint(
-                &(if self.theme.unicode { "─" } else { "-" }).repeat(divider_width),
-                Token::Divider,
-            ),
-        );
+        let mut output = format!("{}\n", compact_identity(self.theme, &display_title(title)));
         if !subtitle.is_empty() {
-            output.push_str(&format!("{}\n", self.theme.paint(subtitle, Token::Muted)));
+            output.push_str(&format!("  {}\n", self.theme.paint(subtitle, Token::Muted)));
         }
         output.push('\n');
         output
@@ -1056,6 +1133,22 @@ impl Renderer {
         }
         output
     }
+}
+
+fn display_title(title: &str) -> String {
+    if title != title.to_ascii_uppercase() {
+        return title.to_owned();
+    }
+    title
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                format!("{}{}", first.to_ascii_uppercase(), chars.as_str().to_ascii_lowercase())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn state_token(state: &str) -> Token {
@@ -1108,6 +1201,37 @@ fn installed_state(installed: Option<bool>) -> &'static str {
         Some(true) => "Installed",
         Some(false) => "Available",
         None => "Availability unknown",
+    }
+}
+
+fn scope_label(scope: &str) -> &str {
+    match scope {
+        "system" => "System-wide",
+        "user" => "User",
+        value => value,
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "kB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1_000.0 && unit < UNITS.len() - 1 {
+        value /= 1_000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_disk_delta(delta: i64) -> String {
+    if delta >= 0 {
+        format!("+{}", format_size(delta as u64))
+    } else {
+        format!("-{}", format_size(delta.unsigned_abs()))
     }
 }
 
@@ -1222,15 +1346,6 @@ fn render_update_group(
     output
 }
 
-fn risk_token(risk: orbis_core::transaction::RiskLevel) -> Token {
-    match risk {
-        orbis_core::transaction::RiskLevel::Normal => Token::Positive,
-        orbis_core::transaction::RiskLevel::Caution => Token::Caution,
-        orbis_core::transaction::RiskLevel::HighImpact
-        | orbis_core::transaction::RiskLevel::Blocked => Token::Destructive,
-    }
-}
-
 fn maintenance_upgrade_coverage(plan: &MaintenancePlan) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     let mut optional = Vec::new();
@@ -1330,7 +1445,7 @@ fn current_time_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_millis() as u64)
 }
 
-fn relative_time(recorded_at_unix_ms: u64, now_unix_ms: u64) -> String {
+fn relative_time_at(recorded_at_unix_ms: u64, now_unix_ms: u64) -> String {
     let seconds = now_unix_ms.saturating_sub(recorded_at_unix_ms) / 1_000;
     if seconds < 60 {
         "just now".into()
@@ -1340,6 +1455,19 @@ fn relative_time(recorded_at_unix_ms: u64, now_unix_ms: u64) -> String {
         format!("{}h ago", seconds / 3_600)
     } else {
         format!("{}d ago", seconds / 86_400)
+    }
+}
+
+fn relative_time(recorded_at_unix_ms: u64) -> String {
+    relative_time_at(recorded_at_unix_ms, current_time_ms())
+}
+
+fn operation_token(status: orbis_core::operation::OperationStatus) -> Token {
+    match status {
+        orbis_core::operation::OperationStatus::Succeeded => Token::Positive,
+        orbis_core::operation::OperationStatus::PartiallyVerified => Token::Caution,
+        orbis_core::operation::OperationStatus::Failed => Token::Destructive,
+        orbis_core::operation::OperationStatus::Running => Token::Muted,
     }
 }
 
@@ -1445,7 +1573,7 @@ fn maintenance_title(action: orbis_core::maintenance::MaintenanceAction) -> &'st
     match action {
         orbis_core::maintenance::MaintenanceAction::Refresh => "Refresh",
         orbis_core::maintenance::MaintenanceAction::Upgrade => "Update",
-        orbis_core::maintenance::MaintenanceAction::Cleanup => "Clean",
+        orbis_core::maintenance::MaintenanceAction::Cleanup => "Clean up",
     }
 }
 
@@ -1557,23 +1685,15 @@ fn maintenance_result_state(
 
 fn refresh_row_view(state: RefreshRowState, theme: Theme) -> (&'static str, Token, &'static str) {
     match state {
-        RefreshRowState::Refreshed => {
-            (if theme.unicode { "●" } else { "*" }, Token::Positive, "refreshed")
-        }
+        RefreshRowState::Refreshed => (theme.mark(Token::Positive), Token::Positive, "refreshed"),
         RefreshRowState::Partial => {
-            (if theme.unicode { "●" } else { "*" }, Token::Caution, "partially refreshed")
+            (theme.mark(Token::Caution), Token::Caution, "partially refreshed")
         }
-        RefreshRowState::Managed => {
-            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "managed by snapd")
-        }
-        RefreshRowState::OnDemand => {
-            (if theme.unicode { "◇" } else { "-" }, Token::Muted, "metadata on demand")
-        }
-        RefreshRowState::Failed => {
-            (if theme.unicode { "×" } else { "x" }, Token::Destructive, "failed")
-        }
+        RefreshRowState::Managed => (theme.mark(Token::Muted), Token::Muted, "managed by snapd"),
+        RefreshRowState::OnDemand => (theme.mark(Token::Muted), Token::Muted, "metadata on demand"),
+        RefreshRowState::Failed => (theme.mark(Token::Destructive), Token::Destructive, "failed"),
         RefreshRowState::Unavailable => {
-            (if theme.unicode { "○" } else { "o" }, Token::Muted, "unavailable")
+            (theme.mark(Token::Unavailable), Token::Unavailable, "unavailable")
         }
     }
 }
@@ -1672,8 +1792,7 @@ mod tests {
             capabilities: capabilities(),
             notes: Vec::new(),
         };
-        assert!(renderer.home(std::slice::from_ref(&source)).contains("Your Linux software"));
-        assert!(renderer.home(std::slice::from_ref(&source)).contains("ORBIS"));
+        assert!(renderer.home(std::slice::from_ref(&source)).contains("* Orbis"));
         assert!(renderer.sources(&[source]).contains("SYSTEM & DESKTOP"));
         let report = SearchReport {
             results: vec![package(PackageSource::Cargo, "bat", Some(true))],
@@ -1687,14 +1806,14 @@ mod tests {
                     "bat",
                     Some(true)
                 )))
-                .contains("ORBIS BRIEF")
+                .contains("* Orbis · Brief")
         );
         let updates = UpdateInventoryReport {
             inventories: Vec::new(),
             candidates: Vec::new(),
             issues: Vec::new(),
         };
-        assert!(renderer.updates(&updates).contains("Everything checked is up to date"));
+        assert!(renderer.updates(&updates).contains("Everything checked up to date"));
         assert!(renderer.history(&[], false).contains("No activity recorded yet"));
     }
 
@@ -1755,11 +1874,11 @@ mod tests {
             ],
         };
         let output = renderer.updates(&report);
-        assert_eq!(output.matches("ORBIS // UPDATES").count(), 1);
+        assert_eq!(output.matches("* Orbis · Updates").count(), 1);
         assert_eq!(output.matches("NODE.JS").count(), 1);
         assert_eq!(output.matches("PYTHON").count(), 1);
         assert!(output.contains("@deepseek-ai/dsh"));
-        assert!(output.contains("Review changes with `orbis update --apply`"));
+        assert!(output.contains("Run orbis update --apply"));
         assert!(output.contains("Ubuntu repositories"));
         assert!(output.contains("Rust tools"));
         assert!(output.contains("Optional providers"));
@@ -1902,9 +2021,9 @@ mod tests {
         assert!(output.contains("NODE.JS"));
         assert!(output.contains("Optional tools"));
         assert!(output.contains("pipx unavailable"));
-        assert!(output.contains("Risk  normal"));
-        assert!(output.contains("Coverage  limited"));
-        assert!(output.contains("Only the updates listed above will be changed."));
+        assert!(!output.contains("Risk  normal"));
+        assert!(output.contains("Some sources could not be checked completely"));
+        assert!(output.contains("System-wide · administrator permission"));
         assert!(!output.contains("Flatpak · user update"));
         assert!(!output.contains("across 5 sources"));
     }
@@ -1992,7 +2111,7 @@ mod tests {
         assert!(output.contains("Ubuntu repositories could not be reached"));
         assert!(output.contains("Refresh software information"));
         assert!(output.contains("Install flatpak · Ubuntu repositories"));
-        assert!(!output.contains("Orbis"));
+        assert!(output.contains("* Orbis · History"));
         assert!(!output.contains("snapd manages"));
 
         let plain = renderer.history(&entries, true);
@@ -2007,10 +2126,19 @@ mod tests {
     #[test]
     fn relative_time_uses_compact_human_units() {
         let now = 1_800_000_000_000;
-        assert_eq!(relative_time(now - 10_000, now), "just now");
-        assert_eq!(relative_time(now - 4 * 60_000, now), "4m ago");
-        assert_eq!(relative_time(now - 2 * 3_600_000, now), "2h ago");
-        assert_eq!(relative_time(now - 3 * 86_400_000, now), "3d ago");
+        assert_eq!(relative_time_at(now - 10_000, now), "just now");
+        assert_eq!(relative_time_at(now - 4 * 60_000, now), "4m ago");
+        assert_eq!(relative_time_at(now - 2 * 3_600_000, now), "2h ago");
+        assert_eq!(relative_time_at(now - 3 * 86_400_000, now), "3d ago");
+    }
+
+    #[test]
+    fn descriptions_wrap_at_terminal_width_and_break_long_words() {
+        let output =
+            wrap("A very long package description with an extraordinarilylongpackagename", 18);
+        assert!(output.lines().all(|line| UnicodeWidthStr::width(line) <= 18));
+        assert!(output.lines().any(|line| line.starts_with("extraordinarily")));
+        assert!(output.lines().any(|line| line.contains("packagename")));
     }
 
     #[test]
@@ -2022,12 +2150,10 @@ mod tests {
             target.clone(),
             orbis_core::transaction::InstallScope::User,
         );
-        assert!(
-            renderer.transaction_review(&plan, None).contains("No package state has been changed")
-        );
+        assert!(renderer.transaction_review(&plan, None).contains("package will be installed"));
         let maintenance =
             MaintenancePlan::new(MaintenanceAction::Cleanup, Some(PackageSource::Apt), Vec::new());
-        assert!(renderer.maintenance_plan(&maintenance, false).contains("CLEAN"));
+        assert!(renderer.maintenance_plan(&maintenance, false).contains("Clean up"));
         let why = WhyReport {
             package: target,
             installed_as: "Required by other installed software.".into(),
@@ -2037,7 +2163,7 @@ mod tests {
             orbis_history: Vec::new(),
             notes: Vec::new(),
         };
-        assert!(renderer.why(&why).contains("WHY"));
+        assert!(renderer.why(&why).contains("Why"));
         let issue = ProviderIssue {
             source: PackageSource::Flatpak,
             message: "Flatpak is not installed.".into(),
@@ -2047,7 +2173,7 @@ mod tests {
         assert!(
             renderer
                 .ambiguous("bat", &[package(PackageSource::Cargo, "bat", Some(true))], &[issue])
-                .contains("CHOOSE A SOURCE")
+                .contains("Choose a source")
         );
         let doctor = DoctorReport {
             checks: vec![DiagnosticCheck::environment(true, "Terminal", "plain")],
@@ -2055,10 +2181,9 @@ mod tests {
         };
         let insight = orbis_core::system::SystemInsight::default();
         let health = renderer.health(&doctor, &insight);
-        assert!(health.contains("HEALTH"));
-        assert!(health.contains("Pending updates  unknown"));
-        assert!(health.contains("Dependencies     unknown"));
-        assert!(!health.contains("Dependencies     ok"));
+        assert!(health.contains("Health"));
+        assert!(health.contains("Package dependencies unknown"));
+        assert!(!health.contains("Package dependencies healthy"));
     }
 
     #[test]
@@ -2150,7 +2275,7 @@ mod tests {
             mutates: true,
         };
         let output = renderer.maintenance_plan(&plan, false);
-        assert_eq!(output.matches("ORBIS // REFRESH").count(), 1);
+        assert_eq!(output.matches("* Orbis · Refresh").count(), 1);
         assert!(output.contains("Ubuntu repositories"));
         assert!(output.contains("Flatpak · system"));
         assert!(output.contains("Flatpak · user"));
@@ -2271,12 +2396,16 @@ mod tests {
             ),
         ];
         let output = renderer.maintenance_result(&result, &plans, false);
-        assert!(output.contains("Rust tools"));
-        assert!(output.contains("metadata on demand"));
-        assert!(output.contains("Flatpak · system"));
-        assert!(output.contains("Flatpak · user"));
-        assert!(!output.contains("scope not reported"));
-        assert!(!output.contains("Maintenance ID"));
+        assert!(output.contains("* Orbis · Refresh"));
+        assert!(output.contains("Software information refreshed"));
+        assert!(output.contains("2 sources refreshed · 1 checked on demand"));
+        assert!(!output.contains("metadata on demand"));
+        let diagnostic = renderer.maintenance_result(&result, &plans, true);
+        assert!(diagnostic.contains("Rust tools"));
+        assert!(diagnostic.contains("Flatpak · system"));
+        assert!(diagnostic.contains("Flatpak · user"));
+        assert!(!diagnostic.contains("scope not reported"));
+        assert!(diagnostic.contains("Operation ID"));
         assert!(!output.contains("0 changes"));
     }
 }
@@ -2308,13 +2437,35 @@ fn wrap(text: &str, width: usize) -> String {
     for paragraph in text.split('\n') {
         let mut line = String::new();
         for word in paragraph.split_whitespace() {
-            if !line.is_empty() && line.len() + word.len() + 1 > width {
+            let word_width = UnicodeWidthStr::width(word);
+            if word_width <= width {
+                let line_width = UnicodeWidthStr::width(line.as_str());
+                if !line.is_empty() && line_width + 1 + word_width > width {
+                    lines.push(std::mem::take(&mut line));
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                continue;
+            }
+
+            if !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
             }
-            if !line.is_empty() {
-                line.push(' ');
+            let mut chunk = String::new();
+            let mut chunk_width = 0;
+            for character in word.chars() {
+                let character_width =
+                    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                if !chunk.is_empty() && chunk_width + character_width > width {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_width = 0;
+                }
+                chunk.push(character);
+                chunk_width += character_width;
             }
-            line.push_str(word);
+            line = chunk;
         }
         if !line.is_empty() {
             lines.push(line);

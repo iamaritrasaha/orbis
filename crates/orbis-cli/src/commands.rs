@@ -280,14 +280,22 @@ fn print_self_update_report(
     if json {
         println!("{}", serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?);
     } else {
-        println!("{} // SELF UPDATE", theme.brand_compact());
-        println!("{}", (if theme.unicode { "─" } else { "-" }).repeat(theme.width.clamp(32, 88)));
+        println!("{} · Self update", theme.brand_compact());
         println!();
-        println!("Current       {}", report.current_version);
-        if let Some(version) = &report.available_version {
-            println!("Available     {version}");
+        if report.state == self_update::SelfUpdateState::DevelopmentBuild {
+            println!("Development build  {}", report.current_version);
+            if let Some(version) = &report.available_version {
+                println!("Published release  {version}");
+            }
+            println!("\nSelf-update is disabled for development builds.");
+            println!("Reinstall from source to update this build.");
+        } else {
+            println!("Current  {}", report.current_version);
+            if let Some(version) = &report.available_version {
+                println!("Release  {version}");
+            }
+            println!("{}", report.message);
         }
-        println!("{}", report.message);
     }
     Ok(())
 }
@@ -537,7 +545,7 @@ fn run_transaction(
         if json {
             print_json(&result)
         } else {
-            print!("{}", renderer.transaction_result(&result));
+            print!("{}", renderer.transaction_result(&result, preserve_raw_output));
             Ok(())
         }
     }
@@ -606,6 +614,13 @@ fn run_maintenance(
             return print_json(&plan);
         }
         print!("{}", renderer.maintenance_plan(&plan, preserve_raw_output));
+        return Ok(());
+    }
+    if plan.is_successful_upgrade_noop() {
+        if json {
+            return print_json(&maintenance_noop_json(&plan));
+        }
+        print!("{}", renderer.maintenance_noop(&plan));
         return Ok(());
     }
     if !plan.executable() {
@@ -736,6 +751,17 @@ fn run_maintenance(
         }
         Ok(())
     }
+}
+
+fn maintenance_noop_json(plan: &MaintenancePlan) -> serde_json::Value {
+    serde_json::json!({
+        "status": "succeeded",
+        "action": "upgrade",
+        "no_op": true,
+        "source": plan.source,
+        "summary": "Already up to date",
+        "changed": 0,
+    })
 }
 
 fn revalidate_upgrade_for_review(
@@ -1200,8 +1226,8 @@ fn report_transaction_error(json: bool, message: &str, plan: &OperationPlan) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::maintenance_confirmation_accepts;
-    use orbis_core::transaction::RiskLevel;
+    use super::{maintenance_confirmation_accepts, maintenance_noop_json};
+    use orbis_core::{maintenance::MaintenancePlan, models::PackageSource, transaction::RiskLevel};
 
     #[test]
     fn normal_maintenance_confirmation_accepts_common_affirmative_answers() {
@@ -1216,6 +1242,33 @@ mod tests {
         for answer in ["", "y", "Y", "yes"] {
             assert!(!maintenance_confirmation_accepts(RiskLevel::HighImpact, answer));
         }
+    }
+
+    #[test]
+    fn maintenance_noop_json_is_successful_and_has_no_change_count() {
+        let plan = MaintenancePlan::new(
+            orbis_core::maintenance::MaintenanceAction::Upgrade,
+            Some(PackageSource::Apt),
+            Vec::new(),
+        );
+        let value = maintenance_noop_json(&plan);
+        assert_eq!(value["status"], "succeeded");
+        assert_eq!(value["action"], "upgrade");
+        assert_eq!(value["no_op"], true);
+        assert_eq!(value["changed"], 0);
+        assert_eq!(value["source"], "apt");
+    }
+
+    #[test]
+    fn no_op_dispatch_branch_precedes_non_executable_error() {
+        let source = include_str!("commands.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        let noop = production.find("plan.is_successful_upgrade_noop()").expect("no-op branch");
+        let executable = production[noop..]
+            .find("if !plan.executable()")
+            .map(|offset| noop + offset)
+            .expect("executable guard");
+        assert!(noop < executable);
     }
 
     #[test]
